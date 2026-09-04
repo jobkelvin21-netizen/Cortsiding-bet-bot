@@ -6,7 +6,7 @@ from loguru import logger
 @dataclass
 class Measurement:
     match_id: str
-    b365_time: datetime
+    fs_time: datetime
     sb_time: Optional[datetime] = None
     latency_ms: float = 0.0
 
@@ -16,27 +16,19 @@ class SlowGameDetector:
         self.slow_games: Dict[str, dict] = {}
         self.threshold = 2000
         
-    async def on_bet365(self, data: dict):
+    async def on_flashscore(self, data: dict):
         mid = data['match_id']
-        self.measurements[mid] = Measurement(match_id=mid, b365_time=datetime.now())
+        self.measurements[mid] = Measurement(match_id=mid, fs_time=datetime.now())
         
     async def on_sportybet(self, data: dict, callback: Callable):
         mid = data['match_id']
         if mid not in self.measurements:
             return
-            
         m = self.measurements[mid]
         m.sb_time = datetime.now()
-        m.latency_ms = (m.sb_time - m.b365_time).total_seconds() * 1000
-        
+        m.latency_ms = (m.sb_time - m.fs_time).total_seconds() * 1000
         if m.latency_ms > self.threshold and mid not in self.slow_games:
-            self.slow_games[mid] = {
-                'match_id': mid,
-                'home_team': data['home_team'],
-                'away_team': data['away_team'],
-                'latency_ms': m.latency_ms,
-                'league': data.get('league', '')
-            }
+            self.slow_games[mid] = {'match_id': mid, 'home_team': data['home_team'], 'away_team': data['away_team'], 'latency_ms': m.latency_ms, 'league': data.get('league', '')}
             logger.info(f"🎯 SLOW: {data['home_team']} vs {data['away_team']} ({m.latency_ms:.0f}ms)")
             await callback(self.slow_games[mid])
             
