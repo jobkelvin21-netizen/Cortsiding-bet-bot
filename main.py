@@ -17,7 +17,7 @@ from utils.security import SecurityManager
 
 class ArbitrageBot:
     def __init__(self):
-        self.security = SecurityManager() if Config.SECURITY_ENABLED else None
+        self.security = None  # Disable security manager for now
         self.learning = LearningEngine() if Config.LEARNING_ENABLED else None
         self.account_manager = AccountManager()
         self.alerter = TelegramAlerter()
