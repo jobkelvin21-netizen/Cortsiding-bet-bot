@@ -12,55 +12,59 @@ class Bet365Feed:
         self.callback = None
 
     async def auto_discover(self, page):
-        logger.info("Discovering bet365 WebSocket...")
+        logger.info("Discovering real bet365 WebSocket...")
         ws_urls = []
 
         def handle_ws(ws):
             url = ws.url
             ws_urls.append(url)
-            logger.debug(f"WebSocket detected: {url[:80]}...")
+            logger.info(f"Captured WebSocket: {url}")
 
+        # Listen for every WebSocket the page opens
         page.on("websocket", handle_ws)
 
         try:
-            # Step 1: Go to homepage first
-            await page.goto("https://www.bet365.com/", wait_until="domcontentloaded", timeout=30000)
+            # Go to homepage first
+            await page.goto("https://www.bet365.com/", wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(4)
+
+            # Go to In-Play
+            await page.goto("https://www.bet365.com/#/IP/", wait_until="domcontentloaded", timeout=60000)
+            
+            # Wait longer and interact so WebSockets open
+            await asyncio.sleep(12)
+
+            # Scroll to trigger more connections
+            await page.mouse.wheel(0, 800)
+            await asyncio.sleep(3)
+            await page.mouse.wheel(0, -400)
             await asyncio.sleep(3)
 
-            # Step 2: Go to In-Play
-            await page.goto("https://www.bet365.com/#/IP/", wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(8)  # Give it more time to open WebSockets
-
-            # Step 3: Scroll a bit to trigger more connections
-            try:
-                await page.mouse.wheel(0, 500)
-                await asyncio.sleep(2)
-            except:
-                pass
-
         except Exception as e:
-            logger.warning(f"Navigation error during discovery: {e}")
+            logger.warning(f"Navigation error: {e}")
 
-        # Filter good WebSocket URLs
-        good_urls = []
-        for url in ws_urls:
-            url_lower = url.lower()
-            if "bet365" in url_lower and any(x in url_lower for x in ["sport", "match", "live", "push", "score", "ip"]):
-                good_urls.append(url)
+        # Show everything we captured
+        logger.info(f"Total WebSockets captured: {len(ws_urls)}")
+        for u in ws_urls:
+            logger.info(f"  → {u}")
+
+        # Prefer the best looking one
+        good_urls = [
+            u for u in ws_urls 
+            if "bet365" in u.lower() or "365" in u.lower() or "lpodds" in u.lower() or "premws" in u.lower()
+        ]
 
         if good_urls:
-            # Prefer the longest / most complete looking URL
-            self.ws_url = max(good_urls, key=len)
-            logger.success(f"Found WebSocket: {self.ws_url[:70]}...")
+            self.ws_url = max(good_urls, key=len)  # longest is usually the real one
+            logger.success(f"Selected real WebSocket:\n{self.ws_url}")
             return True
 
-        # Fallback: take any bet365 websocket if available
         if ws_urls:
             self.ws_url = ws_urls[0]
-            logger.warning(f"Using fallback WebSocket: {self.ws_url[:70]}...")
+            logger.warning(f"Using first captured WebSocket:\n{self.ws_url}")
             return True
 
-        logger.error("No WebSocket URL found")
+        logger.error("No WebSocket was opened by bet365")
         return False
 
     async def connect(self, callback: Callable):
