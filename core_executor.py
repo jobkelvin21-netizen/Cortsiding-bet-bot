@@ -56,7 +56,7 @@ class BetExecutor:
         max_splits = int(self.balance / stake)
         return min(max_splits, 3)
         
-    def is_dying_minutes(self, page: Page) -> bool:
+    async def is_dying_minutes(self, page: Page) -> bool:
         try:
             time_elem = await page.query_selector('.match-time, .timer, [data-testid="match-time"]')
             if time_elem:
