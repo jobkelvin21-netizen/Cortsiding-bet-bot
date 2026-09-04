@@ -31,6 +31,6 @@ class Config:
     def enable_real_mode(cls):
         cls.TEST_MODE = False
         os.environ['TEST_MODE'] = 'false'
-   SECURITY_ENABLED = False
-   LEARNING_ENABLED = False
-   PROXY_ROTATION_ENABLED = False
+       SECURITY_ENABLED = False
+       LEARNING_ENABLED = False
+       PROXY_ROTATION_ENABLED = False
