@@ -1,6 +1,5 @@
 import asyncio
 import sys
-import random
 from datetime import datetime, timedelta
 from loguru import logger
 
@@ -62,58 +61,65 @@ class ArbitrageBot:
         await self.setup()
         
         logger.info("="*60)
-        logger.info("SECURED ARBITRAGE BOT v2.0")
-        logger.info(f"Learning: {Config.LEARNING_ENABLED} | Security: {Config.SECURITY_ENABLED}")
-        logger.info(f"Test: {Config.TEST_MODE} ({Config.TEST_DURATION_HOURS}hrs)")
+        logger.info("BOT STARTING")
         logger.info("="*60)
         
+        # SIMPLIFIED - Just open browser and login
         await self.auth.init()
         
         self.executor = BetExecutor(self.alerter, self.account_manager, self.learning)
         self.executor.current_account = self.account_manager.get_active()
         
-        bal = await self.executor.fetch_balance(self.auth.page)
+        # Get balance from user input since auto-detection fails
+        print("\nEnter your current SportyBet balance:")
+        bal = float(input("Balance: "))
+        self.executor.balance = bal
+        
         mode = "TEST" if Config.TEST_MODE else "REAL"
         await self.alerter.notify_startup(bal, mode)
         
-        if self.learning:
-            insights = self.learning.get_insights()
-            await self.alerter.send(insights)
-        
-        if not await self.bet365.auto_discover(self.auth.page):
-            logger.error("bet365 discovery failed")
-            return
+        # Try to discover bet365 - if fails, continue anyway
+        try:
+            if not await self.bet365.auto_discover(self.auth.page):
+                logger.warning("bet365 discovery failed - continuing anyway")
+        except Exception as e:
+            logger.warning(f"bet365 error: {e} - continuing")
             
         self.running = True
         
-        asyncio.create_task(self.bet365.connect(self.on_b365))
-        asyncio.create_task(self.sportybet.start(self.on_sb))
+        # Start feeds
+        try:
+            asyncio.create_task(self.bet365.connect(self.on_b365))
+            asyncio.create_task(self.sportybet.start(self.on_sb))
+        except Exception as e:
+            logger.warning(f"Feed error: {e}")
+            
         asyncio.create_task(self.check_mode_switch())
         asyncio.create_task(self.daily_report())
         
-        logger.success("Running! Learning enabled.")
+        logger.success("Running! Waiting for goals...")
         
         while self.running:
             await asyncio.sleep(1)
             
     async def on_b365(self, data):
-        await self.detector.on_bet365(data)
-        if self.detector.is_slow(data['match_id']):
-            await self.handle_goal(data)
+        try:
+            await self.detector.on_bet365(data)
+            if self.detector.is_slow(data['match_id']):
+                await self.handle_goal(data)
+        except Exception as e:
+            logger.error(f"bet365 handler error: {e}")
             
     async def on_sb(self, data):
-        await self.detector.on_sportybet(data, self.on_slow_found)
+        try:
+            await self.detector.on_sportybet(data, self.on_slow_found)
+        except Exception as e:
+            logger.error(f"sportybet handler error: {e}")
         
     async def on_slow_found(self, game):
         mid = game['match_id']
         if mid in self.slow_pages:
             return
-            
-        if self.learning:
-            confidence = self.learning.should_bet_league(game.get('league', ''))
-            if confidence < 0.3:
-                logger.warning(f"Low confidence for {game.get('league')}: {confidence:.0%}")
-                return
             
         logger.info(f"Monitor: {game['home_team']} vs {game['away_team']}")
         
@@ -161,20 +167,13 @@ class ArbitrageBot:
             page = self.slow_pages[mid]
             match = self.detector.get(mid)
             
-            league = match.get('league', '')
+            league = match.get('league', '') if match else ''
             time_str = datetime.now().strftime('%H:%M')
             
             odds = await self.get_odds(page, scoring_team)
             if odds <= 0:
+                logger.error("No odds found")
                 return
-                
-            if self.learning:
-                odds_range = f"{int(odds)}-{int(odds)+1}"
-                odds_conf = self.learning.data.get('odds_success', {}).get(odds_range, {})
-                if odds_conf.get('total', 0) > 5:
-                    success_rate = odds_conf['wins'] / odds_conf['total']
-                    if success_rate < 0.5:
-                        logger.warning(f"Low odds history for {odds_range}: {success_rate:.0%}")
                 
             result = await self.executor.execute(page, match, scoring_team, odds, goal_num)
             
@@ -194,6 +193,8 @@ class ArbitrageBot:
                 
             self.match_last_score[mid] = curr_score
             
+        except Exception as e:
+            logger.error(f"Goal handling error: {e}")
         finally:
             self._processing[mid] = False
             
@@ -211,21 +212,25 @@ class ArbitrageBot:
     async def daily_report(self):
         while self.running:
             await asyncio.sleep(86400)
-            await self.alerter.send_daily_report()
-            
-            if self.learning:
-                insights = self.learning.get_insights()
-                await self.alerter.send(insights)
+            try:
+                await self.alerter.send_daily_report()
+                if self.learning:
+                    insights = self.learning.get_insights()
+                    await self.alerter.send(insights)
+            except Exception as e:
+                logger.error(f"Report error: {e}")
 
 if __name__ == "__main__":
-    import time
     bot = ArbitrageBot()
     
     try:
         asyncio.run(bot.start())
     except KeyboardInterrupt:
         logger.info("Stopping...")
-        if bot.learning:
-            insights = bot.learning.get_insights()
-            asyncio.run(bot.alerter.send(insights))
-        asyncio.run(bot.alerter.send_daily_report())
+        try:
+            if bot.learning:
+                insights = bot.learning.get_insights()
+                asyncio.run(bot.alerter.send(insights))
+            asyncio.run(bot.alerter.send_daily_report())
+        except:
+            pass
