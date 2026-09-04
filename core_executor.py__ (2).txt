@@ -1,0 +1,214 @@
+import asyncio
+import random
+import time
+from datetime import datetime
+from playwright.async_api import Page
+from loguru import logger
+
+from config import Config
+from browser.fast_executor import FastExecutor
+from utils.telegram import TelegramAlerter
+
+class BetExecutor:
+    def __init__(self, alerter: TelegramAlerter, account_manager, learning=None):
+        self.alerter = alerter
+        self.account_manager = account_manager
+        self.learning = learning
+        self.balance = 0
+        self.consecutive_slow = 0
+        self.stopped = False
+        self.fast = FastExecutor()
+        self.current_account = None
+        self.match_goal_count = {}
+        
+    async def fetch_balance(self, page: Page) -> float:
+        try:
+            for sel in ['.user-balance', '.account-balance']:
+                elem = await page.query_selector(sel)
+                if elem:
+                    text = await elem.text_content()
+                    bal = float(text.replace('₦', '').replace(',', '').replace(' ', ''))
+                    self.balance = bal
+                    if self.current_account:
+                        self.account_manager.update_balance(self.current_account['username'], bal)
+                    return bal
+        except:
+            pass
+        return self.balance
+        
+    def calc_stake(self, odds: float) -> float:
+        if odds <= 1.0 or self.balance <= 0:
+            return 0
+        stake_for_profit = Config.MAX_PROFIT_PER_BET / (odds - 1)
+        return min(self.balance, stake_for_profit)
+        
+    def get_goal_number(self, match_id: str, current_score: tuple) -> int:
+        if match_id not in self.match_goal_count:
+            self.match_goal_count[match_id] = 0
+        total_goals = sum(current_score)
+        if total_goals > self.match_goal_count[match_id]:
+            self.match_goal_count[match_id] = total_goals
+        return self.match_goal_count[match_id]
+        
+    def can_split_by_balance(self, stake: float) -> int:
+        if stake <= 0:
+            return 1
+        max_splits = int(self.balance / stake)
+        return min(max_splits, 3)
+        
+    def is_dying_minutes(self, page: Page) -> bool:
+        try:
+            time_elem = await page.query_selector('.match-time, .timer, [data-testid="match-time"]')
+            if time_elem:
+                time_text = await time_elem.text_content()
+                minute = int(time_text.split(':')[0].split('\'')[0])
+                return minute >= 80
+        except:
+            pass
+        return False
+        
+    def should_split(self, odds: float, is_dying: bool, split_count: int) -> bool:
+        if split_count >= 2:
+            return True
+        if odds >= 10.0 and is_dying:
+            return True
+        return False
+        
+    async def execute(self, page: Page, match: dict, team: str, odds: float, goal_num: int = 1) -> bool:
+        if self.stopped:
+            return False
+            
+        self.balance = await self.fetch_balance(page)
+        stake = self.calc_stake(odds)
+        
+        if stake < 100:
+            return False
+            
+        match_name = f"{match['home_team']} vs {match['away_team']}"
+        
+        split_count = self.can_split_by_balance(stake)
+        dying = await self.is_dying_minutes(page)
+        
+        if self.should_split(odds, dying, split_count):
+            return await self.split_bet(page, match, team, odds, goal_num, split_count, dying)
+        else:
+            if Config.TEST_MODE:
+                logger.info(f"🧪 TEST Goal {goal_num}: Single ₦{stake:,.0f} on {team} @ {odds}")
+                await self.alerter.notify_goal_detected(match_name, team, odds, goal_num)
+                await self.alerter.notify_bet_placed(match_name, team, stake, odds, f"TEST-G{goal_num}", 1, 1)
+                return True
+                
+            await self.alerter.notify_goal_detected(match_name, team, odds, goal_num)
+            return await self.place_single_bet(page, match, team, stake, odds, 1, goal_num, total_stack=1)
+            
+    async def split_bet(self, page: Page, match: dict, team: str, odds: float, 
+                        goal_num: int, split_count: int, dying: bool):
+        match_name = f"{match['home_team']} vs {match['away_team']}"
+        split_stake = self.balance / split_count
+        
+        reason = "Balance allows" if not dying else f"High odds {odds} + dying minutes"
+        logger.info(f"💰 SPLITTING ({reason}): {split_count} bets of ₦{split_stake:,.0f}")
+        
+        await self.alerter.notify_goal_detected(match_name, team, odds, goal_num)
+        if dying and odds >= 10:
+            await self.alerter.send(f"🚀 <b>BOOST {odds}!</b> Dying minutes - splitting bet")
+        
+        total_bets = 0
+        total_staked = 0
+        
+        for i in range(split_count):
+            if self.balance < 100:
+                break
+                
+            success = await self.place_single_bet(
+                page, match, team, split_stake, odds, i+1, goal_num, split_count
+            )
+            
+            if success:
+                total_bets += 1
+                total_staked += split_stake
+                self.balance -= split_stake
+                
+                if i < split_count - 1:
+                    await asyncio.sleep(random.uniform(0.5, 1.0))
+            else:
+                break
+                
+        if total_bets > 0:
+            await self.alerter.notify_stack_complete(match_name, total_bets, total_staked)
+            
+        return total_bets > 0
+        
+    async def place_single_bet(self, page: Page, match: dict, team: str, stake: float, 
+                               odds: float, stack_num: int, goal_num: int, total_stack: int = 1) -> bool:
+        try:
+            start_time = time.time()
+            match_name = f"{match['home_team']} vs {match['away_team']}"
+            
+            if stack_num == 1 and goal_num == 1:
+                await asyncio.sleep(random.uniform(0.5, 1.0))
+                await page.bring_to_front()
+            
+            if stack_num == 1:
+                await self.fast.scroll_to(page, '[data-market="next_goal"], text=Next Goal')
+                if not await self.fast.fast_click(page, 'text=Next Goal'):
+                    await self.fast.fast_click(page, '[data-market="next_goal"]')
+                await asyncio.sleep(0.3)
+            
+            if not await self.fast.fast_click(page, f'text={team}'):
+                await page.evaluate(f'document.querySelector(\'[data-team="{team}"]\')?.click()')
+            
+            await self.fast.fast_type(page, 'input.stake-input', str(int(stake)))
+            await asyncio.sleep(random.uniform(0.5, 1.0))
+            
+            await self.fast.fast_click(page, 'button.place-bet')
+            
+            try:
+                await page.wait_for_selector('.bet-confirmation, .bet-success', timeout=5000)
+                elapsed = time.time() - start_time
+                
+                if elapsed > Config.SUBMISSION_TIMEOUT:
+                    return await self.handle_slow(match)
+                    
+                self.consecutive_slow = 0
+                
+                if not Config.TEST_MODE:
+                    bet_id = f"{match['match_id']}_G{goal_num}_S{stack_num}_{int(time.time())}"
+                    await self.alerter.notify_bet_placed(match_name, team, stake, odds, bet_id, 
+                                                         stack_num, total_stack)
+                
+                return True
+                
+            except:
+                elapsed = time.time() - start_time
+                if elapsed > Config.SUBMISSION_TIMEOUT:
+                    return await self.handle_slow(match)
+                return False
+                
+        except Exception as e:
+            logger.error(f"Bet error: {e}")
+            return False
+            
+    async def handle_slow(self, match):
+        self.consecutive_slow += 1
+        logger.warning(f"Slow #{self.consecutive_slow}")
+        
+        if self.consecutive_slow >= Config.MAX_CONSECUTIVE_SLOW:
+            old_user = self.current_account['username'] if self.current_account else 'unknown'
+            await self.alerter.notify_account_flagged(old_user)
+            
+            old, new = self.account_manager.mark_limited()
+            if new:
+                await self.alerter.notify_account_switched(old, new['username'])
+                self.current_account = new
+                self.consecutive_slow = 0
+                return "SWITCH"
+            else:
+                self.stopped = True
+                await self.alerter.notify_error("No accounts left!")
+                
+        return False
+        
+    def log_bet(self, match, team, stake, odds, bet_id):
+        with open('bets.log', 'a') as f:
+            f.write(f"{datetime.now()}: {match}|{team}|₦{stake}|@{odds}|{bet_id}\n")

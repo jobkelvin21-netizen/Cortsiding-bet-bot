@@ -1,0 +1,36 @@
+import os
+from cryptography.fernet import Fernet
+from pathlib import Path
+from config import Config
+
+class SecurityManager:
+    def __init__(self):
+        self.key = Config.ENCRYPTION_KEY.encode() if Config.ENCRYPTION_KEY else Fernet.generate_key()
+        self.cipher = Fernet(self.key)
+        
+    def encrypt_file(self, filepath: str):
+        if not Path(filepath).exists():
+            return
+        with open(filepath, 'rb') as f:
+            data = f.read()
+        encrypted = self.cipher.encrypt(data)
+        with open(filepath + '.enc', 'wb') as f:
+            f.write(encrypted)
+        os.remove(filepath)
+        
+    def decrypt_file(self, filepath: str):
+        enc_path = filepath + '.enc'
+        if not Path(enc_path).exists():
+            return None
+        with open(enc_path, 'rb') as f:
+            encrypted = f.read()
+        return self.cipher.decrypt(encrypted)
+        
+    def secure_delete(self, filepath: str):
+        if not Path(filepath).exists():
+            return
+        with open(filepath, 'ba+') as f:
+            length = f.tell()
+            f.seek(0)
+            f.write(os.urandom(length))
+        os.remove(filepath)

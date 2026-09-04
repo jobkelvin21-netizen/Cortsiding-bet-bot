@@ -1,0 +1,126 @@
+import asyncio
+from datetime import datetime
+from telegram import Bot
+from loguru import logger
+from config import Config
+
+class TelegramAlerter:
+    def __init__(self):
+        self.bot = Bot(token=Config.TELEGRAM_BOT_TOKEN) if Config.TELEGRAM_BOT_TOKEN else None
+        self.chat_id = Config.TELEGRAM_CHAT_ID
+        self.daily_stats = {
+            'bets_placed': 0,
+            'bets_won': 0,
+            'bets_lost': 0,
+            'profit': 0.0,
+            'start_time': datetime.now(),
+            'test_bets': 0
+        }
+        
+    async def send(self, message: str, parse_mode='HTML'):
+        if not self.bot or not self.chat_id:
+            print(f"[TELEGRAM] {message}")
+            return
+        try:
+            await self.bot.send_message(chat_id=self.chat_id, text=message, parse_mode=parse_mode)
+        except Exception as e:
+            logger.error(f"Telegram error: {e}")
+            
+    async def notify_startup(self, balance, mode):
+        msg = f"🚀 <b>BOT STARTED</b>\n\n"
+        msg += f"Mode: <b>{mode}</b>\n"
+        msg += f"Balance: ₦{balance:,.0f}\n"
+        msg += f"Profit Cap: ₦{Config.MAX_PROFIT_PER_BET:,.0f}/bet\n"
+        msg += f"Max Stack: {Config.MAX_STACK_PER_GOAL} bets/goal\n"
+        if Config.TEST_MODE:
+            msg += f"\n⏰ Auto-switch to REAL in {Config.TEST_DURATION_HOURS}h"
+        await self.send(msg)
+        
+    async def notify_mode_switch(self):
+        msg = "⚠️ <b>MODE SWITCHED TO REAL MONEY</b>\n\n"
+        msg += "Test complete. Placing ACTUAL bets."
+        await self.send(msg)
+        
+    async def notify_goal_detected(self, match, team, odds, goal_num=1):
+        mode = "[TEST]" if Config.TEST_MODE else "[REAL]"
+        msg = f"⚽ <b>GOAL {goal_num}</b> {mode}\n"
+        msg += f"Match: {match}\nTeam: {team}\nOdds: {odds}"
+        await self.send(msg)
+        
+    async def notify_bet_placed(self, match, team, stake, odds, bet_id, stack_num=1, total_stack=1):
+        potential = stake * (odds - 1)
+        mode = "SIM" if Config.TEST_MODE else "PLACED"
+        emoji = "🧪" if Config.TEST_MODE else "✅"
+        
+        self.daily_stats['bets_placed'] += 1
+        if Config.TEST_MODE:
+            self.daily_stats['test_bets'] += 1
+            
+        msg = f"{emoji} <b>{mode}</b>"
+        if total_stack > 1:
+            msg += f" [{stack_num}/{total_stack}]"
+        msg += f"\nMatch: {match}\nTeam: {team}\n"
+        msg += f"Stake: ₦{stake:,.0f}\nPotential: ₦{potential:,.0f}"
+        if bet_id:
+            msg += f"\nID: {bet_id}"
+        await self.send(msg)
+        
+    async def notify_stack_complete(self, match, total_bets, total_staked):
+        msg = f"📚 <b>STACK COMPLETE</b>\n"
+        msg += f"Match: {match}\n"
+        msg += f"Bets: {total_bets}\nTotal: ₦{total_staked:,.0f}"
+        await self.send(msg)
+        
+    async def notify_bet_failed(self, match, team, reason):
+        msg = f"❌ <b>FAILED</b>\nMatch: {match}\nTeam: {team}\nReason: {reason}"
+        await self.send(msg)
+        
+    async def notify_bet_result(self, match, team, stake, odds, won, profit):
+        if won:
+            self.daily_stats['bets_won'] += 1
+            self.daily_stats['profit'] += profit
+            emoji, result = "✅", "WON"
+        else:
+            self.daily_stats['bets_lost'] += 1
+            self.daily_stats['profit'] -= stake
+            emoji, result = "❌", "LOST"
+            
+        msg = f"{emoji} <b>{result}</b>\nMatch: {match}\nTeam: {team}\n"
+        msg += f"{'Profit' if won else 'Loss'}: ₦{abs(profit if won else stake):,.0f}\n"
+        msg += f"Running: ₦{self.daily_stats['profit']:,.0f}"
+        await self.send(msg)
+        
+    async def notify_cashout(self, bet_id, amount, reason):
+        msg = f"⚠️ <b>CASHOUT</b>\nReason: {reason}\nAmount: ₦{amount:,.0f}"
+        await self.send(msg)
+        
+    async def notify_account_flagged(self, account):
+        msg = f"🚨 <b>FLAGGED</b>\nAccount: {account}\nSwitching..."
+        await self.send(msg)
+        
+    async def notify_account_switched(self, old_acc, new_acc):
+        msg = f"🔄 <b>SWITCHED</b>\nFrom: {old_acc}\nTo: {new_acc}"
+        await self.send(msg)
+        
+    async def notify_balance_update(self, old_bal, new_bal):
+        change = new_bal - old_bal
+        emoji = "📈" if change > 0 else "📉"
+        msg = f"{emoji} <b>BALANCE</b>\n₦{old_bal:,.0f} → ₦{new_bal:,.0f} (₦{change:+,.0f})"
+        await self.send(msg)
+        
+    async def send_daily_report(self):
+        runtime = (datetime.now() - self.daily_stats['start_time']).total_seconds() / 3600
+        total = self.daily_stats['bets_placed']
+        won = self.daily_stats['bets_won']
+        
+        msg = f"📊 <b>REPORT</b>\n\n"
+        msg += f"Runtime: {runtime:.1f}h\n"
+        msg += f"Bets: {total} ({self.daily_stats['test_bets']} test)\n"
+        msg += f"Won: {won} | Lost: {self.daily_stats['bets_lost']}\n"
+        if total > 0:
+            msg += f"Win Rate: {(won/total*100):.1f}%\n"
+        msg += f"Profit: ₦{self.daily_stats['profit']:,.0f}"
+        await self.send(msg)
+        
+    async def notify_error(self, error):
+        await self.send(f"❌ <b>ERROR</b>\n{error}")

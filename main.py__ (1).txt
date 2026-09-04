@@ -1,0 +1,231 @@
+import asyncio
+import sys
+import random
+from datetime import datetime, timedelta
+from loguru import logger
+
+from config import Config
+from auth.sportybet_login import SportyBetAuth
+from feeds.bet365_ws import Bet365Feed
+from feeds.sportybet_api import SportyBetFeed
+from core.detector import SlowGameDetector
+from core.executor import BetExecutor
+from core.cashout import CashOutManager
+from utils.telegram import TelegramAlerter
+from utils.account_manager import AccountManager
+from utils.learning import LearningEngine
+from utils.security import SecurityManager
+
+class ArbitrageBot:
+    def __init__(self):
+        self.security = SecurityManager() if Config.SECURITY_ENABLED else None
+        self.learning = LearningEngine() if Config.LEARNING_ENABLED else None
+        self.account_manager = AccountManager()
+        self.alerter = TelegramAlerter()
+        self.auth = SportyBetAuth()
+        self.bet365 = Bet365Feed()
+        self.sportybet = SportyBetFeed()
+        self.detector = SlowGameDetector()
+        self.executor = None
+        self.cashout = CashOutManager(self.alerter)
+        self.slow_pages = {}
+        self.running = False
+        self._processing = {}
+        self.match_last_score = {}
+        
+    async def setup(self):
+        if not self.account_manager.accounts:
+            print("No accounts! Add one:")
+            u = input("Username: ")
+            p = input("Password: ")
+            ph = input("Phone: ")
+            self.account_manager.add_account(u, p, ph)
+            
+        acc = self.account_manager.get_active()
+        if not acc:
+            logger.error("No active account")
+            sys.exit(1)
+            
+        if Config.TEST_MODE:
+            Config.TEST_END_TIME = datetime.now() + timedelta(hours=Config.TEST_DURATION_HOURS)
+            logger.info(f"Test mode: {Config.TEST_DURATION_HOURS} hours")
+            
+    async def check_mode_switch(self):
+        while self.running:
+            await asyncio.sleep(60)
+            if Config.TEST_MODE and Config.check_test_mode_expired():
+                logger.warning("SWITCHING TO REAL MONEY")
+                Config.enable_real_mode()
+                await self.alerter.notify_mode_switch()
+                
+    async def start(self):
+        await self.setup()
+        
+        logger.info("="*60)
+        logger.info("SECURED ARBITRAGE BOT v2.0")
+        logger.info(f"Learning: {Config.LEARNING_ENABLED} | Security: {Config.SECURITY_ENABLED}")
+        logger.info(f"Test: {Config.TEST_MODE} ({Config.TEST_DURATION_HOURS}hrs)")
+        logger.info("="*60)
+        
+        await self.auth.init()
+        
+        self.executor = BetExecutor(self.alerter, self.account_manager, self.learning)
+        self.executor.current_account = self.account_manager.get_active()
+        
+        bal = await self.executor.fetch_balance(self.auth.page)
+        mode = "TEST" if Config.TEST_MODE else "REAL"
+        await self.alerter.notify_startup(bal, mode)
+        
+        if self.learning:
+            insights = self.learning.get_insights()
+            await self.alerter.send(insights)
+        
+        if not await self.bet365.auto_discover(self.auth.page):
+            logger.error("bet365 discovery failed")
+            return
+            
+        self.running = True
+        
+        asyncio.create_task(self.bet365.connect(self.on_b365))
+        asyncio.create_task(self.sportybet.start(self.on_sb))
+        asyncio.create_task(self.check_mode_switch())
+        asyncio.create_task(self.daily_report())
+        
+        logger.success("Running! Learning enabled.")
+        
+        while self.running:
+            await asyncio.sleep(1)
+            
+    async def on_b365(self, data):
+        await self.detector.on_bet365(data)
+        if self.detector.is_slow(data['match_id']):
+            await self.handle_goal(data)
+            
+    async def on_sb(self, data):
+        await self.detector.on_sportybet(data, self.on_slow_found)
+        
+    async def on_slow_found(self, game):
+        mid = game['match_id']
+        if mid in self.slow_pages:
+            return
+            
+        if self.learning:
+            confidence = self.learning.should_bet_league(game.get('league', ''))
+            if confidence < 0.3:
+                logger.warning(f"Low confidence for {game.get('league')}: {confidence:.0%}")
+                return
+            
+        logger.info(f"Monitor: {game['home_team']} vs {game['away_team']}")
+        
+        try:
+            ctx = self.auth.context
+            page = await ctx.new_page()
+            await page.goto(f"{Config.SPORTYBET_BASE_URL}/ng/m/{mid}")
+            await asyncio.sleep(4)
+            
+            try:
+                await page.click('text=Next Goal')
+                await asyncio.sleep(1.5)
+            except:
+                pass
+                
+            self.slow_pages[mid] = page
+            self.match_last_score[mid] = (0, 0)
+            
+        except Exception as e:
+            logger.error(f"Init error: {e}")
+            
+    async def handle_goal(self, data):
+        mid = data['match_id']
+        if mid not in self.slow_pages:
+            return
+            
+        if self._processing.get(mid):
+            return
+            
+        self._processing[mid] = True
+        
+        try:
+            prev_score = self.match_last_score.get(mid, (0, 0))
+            curr_score = (data['home_score'], data['away_score'])
+            
+            if curr_score == prev_score:
+                return
+                
+            if data.get('var_status') or data.get('offside_flag'):
+                return
+                
+            scoring_team = data['home_team'] if curr_score[0] > prev_score[0] else data['away_team']
+            goal_num = sum(curr_score)
+            
+            page = self.slow_pages[mid]
+            match = self.detector.get(mid)
+            
+            league = match.get('league', '')
+            time_str = datetime.now().strftime('%H:%M')
+            
+            odds = await self.get_odds(page, scoring_team)
+            if odds <= 0:
+                return
+                
+            if self.learning:
+                odds_range = f"{int(odds)}-{int(odds)+1}"
+                odds_conf = self.learning.data.get('odds_success', {}).get(odds_range, {})
+                if odds_conf.get('total', 0) > 5:
+                    success_rate = odds_conf['wins'] / odds_conf['total']
+                    if success_rate < 0.5:
+                        logger.warning(f"Low odds history for {odds_range}: {success_rate:.0%}")
+                
+            result = await self.executor.execute(page, match, scoring_team, odds, goal_num)
+            
+            if result == "SWITCH":
+                await self.auth.close()
+                await asyncio.sleep(3)
+                await self.auth.init()
+                self.executor.current_account = self.account_manager.get_active()
+            elif result is True:
+                bet_id = f"{mid}_G{goal_num}_{int(time.time())}"
+                stake = self.executor.calc_stake(odds)
+                self.cashout.register(mid, bet_id, stake, f"Goal {goal_num}")
+                asyncio.create_task(self.cashout.monitor(mid, data, page))
+                
+                if self.learning:
+                    self.learning.record_bet(mid, league, odds, time_str, won=True)
+                
+            self.match_last_score[mid] = curr_score
+            
+        finally:
+            self._processing[mid] = False
+            
+    async def get_odds(self, page, team):
+        try:
+            return await page.evaluate(f'''
+                () => {{
+                    const el = document.querySelector(\'[data-team="{team}"] .odds\');
+                    return el ? parseFloat(el.textContent) : 0;
+                }}
+            ''')
+        except:
+            return 0.0
+            
+    async def daily_report(self):
+        while self.running:
+            await asyncio.sleep(86400)
+            await self.alerter.send_daily_report()
+            
+            if self.learning:
+                insights = self.learning.get_insights()
+                await self.alerter.send(insights)
+
+if __name__ == "__main__":
+    import time
+    bot = ArbitrageBot()
+    
+    try:
+        asyncio.run(bot.start())
+    except KeyboardInterrupt:
+        logger.info("Stopping...")
+        if bot.learning:
+            insights = bot.learning.get_insights()
+            asyncio.run(bot.alerter.send(insights))
+        asyncio.run(bot.alerter.send_daily_report())

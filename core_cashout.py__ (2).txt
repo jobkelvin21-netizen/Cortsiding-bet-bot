@@ -1,0 +1,66 @@
+import asyncio
+from playwright.async_api import Page
+from loguru import logger
+from utils.telegram import TelegramAlerter
+
+class CashOutManager:
+    def __init__(self, alerter: TelegramAlerter):
+        self.alerter = alerter
+        self.active_bets = {}
+        
+    def register(self, match_id: str, bet_id: str, stake: float, stack_info: str = ''):
+        if match_id not in self.active_bets:
+            self.active_bets[match_id] = []
+        self.active_bets[match_id].append({
+            'id': bet_id, 'stake': stake, 'status': 'active', 'stack': stack_info
+        })
+        
+    async def monitor(self, match_id: str, b365_data: dict, page: Page):
+        original = (b365_data.get('home_score', 0), b365_data.get('away_score', 0))
+        
+        for _ in range(60):
+            await asyncio.sleep(2)
+            
+            if b365_data.get('var_status') or b365_data.get('offside_flag'):
+                await self.cashout_all(match_id, page, "VAR/Offside")
+                return
+                
+            current = (b365_data.get('home_score', 0), b365_data.get('away_score', 0))
+            if sum(current) < sum(original):
+                await self.cashout_all(match_id, page, "Goal cancelled")
+                return
+                
+    async def cashout_all(self, match_id: str, page: Page, reason: str):
+        if match_id not in self.active_bets:
+            return
+            
+        try:
+            await page.click('text=My Bets')
+            await asyncio.sleep(1.5)
+            
+            for bet in self.active_bets[match_id]:
+                if bet['status'] != 'active':
+                    continue
+                    
+                row = await page.query_selector(f'[data-bet-id="{bet["id"]}"]')
+                if not row:
+                    continue
+                    
+                btn = await row.query_selector('button:has-text("Cash Out")')
+                if btn:
+                    await btn.click()
+                    await asyncio.sleep(0.8)
+                    
+                    confirm = await page.query_selector('button:has-text("Confirm")')
+                    if confirm:
+                        await confirm.click()
+                        
+                    amt_elem = await row.query_selector('.cashout-amount')
+                    amt = await amt_elem.text_content() if amt_elem else "0"
+                    amt_float = float(amt.replace('₦', '').replace(',', ''))
+                    
+                    bet['status'] = 'cashed_out'
+                    await self.alerter.notify_cashout(bet['id'], amt_float, reason)
+                    
+        except Exception as e:
+            logger.error(f"Cashout: {e}")

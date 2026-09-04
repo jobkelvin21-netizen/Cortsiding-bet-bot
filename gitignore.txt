@@ -1,0 +1,9 @@
+# NEVER UPLOAD THESE
+.env
+*.enc
+credentials.json
+bets.log
+
+# Python cache
+__pycache__/
+*.pyc

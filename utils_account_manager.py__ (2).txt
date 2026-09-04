@@ -1,0 +1,72 @@
+import json
+import os
+from pathlib import Path
+from typing import Optional, Dict, List
+
+ACCOUNTS_FILE = Path.home() / '.betbot_accounts.json'
+CURRENT_FILE = Path.home() / '.betbot_current'
+
+class AccountManager:
+    def __init__(self):
+        self.accounts: List[Dict] = self.load_accounts()
+        self.current: Optional[Dict] = None
+        self.load_current()
+        
+    def load_accounts(self) -> List[Dict]:
+        if ACCOUNTS_FILE.exists():
+            with open(ACCOUNTS_FILE) as f:
+                return json.load(f)
+        return []
+        
+    def save_accounts(self):
+        with open(ACCOUNTS_FILE, 'w') as f:
+            json.dump(self.accounts, f)
+            
+    def load_current(self):
+        if CURRENT_FILE.exists():
+            username = CURRENT_FILE.read_text().strip()
+            for acc in self.accounts:
+                if acc['username'] == username:
+                    self.current = acc
+                    break
+                    
+    def save_current(self, username: str):
+        CURRENT_FILE.write_text(username)
+        
+    def add_account(self, username: str, password: str, phone: str = ''):
+        self.accounts.append({
+            'username': username,
+            'password': password,
+            'phone': phone,
+            'status': 'active',
+            'balance': 0
+        })
+        self.save_accounts()
+        
+    def get_active(self) -> Optional[Dict]:
+        for acc in self.accounts:
+            if acc['status'] == 'active':
+                self.current = acc
+                self.save_current(acc['username'])
+                return acc
+        return None
+        
+    def mark_limited(self) -> tuple:
+        if self.current:
+            old_user = self.current['username']
+            self.current['status'] = 'limited'
+            self.save_accounts()
+            
+            for acc in self.accounts:
+                if acc['status'] == 'active':
+                    self.current = acc
+                    self.save_current(acc['username'])
+                    return old_user, acc
+        return None, None
+        
+    def update_balance(self, username: str, balance: float):
+        for acc in self.accounts:
+            if acc['username'] == username:
+                acc['balance'] = balance
+                self.save_accounts()
+                break

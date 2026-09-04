@@ -1,0 +1,47 @@
+from datetime import datetime
+from typing import Callable, Dict, Optional
+from dataclasses import dataclass
+from loguru import logger
+
+@dataclass
+class Measurement:
+    match_id: str
+    b365_time: datetime
+    sb_time: Optional[datetime] = None
+    latency_ms: float = 0.0
+
+class SlowGameDetector:
+    def __init__(self):
+        self.measurements: Dict[str, Measurement] = {}
+        self.slow_games: Dict[str, dict] = {}
+        self.threshold = 2000
+        
+    async def on_bet365(self, data: dict):
+        mid = data['match_id']
+        self.measurements[mid] = Measurement(match_id=mid, b365_time=datetime.now())
+        
+    async def on_sportybet(self, data: dict, callback: Callable):
+        mid = data['match_id']
+        if mid not in self.measurements:
+            return
+            
+        m = self.measurements[mid]
+        m.sb_time = datetime.now()
+        m.latency_ms = (m.sb_time - m.b365_time).total_seconds() * 1000
+        
+        if m.latency_ms > self.threshold and mid not in self.slow_games:
+            self.slow_games[mid] = {
+                'match_id': mid,
+                'home_team': data['home_team'],
+                'away_team': data['away_team'],
+                'latency_ms': m.latency_ms,
+                'league': data.get('league', '')
+            }
+            logger.info(f"🎯 SLOW: {data['home_team']} vs {data['away_team']} ({m.latency_ms:.0f}ms)")
+            await callback(self.slow_games[mid])
+            
+    def is_slow(self, mid: str) -> bool:
+        return mid in self.slow_games
+        
+    def get(self, mid: str) -> Optional[dict]:
+        return self.slow_games.get(mid)
