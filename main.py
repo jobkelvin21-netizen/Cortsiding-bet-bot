@@ -64,13 +64,48 @@ class ArbitrageBot:
         logger.info("BOT STARTING")
         logger.info("="*60)
         
-        # SIMPLIFIED - Just open browser and login
-        await self.auth.init()
+        # Get credentials and login automatically
+        print("\n" + "="*60)
+        print("SPORTYBET LOGIN")
+        print("="*60)
+        username = input("Phone/Username: ")
+        password = input("Password: ")
+        print("="*60)
+        
+        # Launch browser and login
+        from playwright.async_api import async_playwright
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(
+            headless=False,
+            args=['--disable-blink-features=AutomationControlled']
+        )
+        
+        page = await browser.new_page(
+            viewport={'width': 412, 'height': 915}
+        )
+        
+        logger.info("Opening login page...")
+        await page.goto("https://www.sportybet.com/ng/login")
+        await asyncio.sleep(3)
+        
+        logger.info("Logging in...")
+        await page.fill('input[name="username"]', username)
+        await asyncio.sleep(0.5)
+        await page.fill('input[name="password"]', password)
+        await asyncio.sleep(0.5)
+        await page.click('button[type="submit"]')
+        await asyncio.sleep(5)
+        
+        logger.success("Login complete!")
+        
+        # Set up executor with this page
+        self.auth.browser = browser
+        self.auth.page = page
         
         self.executor = BetExecutor(self.alerter, self.account_manager, self.learning)
         self.executor.current_account = self.account_manager.get_active()
         
-        # Get balance from user input since auto-detection fails
+        # Get balance
         print("\nEnter your current SportyBet balance:")
         bal = float(input("Balance: "))
         self.executor.balance = bal
@@ -78,16 +113,15 @@ class ArbitrageBot:
         mode = "TEST" if Config.TEST_MODE else "REAL"
         await self.alerter.notify_startup(bal, mode)
         
-        # Try to discover bet365 - if fails, continue anyway
+        # Try bet365
         try:
-            if not await self.bet365.auto_discover(self.auth.page):
-                logger.warning("bet365 discovery failed - continuing anyway")
+            if not await self.bet365.auto_discover(page):
+                logger.warning("bet365 discovery failed - continuing")
         except Exception as e:
             logger.warning(f"bet365 error: {e} - continuing")
             
         self.running = True
         
-        # Start feeds
         try:
             asyncio.create_task(self.bet365.connect(self.on_b365))
             asyncio.create_task(self.sportybet.start(self.on_sb))
@@ -124,18 +158,18 @@ class ArbitrageBot:
         logger.info(f"Monitor: {game['home_team']} vs {game['away_team']}")
         
         try:
-            ctx = self.auth.context
-            page = await ctx.new_page()
-            await page.goto(f"{Config.SPORTYBET_BASE_URL}/ng/m/{mid}")
+            page = self.auth.page
+            new_page = await page.context.new_page()
+            await new_page.goto(f"{Config.SPORTYBET_BASE_URL}/ng/m/{mid}")
             await asyncio.sleep(4)
             
             try:
-                await page.click('text=Next Goal')
+                await new_page.click('text=Next Goal')
                 await asyncio.sleep(1.5)
             except:
                 pass
                 
-            self.slow_pages[mid] = page
+            self.slow_pages[mid] = new_page
             self.match_last_score[mid] = (0, 0)
             
         except Exception as e:
@@ -178,10 +212,7 @@ class ArbitrageBot:
             result = await self.executor.execute(page, match, scoring_team, odds, goal_num)
             
             if result == "SWITCH":
-                await self.auth.close()
-                await asyncio.sleep(3)
-                await self.auth.init()
-                self.executor.current_account = self.account_manager.get_active()
+                logger.info("Account switch requested")
             elif result is True:
                 bet_id = f"{mid}_G{goal_num}_{int(time.time())}"
                 stake = self.executor.calc_stake(odds)
