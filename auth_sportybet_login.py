@@ -55,7 +55,7 @@ class SportyBetAuth:
         
     async def manual_login(self):
         logger.info("Please login...")
-        await self.page.goto(f"{Config.SPORTYBET_BASE_URL}/ng/m/")
+        await self.page.goto(f"{Config.SPORTYBET_BASE_URL}/ng/")
         await asyncio.sleep(2)
 
         try:
