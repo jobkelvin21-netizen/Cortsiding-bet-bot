@@ -71,7 +71,7 @@ class SportyBetAuth:
         input()
         
         try:
-            await self.page.wait_for_selector('.user-balance, .account-menu', timeout=10000)
+            pass  # Skipping automated check — user confirms login manually
             save = input("Save credentials? (y/n): ").lower()
             if save == 'y':
                 user = await self.page.evaluate('() => document.querySelector(".username")?.textContent || ""')
