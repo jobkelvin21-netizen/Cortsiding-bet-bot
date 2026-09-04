@@ -1,0 +1,63 @@
+import asyncio
+import json
+import websockets
+from datetime import datetime
+from typing import Callable, Dict, Optional
+from loguru import logger
+from config import Config
+
+class FlashScoreFeed:
+    def __init__(self):
+        self.ws_url = Config.FLASHSCORE_WS_URL
+        self.matches: Dict[str, dict] = {}
+        self.running = False
+        self.callback: Optional[Callable] = None
+        
+    async def connect(self, callback: Callable):
+        self.callback = callback
+        self.running = True
+        
+        while self.running:
+            try:
+                async with websockets.connect(self.ws_url, extra_headers={'Origin': 'https://www.flashscore.com', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}) as ws:
+                    logger.info("Connected to FlashScore WebSocket")
+                    await ws.send('{"type":"subscribe","channel":"live"}')
+                    
+                    while self.running:
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=30)
+                            await self.parse_message(msg)
+                        except asyncio.TimeoutError:
+                            await ws.send('{"type":"ping"}')
+                            
+            except Exception as e:
+                logger.error(f"FlashScore WS error: {e}")
+                await asyncio.sleep(5)
+                
+    async def parse_message(self, raw_msg: str):
+        try:
+            data = json.loads(raw_msg)
+            
+            if data.get('type') == 'score' or 'score' in str(data).lower():
+                match_data = {
+                    'match_id': str(data.get('id', data.get('matchId', ''))),
+                    'home_team': data.get('home', ''),
+                    'away_team': data.get('away', ''),
+                    'home_score': int(data.get('homeScore', 0)),
+                    'away_score': int(data.get('awayScore', 0)),
+                    'timestamp': datetime.now(),
+                    'league': data.get('league', 'Lower League'),
+                    'var_status': data.get('var'),
+                    'offside_flag': 'offside' in str(data).lower()
+                }
+                
+                if match_data['match_id']:
+                    self.matches[match_data['match_id']] = match_data
+                    if self.callback:
+                        await self.callback(match_data)
+                        
+        except Exception as e:
+            logger.debug(f"Parse error: {e}")
+            
+    def stop(self):
+        self.running = False
