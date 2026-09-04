@@ -55,7 +55,13 @@ class SportyBetAuth:
         
     async def manual_login(self):
         logger.info("Please login...")
-        await self.page.goto(f"{Config.SPORTYBET_BASE_URL}/ng/login")
+        await self.page.goto(f"{Config.SPORTYBET_BASE_URL}/ng/m/")
+        await asyncio.sleep(2)
+
+        try:
+            await self.page.click('text=Log In')
+        except Exception:
+            pass
         
         if CREDENTIALS_FILE.exists():
             try:
