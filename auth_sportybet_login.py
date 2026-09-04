@@ -15,43 +15,35 @@ class SportyBetAuth:
     async def init(self):
         playwright = await async_playwright().start()
         
-        launch_opts = {
-            'headless': False,
-            'args': ['--disable-blink-features=AutomationControlled', '--window-size=500,900']
-        }
-            
-        self.browser = await playwright.chromium.launch(**launch_opts)
+        # Launch browser
+        self.browser = await playwright.chromium.launch(
+            headless=False,
+            args=['--disable-blink-features=AutomationControlled']
+        )
         
-        ctx_opts = {
-            'viewport': {'width': 412, 'height': 915},
-            'user_agent': 'Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36',
-            'locale': 'en-NG',
-            'timezone_id': 'Africa/Lagos',
-        }
+        # Create context
+        self.context = await self.browser.new_context(
+            viewport={'width': 412, 'height': 915},
+            user_agent='Mozilla/5.0 (Linux; Android 13; SM-G998B)'
+        )
         
-        if STORAGE_FILE.exists():
-            ctx_opts['storage_state'] = str(STORAGE_FILE)
-            
-        self.context = await self.browser.new_context(**ctx_opts)
-        
-        # Open page - YOU control everything
+        # Create page
         self.page = await self.context.new_page()
+        
+        # Go to SportyBet
+        logger.info("Opening SportyBet...")
         await self.page.goto("https://www.sportybet.com/ng/")
         
+        # Wait for manual login
         print("\n" + "="*60)
-        print("BROWSER OPENED")
+        print("1. Login to SportyBet in the browser")
+        print("2. Press ENTER here when logged in")
         print("="*60)
-        print("1. Login to SportyBet manually")
-        print("2. Navigate to any page (Home, Live, etc.)")
-        print("3. Make sure you're fully logged in")
-        print("4. Then press ENTER here to continue")
-        print("="*60)
-        
-        input("\nPress ENTER when ready...")
+        input()
         
         # Save session
         await self.context.storage_state(path=str(STORAGE_FILE))
-        logger.success("Session saved!")
+        logger.success("Login saved!")
         
     async def get_page(self):
         return self.page
