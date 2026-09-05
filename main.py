@@ -1,28 +1,25 @@
 import asyncio
 import sys
+import time
 from datetime import datetime, timedelta
 from loguru import logger
 
 from config import Config
 from auth_sportybet_login import SportyBetAuth
-from feeds.flashscore_ws import FlashScoreFeed  # CHANGED: bet365 to flashscore
+from feeds.flashscore_ws import FlashScoreFeed
 from feeds.sportybet_api import SportyBetFeed
 from core.detector import SlowGameDetector
 from core.executor import BetExecutor
 from core.cashout import CashOutManager
 from utils.telegram import TelegramAlerter
 from utils.account_manager import AccountManager
-from utils.learning import LearningEngine
-from utils.security import SecurityManager
 
 class ArbitrageBot:
     def __init__(self):
-        self.security = SecurityManager() if Config.SECURITY_ENABLED else None
-        self.learning = LearningEngine() if Config.LEARNING_ENABLED else None
         self.account_manager = AccountManager()
         self.alerter = TelegramAlerter()
         self.auth = SportyBetAuth()
-        self.flashscore = FlashScoreFeed(self.on_flashscore)  # CHANGED: bet365 to flashscore, callback in constructor
+        self.flashscore = FlashScoreFeed(self.on_flashscore)
         self.sportybet = SportyBetFeed()
         self.detector = SlowGameDetector()
         self.executor = None
@@ -64,7 +61,6 @@ class ArbitrageBot:
         logger.info("BOT STARTING")
         logger.info("="*60)
 
-        # Get credentials and login automatically
         print("\n" + "="*60)
         print("SPORTYBET LOGIN")
         print("="*60)
@@ -72,22 +68,18 @@ class ArbitrageBot:
         password = input("Password: ")
         print("="*60)
 
-        # Launch browser and login
         from playwright.async_api import async_playwright
         playwright = await async_playwright().start()
         browser = await playwright.chromium.launch(
             headless=False,
             args=['--disable-blink-features=AutomationControlled']
         )
-        page = await browser.new_page(
-            viewport={'width': 412, 'height': 915}
-        )
+        page = await browser.new_page(viewport={'width': 412, 'height': 915})
 
         logger.info("Opening login page...")
         await page.goto("https://www.sportybet.com/ng/", wait_until="domcontentloaded")
         await asyncio.sleep(2)
 
-        # Open login form if needed
         try:
             await page.click('button:has-text("Log In"), a:has-text("Log In")', timeout=5000)
             await asyncio.sleep(1)
@@ -95,31 +87,25 @@ class ArbitrageBot:
             pass
 
         logger.info("Logging in...")
-
-        # Phone number
         await page.wait_for_selector('input[name="phone"]', state="visible", timeout=15000)
         await page.fill('input[name="phone"]', phone)
         await asyncio.sleep(0.5)
 
-        # Password
         await page.wait_for_selector('input[name="psd"]', state="visible", timeout=10000)
         await page.fill('input[name="psd"]', password)
         await asyncio.sleep(0.5)
 
-        # Click Login
         await page.click('button[name="logIn"]')
         await asyncio.sleep(5)
 
         logger.success("Login complete!")
 
-        # Set up executor with this page
         self.auth.browser = browser
         self.auth.page = page
 
-        self.executor = BetExecutor(self.alerter, self.account_manager, self.learning)
+        self.executor = BetExecutor(self.alerter, self.account_manager, None)
         self.executor.current_account = self.account_manager.get_active()
 
-        # Get balance
         print("\nEnter your current SportyBet balance:")
         bal = float(input("Balance: "))
         self.executor.balance = bal
@@ -127,13 +113,12 @@ class ArbitrageBot:
         mode = "TEST" if Config.TEST_MODE else "REAL"
         await self.alerter.notify_startup(bal, mode)
 
-        # REMOVED: bet365 auto_discover - FlashScore doesn't need browser discovery
         logger.info("Starting FlashScore WebSocket feed...")
 
         self.running = True
 
         try:
-            asyncio.create_task(self.flashscore.start())  # CHANGED: flashscore.start() instead of bet365.connect
+            asyncio.create_task(self.flashscore.start())
             asyncio.create_task(self.sportybet.start(self.on_sb))
         except Exception as e:
             logger.warning(f"Feed error: {e}")
@@ -146,9 +131,9 @@ class ArbitrageBot:
         while self.running:
             await asyncio.sleep(1)
 
-    async def on_flashscore(self, data):  # CHANGED: on_b365 to on_flashscore
+    async def on_flashscore(self, data):
         try:
-            await self.detector.on_bet365(data)  # detector method name stays same
+            await self.detector.on_bet365(data)
             if self.detector.is_slow(data['match_id']):
                 await self.handle_goal(data)
         except Exception as e:
@@ -229,9 +214,6 @@ class ArbitrageBot:
                 self.cashout.register(mid, bet_id, stake, f"Goal {goal_num}")
                 asyncio.create_task(self.cashout.monitor(mid, data, page))
 
-                if self.learning:
-                    self.learning.record_bet(mid, league, odds, time_str, won=True)
-
             self.match_last_score[mid] = curr_score
 
         except Exception as e:
@@ -255,9 +237,6 @@ class ArbitrageBot:
             await asyncio.sleep(86400)
             try:
                 await self.alerter.send_daily_report()
-                if self.learning:
-                    insights = self.learning.get_insights()
-                    await self.alerter.send(insights)
             except Exception as e:
                 logger.error(f"Report error: {e}")
 
@@ -268,9 +247,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Stopping...")
         try:
-            if bot.learning:
-                insights = bot.learning.get_insights()
-                asyncio.run(bot.alerter.send(insights))
             asyncio.run(bot.alerter.send_daily_report())
         except:
             pass
