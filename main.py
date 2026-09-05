@@ -6,7 +6,7 @@ from loguru import logger
 
 from config import Config
 from auth_sportybet_login import SportyBetAuth
-from feeds.flashscore_ws import FlashScoreFeed
+from feeds.bet365_ws import Bet365Feed  # Changed to bet365 WebSocket
 from feeds.sportybet_api import SportyBetFeed
 from core.detector import SlowGameDetector
 from core.executor import BetExecutor
@@ -19,7 +19,7 @@ class ArbitrageBot:
         self.account_manager = AccountManager()
         self.alerter = TelegramAlerter()
         self.auth = SportyBetAuth()
-        self.flashscore = FlashScoreFeed(self.on_flashscore)
+        self.bet365 = Bet365Feed(self.on_bet365)  # Bet365 WebSocket
         self.sportybet = SportyBetFeed()
         self.detector = SlowGameDetector()
         self.executor = None
@@ -58,7 +58,7 @@ class ArbitrageBot:
         await self.setup()
 
         logger.info("="*60)
-        logger.info("BOT STARTING")
+        logger.info("BOT STARTING - BET365 WEBSOCKET + SPORTYBET")
         logger.info("="*60)
 
         print("\n" + "="*60)
@@ -76,7 +76,7 @@ class ArbitrageBot:
         )
         page = await browser.new_page(viewport={'width': 412, 'height': 915})
 
-        logger.info("Opening login page...")
+        logger.info("Opening SportyBet login...")
         await page.goto("https://www.sportybet.com/ng/", wait_until="domcontentloaded")
         await asyncio.sleep(2)
 
@@ -98,7 +98,7 @@ class ArbitrageBot:
         await page.click('button[name="logIn"]')
         await asyncio.sleep(5)
 
-        logger.success("Login complete!")
+        logger.success("SportyBet login complete!")
 
         self.auth.browser = browser
         self.auth.page = page
@@ -113,12 +113,12 @@ class ArbitrageBot:
         mode = "TEST" if Config.TEST_MODE else "REAL"
         await self.alerter.notify_startup(bal, mode)
 
-        logger.info("Starting FlashScore WebSocket feed...")
-
+        # Start bet365 WebSocket (ULTRA FAST)
+        logger.info("Starting Bet365 WebSocket feed...")
         self.running = True
 
         try:
-            asyncio.create_task(self.flashscore.start())
+            asyncio.create_task(self.bet365.start())
             asyncio.create_task(self.sportybet.start(self.on_sb))
         except Exception as e:
             logger.warning(f"Feed error: {e}")
@@ -126,24 +126,25 @@ class ArbitrageBot:
         asyncio.create_task(self.check_mode_switch())
         asyncio.create_task(self.daily_report())
 
-        logger.success("Running! Waiting for goals...")
+        logger.success("Bot running! Bet365 WebSocket is LIVE")
 
         while self.running:
             await asyncio.sleep(1)
 
-    async def on_flashscore(self, data):
+    async def on_bet365(self, data):
+        """Bet365 WebSocket callback - ULTRA FAST"""
         try:
             await self.detector.on_bet365(data)
             if self.detector.is_slow(data['match_id']):
                 await self.handle_goal(data)
         except Exception as e:
-            logger.error(f"FlashScore handler error: {e}")
+            logger.error(f"Bet365 handler error: {e}")
 
     async def on_sb(self, data):
         try:
             await self.detector.on_sportybet(data, self.on_slow_found)
         except Exception as e:
-            logger.error(f"sportybet handler error: {e}")
+            logger.error(f"SportyBet handler error: {e}")
 
     async def on_slow_found(self, game):
         mid = game['match_id']
