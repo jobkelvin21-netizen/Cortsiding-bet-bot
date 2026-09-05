@@ -9,8 +9,7 @@ import aiohttp
 
 class Bet365Feed:
     def __init__(self, callback: Callable):
-        self.callback = callback
-        self.ws_url = "wss://premws-pt3.365lpodds.com/zap/"
+    self.callback = callback
         self.running = False
         self.matches: Dict = {}
         self.session_token = None
