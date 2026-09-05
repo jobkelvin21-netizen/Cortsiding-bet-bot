@@ -103,6 +103,15 @@ class ArbitrageBot:
         self.auth.browser = browser
         self.auth.page = page
 
+        # --- NEW: discover a real Bet365 WebSocket URL using a live browser page ---
+        try:
+            bet365_page = await browser.new_page(viewport={'width': 412, 'height': 915})
+            logger.info("Discovering Bet365 WebSocket URL...")
+            await self.bet365.discover_ws_url(bet365_page)
+        except Exception as e:
+            logger.warning(f"Bet365 URL discovery failed: {e}")
+        # --- END NEW ---
+
         self.executor = BetExecutor(self.alerter, self.account_manager, None)
         self.executor.current_account = self.account_manager.get_active()
 
