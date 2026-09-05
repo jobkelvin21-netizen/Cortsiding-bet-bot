@@ -6,7 +6,7 @@ from loguru import logger
 
 from config import Config
 from auth_sportybet_login import SportyBetAuth
-from feeds.bet365_ws import Bet365Feed  # Changed to bet365 WebSocket
+from feeds.bet365_ws import Bet365Feed  # Now powered by Odds-API.io
 from feeds.sportybet_api import SportyBetFeed
 from core.detector import SlowGameDetector
 from core.executor import BetExecutor
@@ -19,7 +19,8 @@ class ArbitrageBot:
         self.account_manager = AccountManager()
         self.alerter = TelegramAlerter()
         self.auth = SportyBetAuth()
-        self.bet365 = Bet365Feed(self.on_bet365)  # Bet365 WebSocket
+        self.bet365 = Bet365Feed(self.on_bet365)
+        self.bet365.set_api_key(Config.ODDS_API_KEY)
         self.sportybet = SportyBetFeed()
         self.detector = SlowGameDetector()
         self.executor = None
@@ -58,7 +59,7 @@ class ArbitrageBot:
         await self.setup()
 
         logger.info("="*60)
-        logger.info("BOT STARTING - BET365 WEBSOCKET + SPORTYBET")
+        logger.info("BOT STARTING - ODDS-API.IO WEBSOCKET + SPORTYBET")
         logger.info("="*60)
 
         print("\n" + "="*60)
@@ -103,15 +104,6 @@ class ArbitrageBot:
         self.auth.browser = browser
         self.auth.page = page
 
-        # --- NEW: discover a real Bet365 WebSocket URL using a live browser page ---
-        try:
-            bet365_page = await browser.new_page(viewport={'width': 412, 'height': 915})
-            logger.info("Discovering Bet365 WebSocket URL...")
-            await self.bet365.discover_ws_url(bet365_page)
-        except Exception as e:
-            logger.warning(f"Bet365 URL discovery failed: {e}")
-        # --- END NEW ---
-
         self.executor = BetExecutor(self.alerter, self.account_manager, None)
         self.executor.current_account = self.account_manager.get_active()
 
@@ -122,8 +114,7 @@ class ArbitrageBot:
         mode = "TEST" if Config.TEST_MODE else "REAL"
         await self.alerter.notify_startup(bal, mode)
 
-        # Start bet365 WebSocket (ULTRA FAST)
-        logger.info("Starting Bet365 WebSocket feed...")
+        logger.info("Starting Odds-API.io WebSocket feed...")
         self.running = True
 
         try:
@@ -135,13 +126,13 @@ class ArbitrageBot:
         asyncio.create_task(self.check_mode_switch())
         asyncio.create_task(self.daily_report())
 
-        logger.success("Bot running! Bet365 WebSocket is LIVE")
+        logger.success("Bot running! Odds-API.io WebSocket is LIVE")
 
         while self.running:
             await asyncio.sleep(1)
 
     async def on_bet365(self, data):
-        """Bet365 WebSocket callback - ULTRA FAST"""
+        """Odds-API.io WebSocket callback - ULTRA FAST"""
         try:
             await self.detector.on_bet365(data)
             if self.detector.is_slow(data['match_id']):
