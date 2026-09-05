@@ -18,8 +18,7 @@ class Bet365Feed:
     async def discover_ws_url(self, page):
         """
         Use a real logged-in Playwright page to capture the actual
-        WebSocket URL bet365 connects to. This is more reliable than
-        guessing, since it observes the real browser's live connection.
+        WebSocket URL bet365 connects to.
         """
         ws_url_found = asyncio.Future()
 
