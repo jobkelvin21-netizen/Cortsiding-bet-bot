@@ -4,127 +4,109 @@ import threading
 import time
 from typing import Callable, Dict, List
 from datetime import datetime
-from urllib.parse import urlencode
-import websocket
 from loguru import logger
+from config import Config
 
 
 class Bet365Feed:
+    """
+    Fast-feed source: Polymarket sports WebSocket (confirmed working,
+    no auth needed). Kept the class/file name for compatibility with
+    main.py — internally this is Polymarket only.
+    """
+
     def __init__(self, callback: Callable):
         self.callback = callback
-        self.api_key = None
-        self.ws_url = None
         self.running = False
-        self.matches: Dict = {}
-        self.last_seq = 0
-        self._ws = None
+        self.matches: Dict[str, dict] = {}
         self._loop = None
-
-    def set_api_key(self, api_key: str):
-        self.api_key = api_key
-        self._build_url()
-
-    def _build_url(self):
-        params = {
-            'apiKey': self.api_key,
-            'markets': 'ML,Spread,Totals',
-            'sport': 'football',
-            'status': 'live'
-        }
-        if self.last_seq > 0:
-            params['lastSeq'] = self.last_seq
-        self.ws_url = f"wss://api.odds-api.io/v3/ws?{urlencode(params)}"
-
-    def _on_open(self, ws):
-        logger.success("Odds-API WebSocket connection opened")
+        self._ws = None
 
     def _on_message(self, ws, message):
+        if message == "ping":
+            ws.send("pong")
+            return
         try:
             data = json.loads(message)
-            msg_type = data.get('type')
-
-            if msg_type == 'welcome':
-                logger.success(f"Connected! Bookmakers: {data.get('bookmakers')} | Filters: {data.get('sport_filter')}")
+            if not isinstance(data, dict) or 'homeTeam' not in data:
                 return
 
-            if msg_type == 'resync_required':
-                logger.warning(f"Resync required: {data.get('reason')} — resetting seq")
-                self.last_seq = 0
-                return
+            elapsed_raw = data.get('elapsed')
+            elapsed_seconds = self._parse_elapsed(elapsed_raw)
+            if elapsed_seconds is None:
+                return  # esports / non-clock sports — nothing to compare
 
-            if 'seq' in data:
-                self.last_seq = data['seq']
-
-            if msg_type in ('created', 'updated'):
-                match = self._parse_match(data)
-                if match and self.callback and self._loop:
-                    asyncio.run_coroutine_threadsafe(self.callback(match), self._loop)
-
-            elif msg_type == 'deleted':
-                self.matches.pop(data.get('id'), None)
-
-        except Exception as e:
-            logger.error(f"Message processing error: {e}")
-
-    def _parse_match(self, data: Dict):
-        try:
-            match_id = data.get('id')
-            bookie = data.get('bookie', '')
-            markets = data.get('markets', [])
-
-            home_odds = draw_odds = away_odds = None
-            for market in markets:
-                if market.get('name') == 'ML' and market.get('odds'):
-                    o = market['odds'][0]
-                    home_odds, draw_odds, away_odds = o.get('home'), o.get('draw'), o.get('away')
-
-            return {
-                'id': match_id,
-                'match_id': match_id,
-                'bookie': bookie,
-                'home': 'Home',
-                'away': 'Away',
-                'home_team': 'Home',
-                'away_team': 'Away',
-                'home_score': 0,
-                'away_score': 0,
-                'home_odds': home_odds,
-                'draw_odds': draw_odds,
-                'away_odds': away_odds,
-                'league': 'Live',
-                'timestamp': datetime.now()
+            match = {
+                'source': 'polymarket',
+                'match_id': f"poly:{data.get('gameId')}",
+                'home_team': data.get('homeTeam', ''),
+                'away_team': data.get('awayTeam', ''),
+                'period': data.get('period', ''),
+                'played_seconds': elapsed_seconds,
+                'live': data.get('live', False),
+                'ended': data.get('ended', False),
+                'league': data.get('leagueAbbreviation', ''),
+                'timestamp': datetime.now(),
             }
+            score = data.get('score', '')
+            if '-' in str(score):
+                try:
+                    h, a = str(score).split('-')
+                    match['home_score'] = int(h)
+                    match['away_score'] = int(a)
+                except Exception:
+                    match['home_score'] = 0
+                    match['away_score'] = 0
+
+            self.matches[match['match_id']] = match
+            if self.callback and self._loop:
+                asyncio.run_coroutine_threadsafe(self.callback(match), self._loop)
+
         except Exception as e:
-            logger.error(f"Match parse error: {e}")
+            logger.debug(f"Polymarket message error: {e}")
+
+    def _parse_elapsed(self, elapsed_raw) -> float:
+        if elapsed_raw is None:
             return None
+        try:
+            elapsed_str = str(elapsed_raw).strip()
+            if ':' in elapsed_str:
+                parts = [int(p) for p in elapsed_str.split(':')]
+                if len(parts) == 2:
+                    return float(parts[0] * 60 + parts[1])
+            else:
+                return float(elapsed_str) * 60
+        except Exception:
+            return None
+        return None
 
     def _on_error(self, ws, error):
-        logger.error(f"WebSocket error: {error}")
+        logger.debug(f"Polymarket WS error: {error}")
 
-    def _on_close(self, ws, close_status_code, close_msg):
-        logger.warning("WebSocket disconnected")
+    def _on_close(self, ws, code, msg):
+        logger.warning("Polymarket WebSocket disconnected")
         if self.running:
             time.sleep(3)
-            self._run_ws()
+            self._run()
 
-    def _run_ws(self):
-        self._build_url()
-        self._ws = websocket.WebSocketApp(
-            self.ws_url,
+    def _on_open(self, ws):
+        logger.success("Polymarket sports WebSocket connected!")
+
+    def _run(self):
+        self._ws = __import__('websocket').WebSocketApp(
+            Config.POLYMARKET_WS_URL,
             on_open=self._on_open,
             on_message=self._on_message,
             on_error=self._on_error,
-            on_close=self._on_close
+            on_close=self._on_close,
         )
         self._ws.run_forever()
 
     async def start(self):
-        if not self.api_key:
-            logger.error("No API key set — call set_api_key() before starting")
-            return
         self.running = True
         self._loop = asyncio.get_event_loop()
-        threading.Thread(target=self._run_ws, daemon=True).start()
+        threading.Thread(target=self._run, daemon=True).start()
+        logger.success("Fast feed started: Polymarket")
 
     def stop(self):
         self.running = False
