@@ -56,6 +56,8 @@ class SlowGameDetector:
                 return
 
             key = self._team_key(home, away)
+            logger.info(f"[FAST] {home} vs {away} -> key={key} played_seconds={data.get('played_seconds')}")
+
             record = self._get_or_create(key, home, away)
 
             record.fast_played_seconds = data.get('played_seconds')
@@ -77,6 +79,8 @@ class SlowGameDetector:
                 return
 
             key = self._team_key(home, away)
+            logger.info(f"[SB] {home} vs {away} -> key={key} played_seconds={data.get('played_seconds')}")
+
             record = self._get_or_create(key, home, away)
 
             record.sb_event_id = data.get('match_id')
