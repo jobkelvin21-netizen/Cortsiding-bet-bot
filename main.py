@@ -6,7 +6,7 @@ from loguru import logger
 
 from config import Config
 from auth_sportybet_login import SportyBetAuth
-from feeds.bet365_ws import Bet365Feed  # Now powered by Odds-API.io
+from feeds.bet365_ws import Bet365Feed  # Now: combined Polymarket + SX Bet fast feed
 from feeds.sportybet_api import SportyBetFeed
 from core.detector import SlowGameDetector
 from core.executor import BetExecutor
@@ -20,7 +20,6 @@ class ArbitrageBot:
         self.alerter = TelegramAlerter()
         self.auth = SportyBetAuth()
         self.bet365 = Bet365Feed(self.on_bet365)
-        self.bet365.set_api_key(Config.ODDS_API_KEY)
         self.sportybet = SportyBetFeed()
         self.detector = SlowGameDetector()
         self.executor = None
@@ -59,7 +58,7 @@ class ArbitrageBot:
         await self.setup()
 
         logger.info("="*60)
-        logger.info("BOT STARTING - ODDS-API.IO WEBSOCKET + SPORTYBET")
+        logger.info("BOT STARTING - POLYMARKET + SX BET FAST FEED + SPORTYBET")
         logger.info("="*60)
 
         print("\n" + "="*60)
@@ -114,7 +113,7 @@ class ArbitrageBot:
         mode = "TEST" if Config.TEST_MODE else "REAL"
         await self.alerter.notify_startup(bal, mode)
 
-        logger.info("Starting Odds-API.io WebSocket feed...")
+        logger.info("Starting fast feed (Polymarket + SX Bet)...")
         self.running = True
 
         try:
@@ -126,23 +125,24 @@ class ArbitrageBot:
         asyncio.create_task(self.check_mode_switch())
         asyncio.create_task(self.daily_report())
 
-        logger.success("Bot running! Odds-API.io WebSocket is LIVE")
+        logger.success("Bot running! Monitoring all live matches for slow reactions.")
 
         while self.running:
             await asyncio.sleep(1)
 
     async def on_bet365(self, data):
-        """Odds-API.io WebSocket callback - ULTRA FAST"""
+        """Fast feed (Polymarket/SX Bet) callback."""
         try:
             await self.detector.on_bet365(data)
-            if self.detector.is_slow(data['match_id']):
-                await self.handle_goal(data)
         except Exception as e:
-            logger.error(f"Bet365 handler error: {e}")
+            logger.error(f"Fast feed handler error: {e}")
 
     async def on_sb(self, data):
         try:
             await self.detector.on_sportybet(data, self.on_slow_found)
+            match_id = data.get('match_id')
+            if match_id and self.detector.is_slow(match_id):
+                await self.handle_goal(data)
         except Exception as e:
             logger.error(f"SportyBet handler error: {e}")
 
@@ -151,7 +151,7 @@ class ArbitrageBot:
         if mid in self.slow_pages:
             return
 
-        logger.info(f"Monitor: {game['home_team']} vs {game['away_team']}")
+        logger.info(f"Monitor: {game['home_team']} vs {game['away_team']} (lag: {game.get('gap_seconds', 0):.1f}s)")
 
         try:
             page = self.auth.page
@@ -183,12 +183,9 @@ class ArbitrageBot:
 
         try:
             prev_score = self.match_last_score.get(mid, (0, 0))
-            curr_score = (data['home_score'], data['away_score'])
+            curr_score = (data.get('home_score', 0), data.get('away_score', 0))
 
             if curr_score == prev_score:
-                return
-
-            if data.get('var_status') or data.get('offside_flag'):
                 return
 
             scoring_team = data['home_team'] if curr_score[0] > prev_score[0] else data['away_team']
@@ -196,9 +193,6 @@ class ArbitrageBot:
 
             page = self.slow_pages[mid]
             match = self.detector.get(mid)
-
-            league = match.get('league', '') if match else ''
-            time_str = datetime.now().strftime('%H:%M')
 
             odds = await self.get_odds(page, scoring_team)
             if odds <= 0:
