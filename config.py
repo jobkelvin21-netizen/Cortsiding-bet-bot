@@ -14,9 +14,14 @@ class Config:
     MAX_CONSECUTIVE_SLOW = int(os.getenv('MAX_CONSECUTIVE_SLOW', '2'))
     ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY', 'auto')
     PROXY = os.getenv('PROXY', None)
+
     SPORTYBET_BASE_URL = 'https://www.sportybet.com'
-    SPORTYBET_API_BASE = 'https://www.sportybet.com/api'
-    ODDS_API_KEY = os.getenv('ODDS_API_KEY', '')
+    SPORTYBET_API_BASE = 'https://www.sportybet.com/api/ng/factsCenter'
+
+    POLYMARKET_WS_URL = 'wss://sports-api.polymarket.com/ws'
+
+    SLOW_THRESHOLD_SECONDS = float(os.getenv('SLOW_THRESHOLD_SECONDS', '5'))
+
     MAX_STACK_PER_GOAL = 3
     MIN_STACK_DELAY = 0.8
     MAX_STACK_DELAY = 1.5
