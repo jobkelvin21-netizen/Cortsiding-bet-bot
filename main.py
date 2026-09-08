@@ -6,13 +6,14 @@ from loguru import logger
 
 from config import Config
 from auth_sportybet_login import SportyBetAuth
-from feeds.bet365_ws import Bet365Feed  # Now: combined Polymarket + SX Bet fast feed
+from feeds.bet365_ws import Bet365Feed
 from feeds.sportybet_api import SportyBetFeed
 from core.detector import SlowGameDetector
 from core.executor import BetExecutor
 from core.cashout import CashOutManager
 from utils.telegram import TelegramAlerter
 from utils.account_manager import AccountManager
+
 
 class ArbitrageBot:
     def __init__(self):
@@ -58,7 +59,7 @@ class ArbitrageBot:
         await self.setup()
 
         logger.info("="*60)
-        logger.info("BOT STARTING - POLYMARKET + SX BET FAST FEED + SPORTYBET")
+        logger.info("BOT STARTING - POLYMARKET FAST FEED + SPORTYBET")
         logger.info("="*60)
 
         print("\n" + "="*60)
@@ -113,7 +114,7 @@ class ArbitrageBot:
         mode = "TEST" if Config.TEST_MODE else "REAL"
         await self.alerter.notify_startup(bal, mode)
 
-        logger.info("Starting fast feed (Polymarket + SX Bet)...")
+        logger.info("Starting fast feed (Polymarket)...")
         self.running = True
 
         try:
@@ -131,7 +132,6 @@ class ArbitrageBot:
             await asyncio.sleep(1)
 
     async def on_bet365(self, data):
-        """Fast feed (Polymarket/SX Bet) callback."""
         try:
             await self.detector.on_bet365(data)
         except Exception as e:
@@ -152,6 +152,7 @@ class ArbitrageBot:
             return
 
         logger.info(f"Monitor: {game['home_team']} vs {game['away_team']} (lag: {game.get('gap_seconds', 0):.1f}s)")
+        await self.alerter.notify_slow_match_found(game['home_team'], game['away_team'], game.get('gap_seconds', 0))
 
         try:
             page = self.auth.page
@@ -205,7 +206,7 @@ class ArbitrageBot:
                 logger.info("Account switch requested")
             elif result is True:
                 bet_id = f"{mid}_G{goal_num}_{int(time.time())}"
-                stake = self.executor.calc_stake(odds)
+                stake = self.executor.calc_stake(odds) if not self.executor.validation_bet_placed or self.executor.validation_passed else Config.VALIDATION_STAKE
                 self.cashout.register(mid, bet_id, stake, f"Goal {goal_num}")
                 asyncio.create_task(self.cashout.monitor(mid, data, page))
 
@@ -234,6 +235,7 @@ class ArbitrageBot:
                 await self.alerter.send_daily_report()
             except Exception as e:
                 logger.error(f"Report error: {e}")
+
 
 if __name__ == "__main__":
     bot = ArbitrageBot()
