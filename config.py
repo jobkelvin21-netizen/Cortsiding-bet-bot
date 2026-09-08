@@ -19,8 +19,10 @@ class Config:
     SPORTYBET_API_BASE = 'https://www.sportybet.com/api/ng/factsCenter'
 
     POLYMARKET_WS_URL = 'wss://sports-api.polymarket.com/ws'
+    SLOW_THRESHOLD_SECONDS = float(os.getenv('SLOW_THRESHOLD_SECONDS', '3'))
 
-    SLOW_THRESHOLD_SECONDS = float(os.getenv('SLOW_THRESHOLD_SECONDS', '5'))
+    VALIDATION_MODE = os.getenv('VALIDATION_MODE', 'true').lower() == 'true'
+    VALIDATION_STAKE = float(os.getenv('VALIDATION_STAKE', '10'))
 
     MAX_STACK_PER_GOAL = 3
     MIN_STACK_DELAY = 0.8
