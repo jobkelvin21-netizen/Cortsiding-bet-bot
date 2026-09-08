@@ -9,6 +9,7 @@ from config import Config
 from browser.fast_executor import FastExecutor
 from utils.telegram import TelegramAlerter
 
+
 class BetExecutor:
     def __init__(self, alerter: TelegramAlerter, account_manager, learning=None):
         self.alerter = alerter
@@ -20,28 +21,32 @@ class BetExecutor:
         self.fast = FastExecutor()
         self.current_account = None
         self.match_goal_count = {}
-        
+
+        # Validation-mode state
+        self.validation_bet_placed = False
+        self.validation_passed = False
+
     async def fetch_balance(self, page: Page) -> float:
         try:
-            for sel in ['.user-balance', '.account-balance']:
+            for sel in ['.user-balance', '.account-balance', '[class*="balance"]']:
                 elem = await page.query_selector(sel)
                 if elem:
                     text = await elem.text_content()
-                    bal = float(text.replace('₦', '').replace(',', '').replace(' ', ''))
+                    bal = float(text.replace('₦', '').replace('NGN', '').replace(',', '').strip())
                     self.balance = bal
                     if self.current_account:
                         self.account_manager.update_balance(self.current_account['username'], bal)
                     return bal
-        except:
+        except Exception:
             pass
         return self.balance
-        
+
     def calc_stake(self, odds: float) -> float:
         if odds <= 1.0 or self.balance <= 0:
             return 0
         stake_for_profit = Config.MAX_PROFIT_PER_BET / (odds - 1)
         return min(self.balance, stake_for_profit)
-        
+
     def get_goal_number(self, match_id: str, current_score: tuple) -> int:
         if match_id not in self.match_goal_count:
             self.match_goal_count[match_id] = 0
@@ -49,46 +54,65 @@ class BetExecutor:
         if total_goals > self.match_goal_count[match_id]:
             self.match_goal_count[match_id] = total_goals
         return self.match_goal_count[match_id]
-        
+
     def can_split_by_balance(self, stake: float) -> int:
         if stake <= 0:
             return 1
         max_splits = int(self.balance / stake)
         return min(max_splits, 3)
-        
+
     async def is_dying_minutes(self, page: Page) -> bool:
         try:
-            time_elem = await page.query_selector('.match-time, .timer, [data-testid="match-time"]')
+            time_elem = await page.query_selector('[class*="timer"], [class*="match-time"]')
             if time_elem:
                 time_text = await time_elem.text_content()
-                minute = int(time_text.split(':')[0].split('\'')[0])
+                clean = time_text.split('+')[0].split(':')[0].strip("'")
+                minute = int(clean)
                 return minute >= 80
-        except:
+        except Exception:
             pass
         return False
-        
+
     def should_split(self, odds: float, is_dying: bool, split_count: int) -> bool:
         if split_count >= 2:
             return True
         if odds >= 10.0 and is_dying:
             return True
         return False
-        
+
     async def execute(self, page: Page, match: dict, team: str, odds: float, goal_num: int = 1) -> bool:
         if self.stopped:
             return False
-            
+
+        match_name = f"{match['home_team']} vs {match['away_team']}"
+
+        # --- VALIDATION MODE: one real ₦10 bet, one time only, to prove
+        # the whole pipeline actually works end-to-end. On success, it
+        # automatically switches to normal full-stake betting from then on. ---
+        if Config.VALIDATION_MODE and not self.validation_bet_placed:
+            self.validation_bet_placed = True
+            success = await self.run_validation_bet(page, match, team, odds, goal_num, match_name)
+            if success:
+                self.validation_passed = True
+                logger.success("✅ Validation passed — full staking now ACTIVE for the rest of this session")
+            return success
+
+        if Config.VALIDATION_MODE and self.validation_bet_placed and not self.validation_passed:
+            # Validation failed earlier — don't risk further real bets blindly
+            logger.warning(f"Validation previously failed — skipping bet on {match_name}")
+            return False
+
+        # Normal full-stake flow (runs directly if VALIDATION_MODE is off,
+        # or automatically once validation has passed)
         self.balance = await self.fetch_balance(page)
         stake = self.calc_stake(odds)
-        
+
         if stake < 100:
             return False
-            
-        match_name = f"{match['home_team']} vs {match['away_team']}"
-        
+
         split_count = self.can_split_by_balance(stake)
         dying = await self.is_dying_minutes(page)
-        
+
         if self.should_split(odds, dying, split_count):
             return await self.split_bet(page, match, team, odds, goal_num, split_count, dying)
         else:
@@ -97,106 +121,157 @@ class BetExecutor:
                 await self.alerter.notify_goal_detected(match_name, team, odds, goal_num)
                 await self.alerter.notify_bet_placed(match_name, team, stake, odds, f"TEST-G{goal_num}", 1, 1)
                 return True
-                
+
             await self.alerter.notify_goal_detected(match_name, team, odds, goal_num)
             return await self.place_single_bet(page, match, team, stake, odds, 1, goal_num, total_stack=1)
-            
-    async def split_bet(self, page: Page, match: dict, team: str, odds: float, 
+
+    async def run_validation_bet(self, page: Page, match: dict, team: str, odds: float,
+                                  goal_num: int, match_name: str) -> bool:
+        stake = Config.VALIDATION_STAKE
+        logger.info(f"🔬 VALIDATION BET STARTING: ₦{stake} on {team} @ {odds}")
+
+        await self.alerter.notify_validation_start(match_name, team, odds, goal_num, stake)
+
+        self.balance = await self.fetch_balance(page)
+        await self.alerter.notify_validation_step("Balance read", f"₦{self.balance:,.2f} confirmed")
+
+        success = await self.place_single_bet(
+            page, match, team, stake, odds, stack_num=1, goal_num=goal_num, total_stack=1
+        )
+
+        if success:
+            logger.success("✅ VALIDATION BET SUCCEEDED — full pipeline confirmed working")
+            await self.alerter.notify_validation_result(
+                success=True, match_name=match_name, team=team, stake=stake, odds=odds
+            )
+        else:
+            logger.error("❌ VALIDATION BET FAILED — pipeline needs fixing before real use")
+            await self.alerter.notify_validation_result(
+                success=False, match_name=match_name, team=team, stake=stake, odds=odds
+            )
+
+        return success
+
+    async def split_bet(self, page: Page, match: dict, team: str, odds: float,
                         goal_num: int, split_count: int, dying: bool):
         match_name = f"{match['home_team']} vs {match['away_team']}"
         split_stake = self.balance / split_count
-        
+
         reason = "Balance allows" if not dying else f"High odds {odds} + dying minutes"
         logger.info(f"💰 SPLITTING ({reason}): {split_count} bets of ₦{split_stake:,.0f}")
-        
+
         await self.alerter.notify_goal_detected(match_name, team, odds, goal_num)
         if dying and odds >= 10:
             await self.alerter.send(f"🚀 <b>BOOST {odds}!</b> Dying minutes - splitting bet")
-        
+
         total_bets = 0
         total_staked = 0
-        
+
         for i in range(split_count):
             if self.balance < 100:
                 break
-                
+
             success = await self.place_single_bet(
                 page, match, team, split_stake, odds, i+1, goal_num, split_count
             )
-            
+
             if success:
                 total_bets += 1
                 total_staked += split_stake
                 self.balance -= split_stake
-                
                 if i < split_count - 1:
                     await asyncio.sleep(random.uniform(0.5, 1.0))
             else:
                 break
-                
+
         if total_bets > 0:
             await self.alerter.notify_stack_complete(match_name, total_bets, total_staked)
-            
+
         return total_bets > 0
-        
-    async def place_single_bet(self, page: Page, match: dict, team: str, stake: float, 
+
+    async def place_single_bet(self, page: Page, match: dict, team: str, stake: float,
                                odds: float, stack_num: int, goal_num: int, total_stack: int = 1) -> bool:
         try:
             start_time = time.time()
             match_name = f"{match['home_team']} vs {match['away_team']}"
-            
+
             if stack_num == 1 and goal_num == 1:
                 await asyncio.sleep(random.uniform(0.5, 1.0))
                 await page.bring_to_front()
-            
+
             if stack_num == 1:
-                await self.fast.scroll_to(page, '[data-market="next_goal"], text=Next Goal')
-                if not await self.fast.fast_click(page, 'text=Next Goal'):
-                    await self.fast.fast_click(page, '[data-market="next_goal"]')
+                await self.fast.scroll_to(page, 'text=Next Goal')
+                await self.fast.fast_click(page, 'text=Next Goal')
                 await asyncio.sleep(0.3)
-            
+
             if not await self.fast.fast_click(page, f'text={team}'):
-                await page.evaluate(f'document.querySelector(\'[data-team="{team}"]\')?.click()')
-            
-            await self.fast.fast_type(page, 'input.stake-input', str(int(stake)))
+                logger.warning(f"Could not click team selection for {team}")
+                return False
+
+            stake_input = await page.query_selector(
+                'input[type="number"], input[type="tel"][value], input[inputmode="numeric"]'
+            )
+            if stake_input:
+                await stake_input.fill(str(int(stake)))
+            else:
+                await self.fast.fast_type(page, 'input', str(int(stake)))
+
             await asyncio.sleep(random.uniform(0.5, 1.0))
-            
-            await self.fast.fast_click(page, 'button.place-bet')
-            
+
+            clicked = await self.fast.fast_click(page, 'button:has-text("Accept Changes")')
+            if not clicked:
+                clicked = await self.fast.fast_click(page, 'button:has-text("Place Bet")')
+
+            if not clicked:
+                logger.error("Could not find submit button (Accept Changes / Place Bet)")
+                await self.alerter.notify_submission_slow(match_name, "Submit button not found", 0)
+                return False
+
             try:
-                await page.wait_for_selector('.bet-confirmation, .bet-success', timeout=5000)
+                await page.wait_for_selector(
+                    'text=Rebet, [class*="success"], [class*="confirmation"]',
+                    timeout=5000
+                )
                 elapsed = time.time() - start_time
-                
+
+                # Immediate alert the moment ANY submission exceeds the
+                # configured timeout — separate from the escalation logic
+                # for repeated slow submissions.
                 if elapsed > Config.SUBMISSION_TIMEOUT:
+                    await self.alerter.notify_submission_slow(match_name, "Confirmed but slow", elapsed)
                     return await self.handle_slow(match)
-                    
+
                 self.consecutive_slow = 0
-                
+
                 if not Config.TEST_MODE:
                     bet_id = f"{match['match_id']}_G{goal_num}_S{stack_num}_{int(time.time())}"
-                    await self.alerter.notify_bet_placed(match_name, team, stake, odds, bet_id, 
+                    await self.alerter.notify_bet_placed(match_name, team, stake, odds, bet_id,
                                                          stack_num, total_stack)
-                
+
+                self.log_bet(match_name, team, stake, odds,
+                            f"{match['match_id']}_G{goal_num}_S{stack_num}")
                 return True
-                
-            except:
+
+            except Exception:
                 elapsed = time.time() - start_time
+                await self.alerter.notify_submission_slow(match_name, "No confirmation seen", elapsed)
                 if elapsed > Config.SUBMISSION_TIMEOUT:
                     return await self.handle_slow(match)
                 return False
-                
+
         except Exception as e:
             logger.error(f"Bet error: {e}")
+            await self.alerter.notify_error(f"Bet execution error on {match.get('home_team','')} vs {match.get('away_team','')}: {e}")
             return False
-            
+
     async def handle_slow(self, match):
         self.consecutive_slow += 1
         logger.warning(f"Slow #{self.consecutive_slow}")
-        
+
         if self.consecutive_slow >= Config.MAX_CONSECUTIVE_SLOW:
             old_user = self.current_account['username'] if self.current_account else 'unknown'
             await self.alerter.notify_account_flagged(old_user)
-            
+
             old, new = self.account_manager.mark_limited()
             if new:
                 await self.alerter.notify_account_switched(old, new['username'])
@@ -206,9 +281,9 @@ class BetExecutor:
             else:
                 self.stopped = True
                 await self.alerter.notify_error("No accounts left!")
-                
+
         return False
-        
+
     def log_bet(self, match, team, stake, odds, bet_id):
         with open('bets.log', 'a') as f:
             f.write(f"{datetime.now()}: {match}|{team}|₦{stake}|@{odds}|{bet_id}\n")
