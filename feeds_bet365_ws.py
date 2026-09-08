@@ -5,14 +5,15 @@ import time
 from typing import Callable, Dict, List
 from datetime import datetime
 from loguru import logger
-from config import Config
+import websocket
 
 
 class Bet365Feed:
     """
     Fast-feed source: Polymarket sports WebSocket (confirmed working,
     no auth needed). Kept the class/file name for compatibility with
-    main.py — internally this is Polymarket only.
+    main.py — internally this is Polymarket only. Filters strictly
+    to soccer/football matches (confirmed field: eventState.type).
     """
 
     def __init__(self, callback: Callable):
@@ -31,10 +32,13 @@ class Bet365Feed:
             if not isinstance(data, dict) or 'homeTeam' not in data:
                 return
 
-            elapsed_raw = data.get('elapsed')
-            elapsed_seconds = self._parse_elapsed(elapsed_raw)
+            event_type = data.get('eventState', {}).get('type', '')
+            if event_type != 'soccer':
+                return
+
+            elapsed_seconds = self._parse_elapsed(data.get('elapsed'))
             if elapsed_seconds is None:
-                return  # esports / non-clock sports — nothing to compare
+                return
 
             match = {
                 'source': 'polymarket',
@@ -65,7 +69,7 @@ class Bet365Feed:
         except Exception as e:
             logger.debug(f"Polymarket message error: {e}")
 
-    def _parse_elapsed(self, elapsed_raw) -> float:
+    def _parse_elapsed(self, elapsed_raw):
         if elapsed_raw is None:
             return None
         try:
@@ -90,11 +94,11 @@ class Bet365Feed:
             self._run()
 
     def _on_open(self, ws):
-        logger.success("Polymarket sports WebSocket connected!")
+        logger.success("Polymarket sports WebSocket connected! (soccer-only filter active)")
 
     def _run(self):
-        self._ws = __import__('websocket').WebSocketApp(
-            Config.POLYMARKET_WS_URL,
+        self._ws = websocket.WebSocketApp(
+            "wss://sports-api.polymarket.com/ws",
             on_open=self._on_open,
             on_message=self._on_message,
             on_error=self._on_error,
@@ -106,7 +110,7 @@ class Bet365Feed:
         self.running = True
         self._loop = asyncio.get_event_loop()
         threading.Thread(target=self._run, daemon=True).start()
-        logger.success("Fast feed started: Polymarket")
+        logger.success("Fast feed started: Polymarket (soccer only)")
 
     def stop(self):
         self.running = False
