@@ -48,7 +48,6 @@ class SlowGameDetector:
         return self.records[key]
 
     async def on_bet365(self, data: dict):
-        """Callback for the fast feed (Polymarket)."""
         try:
             home = data.get('home_team', '')
             away = data.get('away_team', '')
@@ -59,7 +58,6 @@ class SlowGameDetector:
             logger.info(f"[FAST] {home} vs {away} -> key={key} played_seconds={data.get('played_seconds')}")
 
             record = self._get_or_create(key, home, away)
-
             record.fast_played_seconds = data.get('played_seconds')
             record.fast_home_score = data.get('home_score', record.fast_home_score)
             record.fast_away_score = data.get('away_score', record.fast_away_score)
@@ -71,7 +69,6 @@ class SlowGameDetector:
             logger.error(f"Fast feed handler error: {e}")
 
     async def on_sportybet(self, data: dict, callback: Callable):
-        """Callback for feeds/sportybet_api.py."""
         try:
             home = data.get('home_team', '')
             away = data.get('away_team', '')
@@ -82,7 +79,6 @@ class SlowGameDetector:
             logger.info(f"[SB] {home} vs {away} -> key={key} played_seconds={data.get('played_seconds')}")
 
             record = self._get_or_create(key, home, away)
-
             record.sb_event_id = data.get('match_id')
             record.sb_played_seconds = data.get('played_seconds')
             record.sb_home_score = data.get('home_score', record.sb_home_score)
