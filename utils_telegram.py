@@ -13,8 +13,6 @@ class TelegramAlerter:
         self.session_start = datetime.now()
         self.total_bets = 0
         self.total_staked = 0.0
-        self.total_wins = 0
-        self.total_losses = 0
         self.total_cashed_out = 0
         self.total_cashout_profit = 0.0
         self.matches_flagged_slow = 0
@@ -43,16 +41,14 @@ class TelegramAlerter:
         minutes, _ = divmod(remainder, 60)
         return f"{hours}h {minutes}m"
 
-    async def notify_startup(self, balance: float, mode: str):
-        mode_emoji = "🧪" if mode == "TEST" else "💰"
+    async def notify_startup(self, balance: float):
         msg = (
-            f"{mode_emoji} <b>BOT STARTED</b>\n"
+            f"💰 <b>BOT STARTED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Mode: <b>{mode}</b>\n"
             f"Starting balance: <b>₦{balance:,.2f}</b>\n"
             f"Data sources: Polymarket (fast) + SportyBet (own feed)\n"
             f"Slow-detection threshold: <b>{Config.SLOW_THRESHOLD_SECONDS}s</b>\n"
-            f"Validation mode: <b>{'ON — first slow match will trigger a ₦' + str(int(Config.VALIDATION_STAKE)) + ' test bet' if Config.VALIDATION_MODE else 'OFF — full staking active'}</b>\n"
+            f"First slow match will trigger a ₦{int(Config.VALIDATION_STAKE)} validation bet.\n"
             f"Started: {self.session_start.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Watching all live football matches for Next Goal opportunities."
@@ -133,8 +129,6 @@ class TelegramAlerter:
         await self.send(msg)
 
     async def notify_submission_slow(self, match_name: str, reason: str, elapsed_seconds: float):
-        """Fires immediately, every time a submission takes too long —
-        separate from the account-flagging escalation logic."""
         self.slow_submissions += 1
         msg = (
             f"🐌 <b>SLOW SUBMISSION WARNING</b>\n"
@@ -167,19 +161,6 @@ class TelegramAlerter:
         )
         await self.send(msg)
 
-    async def notify_mode_switch(self):
-        msg = (
-            f"🚨 <b>SWITCHING TO REAL MONEY MODE</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Test period ({Config.TEST_DURATION_HOURS}h) has ended.\n"
-            f"The bot will now place <b>real bets with real money</b>.\n"
-            f"Test session summary:\n"
-            f"• {self.total_bets} test bets simulated\n"
-            f"• ₦{self.total_staked:,.2f} would have been staked\n"
-            f"• {self.matches_flagged_slow} slow matches flagged"
-        )
-        await self.send(msg)
-
     async def notify_error(self, error_message: str):
         msg = (
             f"❌ <b>ERROR</b>\n"
@@ -194,16 +175,16 @@ class TelegramAlerter:
         msg = (
             f"🔬 <b>VALIDATION BET STARTING</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"This is a ONE-TIME real bet at minimal stake to confirm\n"
-            f"the entire pipeline works end-to-end.\n\n"
+            f"ONE-TIME real bet at minimal stake to confirm the entire\n"
+            f"pipeline works end-to-end.\n\n"
             f"⚽ Match: {match_name}\n"
             f"🎯 Backing: <b>{team}</b>\n"
             f"⚡ Goal #{goal_num} just detected\n"
             f"📈 Odds: @{odds}\n"
-            f"💵 Validation stake: <b>₦{stake:,.2f}</b> (fixed, real money)\n"
+            f"💵 Validation stake: <b>₦{stake:,.2f}</b> (real money)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"If this succeeds, full staking activates automatically\n"
-            f"for the rest of this session."
+            f"Success -> full staking activates automatically.\n"
+            f"Failure -> bot stops and reports the exact problem."
         )
         await self.send(msg)
 
@@ -212,37 +193,30 @@ class TelegramAlerter:
         await self.send(msg)
 
     async def notify_validation_result(self, success: bool, match_name: str,
-                                        team: str, stake: float, odds: float):
+                                        team: str, stake: float, odds: float,
+                                        error_detail: str = None):
         if success:
             msg = (
                 f"✅ <b>VALIDATION SUCCESSFUL — FULL STAKING NOW ACTIVE</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"⚽ {match_name}\n"
                 f"🎯 {team} @ {odds}\n"
-                f"💵 ₦{stake:,.2f} bet placed and confirmed on SportyBet\n\n"
-                f"✅ Slow-match detection: working\n"
-                f"✅ Match navigation: working\n"
-                f"✅ Next Goal market selection: working\n"
-                f"✅ Team selection: working\n"
-                f"✅ Stake entry: working\n"
-                f"✅ Bet submission: working\n"
-                f"✅ Confirmation detection: working\n"
+                f"💵 ₦{stake:,.2f} bet placed and confirmed\n\n"
+                f"✅ Detection → Navigation → Market select → Team select →\n"
+                f"Stake entry → Submission → Confirmation — all working.\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎉 Full pipeline validated. The bot will now place\n"
-                f"real, full-stake bets on every future slow match detected."
+                f"🎉 Bot will now place real, full-stake bets automatically."
             )
         else:
             msg = (
-                f"❌ <b>VALIDATION FAILED</b>\n"
+                f"❌ <b>VALIDATION FAILED — BOT STOPPED</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"⚽ {match_name}\n"
                 f"🎯 {team} @ {odds}\n"
-                f"💵 Attempted stake: ₦{stake:,.2f}\n\n"
-                f"Something in the click-through (market select, stake\n"
-                f"entry, submit, or confirmation) failed.\n"
+                f"💵 Attempted: ₦{stake:,.2f}\n\n"
+                f"🔍 <b>Problem:</b> {error_detail}\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"Check the terminal logs for the exact error. No further\n"
-                f"bets will be placed until this is fixed."
+                f"The bot has stopped. Fix the issue above and restart."
             )
         await self.send(msg)
 
