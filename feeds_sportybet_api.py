@@ -13,6 +13,7 @@ class SportyBetFeed:
         self.running = False
         self.callback = None
         self.cookies = {}
+        self.connected = False
 
     def _parse_played_seconds(self, played_seconds_str):
         try:
@@ -36,6 +37,7 @@ class SportyBetFeed:
     async def start(self, callback: Callable):
         self.callback = callback
         self.running = True
+        self.connected = False
 
         headers = {
             'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -49,7 +51,7 @@ class SportyBetFeed:
         logger.info(f"SportyBet feed polling: {url}")
 
         async with AsyncSession(headers=headers, impersonate="chrome120") as session:
-            # Visit homepage once to get initial cookies
+            # Get initial cookies
             try:
                 await session.get("https://www.sportybet.com/ng/", timeout=20)
                 logger.info("Visited SportyBet homepage for cookies")
@@ -70,7 +72,6 @@ class SportyBetFeed:
 
                     data = resp.json()
 
-                    # Handle both list and dict responses
                     if isinstance(data, dict):
                         events = data.get('data', [])
                     else:
@@ -81,8 +82,12 @@ class SportyBetFeed:
                         await asyncio.sleep(2)
                         continue
 
+                    # Only show success after we actually received valid data
+                    if not self.connected:
+                        logger.success("SportyBet feed connected successfully!")
+                        self.connected = True
+
                     for detail in events:
-                        # Handle nested events (tournament structure)
                         event_list = detail.get('events', [detail]) if isinstance(detail, dict) else [detail]
 
                         for event in event_list:
