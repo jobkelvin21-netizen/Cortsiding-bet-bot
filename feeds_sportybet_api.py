@@ -51,7 +51,6 @@ class SportyBetFeed:
         logger.info(f"SportyBet feed polling: {url}")
 
         async with AsyncSession(headers=headers, impersonate="chrome120") as session:
-            # Get initial cookies
             try:
                 await session.get("https://www.sportybet.com/ng/", timeout=20)
                 logger.info("Visited SportyBet homepage for cookies")
@@ -82,7 +81,7 @@ class SportyBetFeed:
                         await asyncio.sleep(2)
                         continue
 
-                    # Only show success after we actually received valid data
+                    # Only show success after real data is received
                     if not self.connected:
                         logger.success("SportyBet feed connected successfully!")
                         self.connected = True
@@ -95,37 +94,43 @@ class SportyBetFeed:
                             if not event_id:
                                 continue
 
-                            match = {
-                                'match_id': event_id,
-                                'sportradar_id': self._extract_sportradar_numeric_id(event_id),
-                                'home_team': event.get('homeTeamName', ''),
-                                'away_team': event.get('awayTeamName', ''),
-                                'home_score': 0,
-                                'away_score': 0,
-                                'period': event.get('period', ''),
-                                'match_status': event.get('matchStatus', ''),
-                                'played_seconds': self._parse_played_seconds(
-                                    event.get('playedSeconds', '0:0')
-                                ),
-                                'timestamp': datetime.now(),
-                            }
+                            home = event.get('homeTeamName', '')
+                            away = event.get('awayTeamName', '')
+                            played = self._parse_played_seconds(event.get('playedSeconds', '0:0'))
+                            status = event.get('matchStatus', '')
 
+                            home_score = 0
+                            away_score = 0
                             game_score = event.get('gameScore', [])
                             if game_score:
                                 try:
                                     last = game_score[-1]
                                     h, a = last.split(':')
-                                    match['home_score'] = int(h)
-                                    match['away_score'] = int(a)
+                                    home_score = int(h)
+                                    away_score = int(a)
                                 except Exception:
                                     pass
 
+                            match = {
+                                'match_id': event_id,
+                                'sportradar_id': self._extract_sportradar_numeric_id(event_id),
+                                'home_team': home,
+                                'away_team': away,
+                                'home_score': home_score,
+                                'away_score': away_score,
+                                'period': event.get('period', ''),
+                                'match_status': status,
+                                'played_seconds': played,
+                                'timestamp': datetime.now(),
+                            }
+
                             self.matches[event_id] = match
 
+                            # Clean log format similar to Polymarket
                             logger.info(
-                                f"[SportyBet] {match['home_team']} vs {match['away_team']} | "
-                                f"{match['home_score']}-{match['away_score']} | "
-                                f"{match['match_status']} | {match['played_seconds']}s"
+                                f"[SportyBet] {home} vs {away} -> "
+                                f"score={home_score}:{away_score} "
+                                f"status={status} played_seconds={played}"
                             )
 
                             if self.callback:
