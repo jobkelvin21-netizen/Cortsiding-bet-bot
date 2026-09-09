@@ -119,7 +119,7 @@ class ArbitrageBot:
 
     async def on_bet365(self, data):
         try:
-            await self.detector.on_bet365(data)
+            await self.detector.on_bet365(data, self.on_slow_found)
         except Exception as e:
             logger.error(f"Fast feed handler error: {e}")
 
