@@ -10,7 +10,12 @@ def normalize_team_name(name: str) -> str:
     if not name:
         return ''
     name = name.lower().strip()
-    name = re.sub(r'\b(fc|cf|sc|afc|cd|ac)\b', '', name)
+
+    # Remove common prefixes/suffixes
+    name = re.sub(r'\b(fc|cf|sc|afc|cd|ac|fk|nk|sk|as|ss|rc|ca|cs|us|sd)\b', '', name)
+    name = re.sub(r'\b(united|city|town|rovers|athletic|sporting|club)\b', '', name)
+
+    # Remove special characters and spaces
     name = re.sub(r'[^a-z0-9]', '', name)
     return name
 
@@ -31,10 +36,6 @@ class MatchRecord:
 
     home_team: str = ''
     away_team: str = ''
-
-    # Require the gap to clear the threshold on 2 consecutive readings
-    # before un-flagging, so one noisy sample doesn't silently drop a
-    # match the bot is already watching.
     below_threshold_streak: int = 0
 
 
@@ -44,16 +45,15 @@ class SlowGameDetector:
         self.slow_games: Dict[str, dict] = {}
         self.threshold = Config.SLOW_THRESHOLD_SECONDS
         self.UNFLAG_STREAK_REQUIRED = 2
-
-        # Maps a league-agnostic "base" key (team names only) to whichever
-        # full record key is actually storing that match. This lets the
-        # fast feed (which knows the league) and SportyBet (which doesn't)
-        # always resolve to the SAME MatchRecord, no matter which feed's
-        # data arrives first.
         self.base_to_full: Dict[str, str] = {}
 
     def _base_key(self, home: str, away: str) -> str:
-        return f"{normalize_team_name(home)}_vs_{normalize_team_name(away)}"
+        h = normalize_team_name(home)
+        a = normalize_team_name(away)
+        # Always keep alphabetical order so Home vs Away and Away vs Home match
+        if h > a:
+            h, a = a, h
+        return f"{h}_vs_{a}"
 
     def _team_key(self, home: str, away: str, league: str = '') -> str:
         league_part = re.sub(r'[^a-z0-9]', '', league.lower().strip()) if league else ''
@@ -61,26 +61,21 @@ class SlowGameDetector:
         return f"{league_part}_{base}" if league_part else base
 
     def _resolve_key(self, home: str, away: str, league: str = '') -> str:
-        """
-        Finds the correct record key for this match, merging fast-feed and
-        SportyBet data together regardless of arrival order or whether a
-        league name is available.
-        """
         base = self._base_key(home, away)
         full = self._team_key(home, away, league)
 
-        # If this exact full key already has a record, use it.
         if full in self.records:
             self.base_to_full.setdefault(base, full)
             return full
 
-        # If some other feed already created a record for this base match
-        # (under a different key format), reuse that same record.
         if base in self.base_to_full and self.base_to_full[base] in self.records:
             return self.base_to_full[base]
 
-        # No existing record at all — create fresh under the most specific
-        # key available, and register it for the other feed to find later.
+        # Also try reverse order just in case
+        reverse_base = self._base_key(away, home)
+        if reverse_base in self.base_to_full and self.base_to_full[reverse_base] in self.records:
+            return self.base_to_full[reverse_base]
+
         self.base_to_full[base] = full
         return full
 
@@ -98,6 +93,7 @@ class SlowGameDetector:
 
             league = data.get('league', '')
             key = self._resolve_key(home, away, league)
+
             logger.info(f"[FAST] {home} vs {away} -> key={key} played_seconds={data.get('played_seconds')}")
 
             record = self._get_or_create(key, home, away)
@@ -122,10 +118,8 @@ class SlowGameDetector:
             if not home or not away:
                 return
 
-            # SportyBet doesn't provide a league name, so resolution relies
-            # on the base (team-name-only) match against any existing
-            # fast-feed record.
             key = self._resolve_key(home, away)
+
             logger.info(f"[SB] {home} vs {away} -> key={key} played_seconds={data.get('played_seconds')}")
 
             record = self._get_or_create(key, home, away)
@@ -151,7 +145,6 @@ class SlowGameDetector:
         if record.fast_played_seconds is None or record.sb_played_seconds is None:
             return
 
-        # Positive gap = SportyBet is BEHIND the fast feed (i.e. slow).
         gap = record.fast_played_seconds - record.sb_played_seconds
 
         if gap >= self.threshold:
@@ -165,11 +158,10 @@ class SlowGameDetector:
                     '_last_score': (record.sb_home_score, record.sb_away_score),
                 }
                 logger.info(
-                    f"🐢 SLOW: {record.home_team} vs {record.away_team} "
+                    f"⚡ SLOW: {record.home_team} vs {record.away_team} "
                     f"(SportyBet lagging by {gap:.1f}s)"
                 )
             else:
-                # keep gap_seconds fresh for already-flagged matches
                 self.slow_games[key]['gap_seconds'] = gap
         else:
             if key in self.slow_games:
