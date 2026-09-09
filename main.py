@@ -1,7 +1,7 @@
 import asyncio
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from loguru import logger
 
 from config import Config
@@ -42,18 +42,6 @@ class ArbitrageBot:
         if not acc:
             logger.error("No active account")
             sys.exit(1)
-
-        if Config.TEST_MODE:
-            Config.TEST_END_TIME = datetime.now() + timedelta(hours=Config.TEST_DURATION_HOURS)
-            logger.info(f"Test mode: {Config.TEST_DURATION_HOURS} hours")
-
-    async def check_mode_switch(self):
-        while self.running:
-            await asyncio.sleep(60)
-            if Config.TEST_MODE and Config.check_test_mode_expired():
-                logger.warning("SWITCHING TO REAL MONEY")
-                Config.enable_real_mode()
-                await self.alerter.notify_mode_switch()
 
     async def start(self):
         await self.setup()
@@ -111,8 +99,7 @@ class ArbitrageBot:
         bal = float(input("Balance: "))
         self.executor.balance = bal
 
-        mode = "TEST" if Config.TEST_MODE else "REAL"
-        await self.alerter.notify_startup(bal, mode)
+        await self.alerter.notify_startup(bal)
 
         logger.info("Starting fast feed (Polymarket)...")
         self.running = True
@@ -123,7 +110,6 @@ class ArbitrageBot:
         except Exception as e:
             logger.warning(f"Feed error: {e}")
 
-        asyncio.create_task(self.check_mode_switch())
         asyncio.create_task(self.daily_report())
 
         logger.success("Bot running! Monitoring all live matches for slow reactions.")
@@ -206,7 +192,7 @@ class ArbitrageBot:
                 logger.info("Account switch requested")
             elif result is True:
                 bet_id = f"{mid}_G{goal_num}_{int(time.time())}"
-                stake = self.executor.calc_stake(odds) if not self.executor.validation_bet_placed or self.executor.validation_passed else Config.VALIDATION_STAKE
+                stake = Config.VALIDATION_STAKE if not self.executor.validation_passed else self.executor.calc_stake(odds)
                 self.cashout.register(mid, bet_id, stake, f"Goal {goal_num}")
                 asyncio.create_task(self.cashout.monitor(mid, data, page))
 
