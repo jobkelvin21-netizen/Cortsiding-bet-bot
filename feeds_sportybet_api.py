@@ -8,18 +8,12 @@ from config import Config
 
 
 class SportyBetFeed:
-    """
-    Polls SportyBet's own internal API for ALL live matches at once —
-    CONFIRMED endpoint (verified via browser Network tab):
-    https://www.sportybet.com/api/ng/factsCenter/liveOrPrematchEvents?sportId=sr:sport:1
-    """
-
     def __init__(self):
-        self.matches: Dict[str, dict] = {}
+        self.matches = {}
         self.running = False
         self.callback = None
 
-    def _parse_played_seconds(self, played_seconds_str: str) -> float:
+    def _parse_played_seconds(self, played_seconds_str):
         try:
             parts = [int(p) for p in played_seconds_str.split(':')]
             if len(parts) == 2:
@@ -30,11 +24,11 @@ class SportyBetFeed:
             pass
         return 0.0
 
-    def _extract_sportradar_numeric_id(self, event_id: str) -> str:
+    def _extract_sportradar_numeric_id(self, event_id):
         match = re.search(r'(\d+)$', event_id or '')
         return match.group(1) if match else ''
 
-    async def start(self, callback: Callable):
+    async def start(self, callback):
         self.callback = callback
         self.running = True
 
@@ -45,19 +39,30 @@ class SportyBetFeed:
         }
 
         url = f"{Config.SPORTYBET_API_BASE}/liveOrPrematchEvents?sportId=sr:sport:1"
+        logger.info(f"SportyBet feed polling: {url}")
 
         async with aiohttp.ClientSession(headers=headers) as session:
             while self.running:
                 try:
                     async with session.get(url) as resp:
                         if resp.status != 200:
-                            logger.debug(f"SportyBet feed: status {resp.status}")
+                            logger.warning(f"SportyBet feed: HTTP status {resp.status}")
                             await asyncio.sleep(2)
                             continue
 
-                        events = await resp.json()
+                        try:
+                            events = await resp.json()
+                        except Exception:
+                            body_preview = (await resp.text())[:200]
+                            logger.error(f"SportyBet feed: invalid JSON. Preview: {body_preview}")
+                            await asyncio.sleep(2)
+                            continue
+
                         if not isinstance(events, list):
                             events = events.get('data', []) if isinstance(events, dict) else []
+
+                        if not events:
+                            logger.warning("SportyBet feed: 200 OK but 0 events returned")
 
                         for detail in events:
                             event_id = detail.get('eventId')
@@ -94,7 +99,7 @@ class SportyBetFeed:
                                 await self.callback(match)
 
                 except Exception as e:
-                    logger.debug(f"SportyBet feed loop error: {e}")
+                    logger.error(f"SportyBet feed loop error: {e}")
 
                 await asyncio.sleep(2)
 
