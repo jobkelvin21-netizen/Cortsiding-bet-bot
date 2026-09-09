@@ -89,6 +89,17 @@ class ArbitrageBot:
 
         logger.success("SportyBet login complete!")
 
+        # === COOKIE FIX ADDED HERE ===
+        try:
+            cookies = await page.context.cookies()
+            cookie_dict = {c['name']: c['value'] for c in cookies if 'sportybet' in c.get('domain', '')}
+            if cookie_dict:
+                self.sportybet.set_cookies(cookie_dict)
+                logger.info(f"Passed {len(cookie_dict)} cookies to SportyBet feed")
+        except Exception as e:
+            logger.warning(f"Could not extract cookies: {e}")
+        # === END COOKIE FIX ===
+
         self.auth.browser = browser
         self.auth.page = page
 
