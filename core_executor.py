@@ -22,7 +22,6 @@ class BetExecutor:
         self.current_account = None
         self.match_goal_count = {}
 
-        # Validation-mode state
         self.validation_bet_placed = False
         self.validation_passed = False
 
@@ -86,24 +85,20 @@ class BetExecutor:
 
         match_name = f"{match['home_team']} vs {match['away_team']}"
 
-        # --- VALIDATION MODE: one real ₦10 bet, one time only, to prove
-        # the whole pipeline actually works end-to-end. On success, it
-        # automatically switches to normal full-stake betting from then on. ---
-        if Config.VALIDATION_MODE and not self.validation_bet_placed:
+        if not self.validation_bet_placed:
             self.validation_bet_placed = True
             success = await self.run_validation_bet(page, match, team, odds, goal_num, match_name)
             if success:
                 self.validation_passed = True
-                logger.success("✅ Validation passed — full staking now ACTIVE for the rest of this session")
+                logger.success("✅ Validation passed — full staking now ACTIVE")
+            else:
+                self.stopped = True
+                logger.error("❌ Validation failed — bot stopped placing further bets")
             return success
 
-        if Config.VALIDATION_MODE and self.validation_bet_placed and not self.validation_passed:
-            # Validation failed earlier — don't risk further real bets blindly
-            logger.warning(f"Validation previously failed — skipping bet on {match_name}")
+        if not self.validation_passed:
             return False
 
-        # Normal full-stake flow (runs directly if VALIDATION_MODE is off,
-        # or automatically once validation has passed)
         self.balance = await self.fetch_balance(page)
         stake = self.calc_stake(odds)
 
@@ -116,40 +111,34 @@ class BetExecutor:
         if self.should_split(odds, dying, split_count):
             return await self.split_bet(page, match, team, odds, goal_num, split_count, dying)
         else:
-            if Config.TEST_MODE:
-                logger.info(f"🧪 TEST Goal {goal_num}: Single ₦{stake:,.0f} on {team} @ {odds}")
-                await self.alerter.notify_goal_detected(match_name, team, odds, goal_num)
-                await self.alerter.notify_bet_placed(match_name, team, stake, odds, f"TEST-G{goal_num}", 1, 1)
-                return True
-
             await self.alerter.notify_goal_detected(match_name, team, odds, goal_num)
             return await self.place_single_bet(page, match, team, stake, odds, 1, goal_num, total_stack=1)
 
     async def run_validation_bet(self, page: Page, match: dict, team: str, odds: float,
                                   goal_num: int, match_name: str) -> bool:
         stake = Config.VALIDATION_STAKE
-        logger.info(f"🔬 VALIDATION BET STARTING: ₦{stake} on {team} @ {odds}")
-
+        logger.info(f"🔬 VALIDATION BET: ₦{stake} on {team} @ {odds}")
         await self.alerter.notify_validation_start(match_name, team, odds, goal_num, stake)
 
         self.balance = await self.fetch_balance(page)
         await self.alerter.notify_validation_step("Balance read", f"₦{self.balance:,.2f} confirmed")
 
-        success = await self.place_single_bet(
-            page, match, team, stake, odds, stack_num=1, goal_num=goal_num, total_stack=1
-        )
+        error_detail = None
+        try:
+            success = await self.place_single_bet(
+                page, match, team, stake, odds, stack_num=1, goal_num=goal_num, total_stack=1
+            )
+        except Exception as e:
+            success = False
+            error_detail = str(e)
 
         if success:
-            logger.success("✅ VALIDATION BET SUCCEEDED — full pipeline confirmed working")
-            await self.alerter.notify_validation_result(
-                success=True, match_name=match_name, team=team, stake=stake, odds=odds
-            )
+            await self.alerter.notify_validation_result(True, match_name, team, stake, odds)
         else:
-            logger.error("❌ VALIDATION BET FAILED — pipeline needs fixing before real use")
             await self.alerter.notify_validation_result(
-                success=False, match_name=match_name, team=team, stake=stake, odds=odds
+                False, match_name, team, stake, odds,
+                error_detail=error_detail or "Bet did not confirm — check market selection, stake entry, or submit button"
             )
-
         return success
 
     async def split_bet(self, page: Page, match: dict, team: str, odds: float,
@@ -234,19 +223,15 @@ class BetExecutor:
                 )
                 elapsed = time.time() - start_time
 
-                # Immediate alert the moment ANY submission exceeds the
-                # configured timeout — separate from the escalation logic
-                # for repeated slow submissions.
                 if elapsed > Config.SUBMISSION_TIMEOUT:
                     await self.alerter.notify_submission_slow(match_name, "Confirmed but slow", elapsed)
                     return await self.handle_slow(match)
 
                 self.consecutive_slow = 0
 
-                if not Config.TEST_MODE:
-                    bet_id = f"{match['match_id']}_G{goal_num}_S{stack_num}_{int(time.time())}"
-                    await self.alerter.notify_bet_placed(match_name, team, stake, odds, bet_id,
-                                                         stack_num, total_stack)
+                bet_id = f"{match['match_id']}_G{goal_num}_S{stack_num}_{int(time.time())}"
+                await self.alerter.notify_bet_placed(match_name, team, stake, odds, bet_id,
+                                                     stack_num, total_stack)
 
                 self.log_bet(match_name, team, stake, odds,
                             f"{match['match_id']}_G{goal_num}_S{stack_num}")
