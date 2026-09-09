@@ -32,9 +32,9 @@ class MatchRecord:
     home_team: str = ''
     away_team: str = ''
 
-    # Fix for Bug 2: require the gap to clear the threshold on 2
-    # consecutive readings before un-flagging, so one noisy sample
-    # doesn't silently drop a match the bot is already watching.
+    # Require the gap to clear the threshold on 2 consecutive readings
+    # before un-flagging, so one noisy sample doesn't silently drop a
+    # match the bot is already watching.
     below_threshold_streak: int = 0
 
 
@@ -45,20 +45,51 @@ class SlowGameDetector:
         self.threshold = Config.SLOW_THRESHOLD_SECONDS
         self.UNFLAG_STREAK_REQUIRED = 2
 
+        # Maps a league-agnostic "base" key (team names only) to whichever
+        # full record key is actually storing that match. This lets the
+        # fast feed (which knows the league) and SportyBet (which doesn't)
+        # always resolve to the SAME MatchRecord, no matter which feed's
+        # data arrives first.
+        self.base_to_full: Dict[str, str] = {}
+
+    def _base_key(self, home: str, away: str) -> str:
+        return f"{normalize_team_name(home)}_vs_{normalize_team_name(away)}"
+
     def _team_key(self, home: str, away: str, league: str = '') -> str:
-        # Fix for Bug 1: include league/competition when available so two
-        # different real matches with similarly-named clubs in different
-        # leagues never collapse into the same record.
         league_part = re.sub(r'[^a-z0-9]', '', league.lower().strip()) if league else ''
-        base = f"{normalize_team_name(home)}_vs_{normalize_team_name(away)}"
+        base = self._base_key(home, away)
         return f"{league_part}_{base}" if league_part else base
+
+    def _resolve_key(self, home: str, away: str, league: str = '') -> str:
+        """
+        Finds the correct record key for this match, merging fast-feed and
+        SportyBet data together regardless of arrival order or whether a
+        league name is available.
+        """
+        base = self._base_key(home, away)
+        full = self._team_key(home, away, league)
+
+        # If this exact full key already has a record, use it.
+        if full in self.records:
+            self.base_to_full.setdefault(base, full)
+            return full
+
+        # If some other feed already created a record for this base match
+        # (under a different key format), reuse that same record.
+        if base in self.base_to_full and self.base_to_full[base] in self.records:
+            return self.base_to_full[base]
+
+        # No existing record at all — create fresh under the most specific
+        # key available, and register it for the other feed to find later.
+        self.base_to_full[base] = full
+        return full
 
     def _get_or_create(self, key: str, home: str, away: str) -> MatchRecord:
         if key not in self.records:
             self.records[key] = MatchRecord(key=key, home_team=home, away_team=away)
         return self.records[key]
 
-    async def on_bet365(self, data: dict):
+    async def on_bet365(self, data: dict, callback: Optional[Callable] = None):
         try:
             home = data.get('home_team', '')
             away = data.get('away_team', '')
@@ -66,7 +97,7 @@ class SlowGameDetector:
                 return
 
             league = data.get('league', '')
-            key = self._team_key(home, away, league)
+            key = self._resolve_key(home, away, league)
             logger.info(f"[FAST] {home} vs {away} -> key={key} played_seconds={data.get('played_seconds')}")
 
             record = self._get_or_create(key, home, away)
@@ -75,48 +106,40 @@ class SlowGameDetector:
             record.fast_away_score = data.get('away_score', record.fast_away_score)
             record.fast_last_update = datetime.now()
 
+            was_slow_before = key in self.slow_games
             self._evaluate(key)
+
+            if not was_slow_before and key in self.slow_games and callback:
+                await callback(self.slow_games[key])
 
         except Exception as e:
             logger.error(f"Fast feed handler error: {e}")
 
-    async def on_sportybet(self, data: dict, callback: Callable):
+    async def on_sportybet(self, data: dict, callback: Optional[Callable] = None):
         try:
             home = data.get('home_team', '')
             away = data.get('away_team', '')
             if not home or not away:
                 return
 
-            # SportyBet feed doesn't carry a 'league' field currently, so
-            # this falls back to team-name-only matching on the SB side —
-            # that's fine, since the FAST side's league-qualified key is
-            # what actually prevents cross-league collisions in practice
-            # (SB rarely has two live matches with identical team names
-            # itself; the risk was always on the FAST side matching wrong).
-            key = self._team_key(home, away)
+            # SportyBet doesn't provide a league name, so resolution relies
+            # on the base (team-name-only) match against any existing
+            # fast-feed record.
+            key = self._resolve_key(home, away)
             logger.info(f"[SB] {home} vs {away} -> key={key} played_seconds={data.get('played_seconds')}")
 
-            # Try to find a matching FAST record even if it was stored
-            # under a league-qualified key
-            matched_key = key
-            if key not in self.records:
-                for existing_key, rec in self.records.items():
-                    if existing_key.endswith(key) or existing_key == key:
-                        matched_key = existing_key
-                        break
-
-            record = self._get_or_create(matched_key, home, away)
+            record = self._get_or_create(key, home, away)
             record.sb_event_id = data.get('match_id')
             record.sb_played_seconds = data.get('played_seconds')
             record.sb_home_score = data.get('home_score', record.sb_home_score)
             record.sb_away_score = data.get('away_score', record.sb_away_score)
             record.sb_last_update = datetime.now()
 
-            was_slow_before = matched_key in self.slow_games
-            self._evaluate(matched_key)
+            was_slow_before = key in self.slow_games
+            self._evaluate(key)
 
-            if not was_slow_before and matched_key in self.slow_games and callback:
-                await callback(self.slow_games[matched_key])
+            if not was_slow_before and key in self.slow_games and callback:
+                await callback(self.slow_games[key])
 
         except Exception as e:
             logger.error(f"SportyBet handler error: {e}")
@@ -128,7 +151,8 @@ class SlowGameDetector:
         if record.fast_played_seconds is None or record.sb_played_seconds is None:
             return
 
-        gap = record.sb_played_seconds - record.fast_played_seconds
+        # Positive gap = SportyBet is BEHIND the fast feed (i.e. slow).
+        gap = record.fast_played_seconds - record.sb_played_seconds
 
         if gap >= self.threshold:
             record.below_threshold_streak = 0
