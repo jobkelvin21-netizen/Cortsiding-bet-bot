@@ -126,12 +126,13 @@ class SportyBetFeed:
 
                             self.matches[event_id] = match
 
-                            # Clean log format similar to Polymarket
-                            logger.info(
-                                f"[SportyBet] {home} vs {away} -> "
-                                f"score={home_score}:{away_score} "
-                                f"status={status} played_seconds={played}"
-                            )
+                            # Only log live matches (reduce spam so Polymarket logs stay visible)
+                            if status in ["H1", "H2", "LIVE", "1H", "2H"] or played > 0:
+                                logger.info(
+                                    f"[SportyBet] {home} vs {away} -> "
+                                    f"score={home_score}:{away_score} "
+                                    f"status={status} played_seconds={played}"
+                                )
 
                             if self.callback:
                                 await self.callback(match)
