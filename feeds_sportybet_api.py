@@ -95,6 +95,9 @@ class SportyBetFeed:
                                     pass
 
                             self.matches[event_id] = match
+
+                            logger.info(f"[SportyBet] {match['home_team']} vs {match['away_team']} -> status={match['match_status']} played_seconds={match['played_seconds']} score={match['home_score']}:{match['away_score']}")
+
                             if self.callback:
                                 await self.callback(match)
 
