@@ -4,3 +4,4 @@ loguru
 aiohttp
 websocket-client
 python-telegram-bot
+pip install python-socketio aiohttp
