@@ -7,7 +7,7 @@ from loguru import logger
 from config import Config
 from auth_sportybet_login import SportyBetAuth
 from feeds.bet365_ws import Bet365Feed
-from feeds.sportybet_ws import SportyBetFeed          # <-- new WS version
+from feeds.sportybet_api import SportyBetFeed          # <-- Fixed
 from core.detector import SlowGameDetector
 from core.executor import BetExecutor
 from core.cashout import CashOutManager
@@ -92,7 +92,7 @@ class ArbitrageBot:
 
         logger.success("SportyBet login complete!")
 
-        # Pass page + alerter to the new WebSocket feed
+        # Pass page + alerter to the SportyBet feed
         self.sportybet.set_page(page)
         self.sportybet.set_alerter(self.alerter)
 
