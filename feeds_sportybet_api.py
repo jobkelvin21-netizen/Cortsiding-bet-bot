@@ -51,7 +51,6 @@ class SportyBetFeed:
         def on_ws(ws):
             url = ws.url
             if "sportybet" in url.lower() and "socket.io" in url.lower():
-                # Convert to the base Socket.IO URL
                 base = url.split("?")[0].replace("/socket.io/", "").replace("/socket.io", "")
                 if base.startswith("wss://"):
                     base = "https://" + base[6:]
@@ -190,14 +189,15 @@ class SportyBetFeed:
                     self.connected = False
                     logger.warning("SportyBet Socket.IO disconnected")
 
-                # Listen to common event names SportyBet might use
                 @self.sio.on('*')
                 async def catch_all(event, data):
                     await self._handle_event(data)
 
-                await self.sio.connect(url, transports=['websocket'], wait_timeout=15)
+                # FIX: removed the unsupported 'wait_timeout' kwarg — the
+                # installed python-socketio version's AsyncClient.connect()
+                # doesn't accept it, which was causing the crash.
+                await self.sio.connect(url, transports=['websocket'])
 
-                # Keep the connection alive
                 while self.running and self.sio.connected:
                     await asyncio.sleep(1)
 
