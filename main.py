@@ -29,6 +29,7 @@ class ArbitrageBot:
         self.running = False
         self._processing = {}
         self.match_last_score = {}
+        self.browser = None  # kept so on_slow_found can create fresh contexts
 
     async def setup(self):
         if not self.account_manager.accounts:
@@ -63,6 +64,8 @@ class ArbitrageBot:
             headless=False,
             args=['--disable-blink-features=AutomationControlled']
         )
+        self.browser = browser
+
         page = await browser.new_page(viewport={'width': 412, 'height': 915})
 
         logger.info("Opening SportyBet login...")
@@ -89,7 +92,6 @@ class ArbitrageBot:
 
         logger.success("SportyBet login complete!")
 
-        # === COOKIE FIX ADDED HERE ===
         try:
             cookies = await page.context.cookies()
             cookie_dict = {c['name']: c['value'] for c in cookies if 'sportybet' in c.get('domain', '')}
@@ -98,7 +100,6 @@ class ArbitrageBot:
                 logger.info(f"Passed {len(cookie_dict)} cookies to SportyBet feed")
         except Exception as e:
             logger.warning(f"Could not extract cookies: {e}")
-        # === END COOKIE FIX ===
 
         self.auth.browser = browser
         self.auth.page = page
@@ -130,18 +131,27 @@ class ArbitrageBot:
 
     async def on_bet365(self, data):
         try:
-            await self.detector.on_bet365(data, self.on_slow_found)
+            # FIX: background the slow-match handler so one match opening a
+            # new page (4+ second operation) never blocks processing of the
+            # NEXT incoming Polymarket message for a different match.
+            await self.detector.on_bet365(data, self._background_slow_found)
         except Exception as e:
             logger.error(f"Fast feed handler error: {e}")
 
     async def on_sb(self, data):
         try:
-            await self.detector.on_sportybet(data, self.on_slow_found)
+            # Same fix applied here — this loop processes many matches per
+            # cycle; without backgrounding, finding one slow match freezes
+            # every other match's update until the new page finishes loading.
+            await self.detector.on_sportybet(data, self._background_slow_found)
             match_id = data.get('match_id')
             if match_id and self.detector.is_slow(match_id):
-                await self.handle_goal(data)
+                asyncio.create_task(self.handle_goal(data))
         except Exception as e:
             logger.error(f"SportyBet handler error: {e}")
+
+    async def _background_slow_found(self, game):
+        asyncio.create_task(self.on_slow_found(game))
 
     async def on_slow_found(self, game):
         mid = game['match_id']
@@ -152,8 +162,11 @@ class ArbitrageBot:
         await self.alerter.notify_slow_match_found(game['home_team'], game['away_team'], game.get('gap_seconds', 0))
 
         try:
-            page = self.auth.page
-            new_page = await page.context.new_page()
+            # FIX: the crash "Please use browser.new_context()" happened
+            # because page.context.new_page() isn't reliable here. Create
+            # an explicit fresh context from the browser instead.
+            new_context = await self.browser.new_context(viewport={'width': 412, 'height': 915})
+            new_page = await new_context.new_page()
             await new_page.goto(f"{Config.SPORTYBET_BASE_URL}/ng/m/{mid}")
             await asyncio.sleep(4)
 
@@ -164,10 +177,14 @@ class ArbitrageBot:
                 pass
 
             self.slow_pages[mid] = new_page
-            self.match_last_score[mid] = (0, 0)
+            # FIX: initialize to the score AT the moment of flagging (if the
+            # detector provided one) instead of always assuming 0-0 — a
+            # match flagged mid-game shouldn't misfire a false "goal" the
+            # instant it's opened just because the real score isn't 0-0.
+            self.match_last_score[mid] = game.get('_last_score', (0, 0))
 
         except Exception as e:
-            logger.error(f"Init error: {e}")
+            logger.error(f"Init error for {mid}: {e}")
 
     async def handle_goal(self, data):
         mid = data['match_id']
@@ -192,18 +209,16 @@ class ArbitrageBot:
             page = self.slow_pages[mid]
             match = self.detector.get(mid)
 
-            odds = await self.get_odds(page, scoring_team)
-            if odds <= 0:
-                logger.error("No odds found")
-                return
-
-            result = await self.executor.execute(page, match, scoring_team, odds, goal_num)
+            # Odds reading now happens inside executor.execute(), using the
+            # real clicked-element text instead of a guessed selector here.
+            result = await self.executor.execute(page, match, scoring_team, goal_num)
 
             if result == "SWITCH":
                 logger.info("Account switch requested")
             elif result is True:
                 bet_id = f"{mid}_G{goal_num}_{int(time.time())}"
-                stake = Config.VALIDATION_STAKE if not self.executor.validation_passed else self.executor.calc_stake(odds)
+                stake = (Config.VALIDATION_STAKE if not self.executor.validation_passed
+                         else self.executor.calc_stake(self.executor.last_odds_used))
                 self.cashout.register(mid, bet_id, stake, f"Goal {goal_num}")
                 asyncio.create_task(self.cashout.monitor(mid, data, page))
 
@@ -213,17 +228,6 @@ class ArbitrageBot:
             logger.error(f"Goal handling error: {e}")
         finally:
             self._processing[mid] = False
-
-    async def get_odds(self, page, team):
-        try:
-            return await page.evaluate(f'''
-                () => {{
-                    const el = document.querySelector('[data-team="{team}"] .odds');
-                    return el ? parseFloat(el.textContent) : 0;
-                }}
-            ''')
-        except:
-            return 0.0
 
     async def daily_report(self):
         while self.running:
