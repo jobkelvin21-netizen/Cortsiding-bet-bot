@@ -1,5 +1,6 @@
 import asyncio
 import random
+import re
 import time
 from datetime import datetime
 from playwright.async_api import Page
@@ -21,6 +22,7 @@ class BetExecutor:
         self.fast = FastExecutor()
         self.current_account = None
         self.match_goal_count = {}
+        self.last_odds_used = 0.0
 
         self.validation_bet_placed = False
         self.validation_passed = False
@@ -45,14 +47,6 @@ class BetExecutor:
             return 0
         stake_for_profit = Config.MAX_PROFIT_PER_BET / (odds - 1)
         return min(self.balance, stake_for_profit)
-
-    def get_goal_number(self, match_id: str, current_score: tuple) -> int:
-        if match_id not in self.match_goal_count:
-            self.match_goal_count[match_id] = 0
-        total_goals = sum(current_score)
-        if total_goals > self.match_goal_count[match_id]:
-            self.match_goal_count[match_id] = total_goals
-        return self.match_goal_count[match_id]
 
     def can_split_by_balance(self, stake: float) -> int:
         if stake <= 0:
@@ -79,11 +73,46 @@ class BetExecutor:
             return True
         return False
 
-    async def execute(self, page: Page, match: dict, team: str, odds: float, goal_num: int = 1) -> bool:
+    async def _read_odds_from_click(self, page: Page, selection_text: str) -> float:
+        """
+        FIX: previously main.py used a guessed '[data-team=...] .odds'
+        selector that almost certainly doesn't exist on the real page,
+        so odds always came back as 0 and every goal event was silently
+        dropped. This reads odds directly from the same clickable element's
+        own text (confirmed pattern: 'Home @1.85' style labels).
+        """
+        try:
+            elem = await page.query_selector(f'text={selection_text}')
+            if not elem:
+                return 0.0
+            full_text = await elem.text_content()
+            match = re.search(r'(\d+\.\d+)', full_text or '')
+            if match:
+                return float(match.group(1))
+        except Exception as e:
+            logger.debug(f"Odds read error: {e}")
+        return 0.0
+
+    async def execute(self, page: Page, match: dict, team: str, goal_num: int = 1) -> bool:
         if self.stopped:
             return False
 
         match_name = f"{match['home_team']} vs {match['away_team']}"
+
+        try:
+            await self.fast.scroll_to(page, 'text=Next Goal')
+            await self.fast.fast_click(page, 'text=Next Goal')
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+        odds = await self._read_odds_from_click(page, team)
+        if odds <= 0:
+            logger.error(f"No odds found for {team} on {match_name} — skipping this goal event")
+            return False
+
+        self.last_odds_used = odds
+        logger.info(f"Odds confirmed: {team} @ {odds}")
 
         if not self.validation_bet_placed:
             self.validation_bet_placed = True
@@ -126,7 +155,8 @@ class BetExecutor:
         error_detail = None
         try:
             success = await self.place_single_bet(
-                page, match, team, stake, odds, stack_num=1, goal_num=goal_num, total_stack=1
+                page, match, team, stake, odds, stack_num=1, goal_num=goal_num,
+                total_stack=1, skip_market_selection=True
             )
         except Exception as e:
             success = False
@@ -179,7 +209,8 @@ class BetExecutor:
         return total_bets > 0
 
     async def place_single_bet(self, page: Page, match: dict, team: str, stake: float,
-                               odds: float, stack_num: int, goal_num: int, total_stack: int = 1) -> bool:
+                               odds: float, stack_num: int, goal_num: int, total_stack: int = 1,
+                               skip_market_selection: bool = False) -> bool:
         try:
             start_time = time.time()
             match_name = f"{match['home_team']} vs {match['away_team']}"
@@ -188,14 +219,10 @@ class BetExecutor:
                 await asyncio.sleep(random.uniform(0.5, 1.0))
                 await page.bring_to_front()
 
-            if stack_num == 1:
-                await self.fast.scroll_to(page, 'text=Next Goal')
-                await self.fast.fast_click(page, 'text=Next Goal')
-                await asyncio.sleep(0.3)
-
-            if not await self.fast.fast_click(page, f'text={team}'):
-                logger.warning(f"Could not click team selection for {team}")
-                return False
+            if not skip_market_selection:
+                if not await self.fast.fast_click(page, f'text={team}'):
+                    logger.warning(f"Could not click team selection for {team}")
+                    return False
 
             stake_input = await page.query_selector(
                 'input[type="number"], input[type="tel"][value], input[inputmode="numeric"]'
