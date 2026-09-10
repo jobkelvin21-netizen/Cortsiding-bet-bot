@@ -4,4 +4,3 @@ loguru
 aiohttp
 websocket-client
 python-telegram-bot
-python-socketio aiohttp
