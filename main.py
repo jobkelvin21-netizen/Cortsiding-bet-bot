@@ -7,7 +7,7 @@ from loguru import logger
 from config import Config
 from auth_sportybet_login import SportyBetAuth
 from feeds.bet365_ws import Bet365Feed
-from feeds.sportybet_api import SportyBetFeed          # <-- Fixed
+from feeds.sportybet_api import SportyBetFeed
 from core.detector import SlowGameDetector
 from core.executor import BetExecutor
 from core.cashout import CashOutManager
@@ -48,7 +48,7 @@ class ArbitrageBot:
         await self.setup()
 
         logger.info("=" * 60)
-        logger.info("BOT STARTING - POLYMARKET + SPORTYBET WEBSOCKET")
+        logger.info("BOT STARTING - POLYMARKET + SPORTYBET SOCKET.IO")
         logger.info("=" * 60)
 
         print("\n" + "=" * 60)
@@ -92,7 +92,7 @@ class ArbitrageBot:
 
         logger.success("SportyBet login complete!")
 
-        # Pass page + alerter to the SportyBet feed
+        # Important: pass page and alerter to SportyBet feed
         self.sportybet.set_page(page)
         self.sportybet.set_alerter(self.alerter)
 
