@@ -16,10 +16,10 @@ def normalize_team_name(name: str) -> str:
     return name
 
 
-def _is_paused_period(period_text: str) -> bool:
-    if not period_text:
+def _is_paused(period: str) -> bool:
+    if not period:
         return False
-    p = str(period_text).upper().strip()
+    p = str(period).upper().strip()
     return p in ('HT', 'HALFTIME', 'BREAK', 'PAUSED', 'HALF TIME')
 
 
@@ -29,20 +29,18 @@ class MatchRecord:
     home_team: str = ''
     away_team: str = ''
 
-    fast_played_seconds: Optional[float] = None
+    fast_played: Optional[float] = None
     fast_period: str = ''
-    fast_home_score: int = 0
-    fast_away_score: int = 0
-    fast_last_update: Optional[datetime] = None
+    fast_score: tuple = (0, 0)
+    fast_updated: Optional[datetime] = None
 
     sb_event_id: Optional[str] = None
-    sb_played_seconds: Optional[float] = None
+    sb_played: Optional[float] = None
     sb_period: str = ''
-    sb_home_score: int = 0
-    sb_away_score: int = 0
-    sb_last_update: Optional[datetime] = None
+    sb_score: tuple = (0, 0)
+    sb_updated: Optional[datetime] = None
 
-    below_threshold_streak: int = 0
+    below_streak: int = 0
 
 
 class SlowGameDetector:
@@ -50,9 +48,9 @@ class SlowGameDetector:
         self.records: Dict[str, MatchRecord] = {}
         self.slow_games: Dict[str, dict] = {}
         self.threshold = Config.SLOW_THRESHOLD_SECONDS
-        self.UNFLAG_STREAK_REQUIRED = 2
-        # Both feeds must have updated recently
-        self.MAX_DATA_AGE_SECONDS = 12.0
+        self.UNFLAG_STREAK = 2
+        self.MAX_FAST_AGE = 8.0
+        self.MAX_SB_AGE = 7.0
 
     def _base_key(self, home: str, away: str) -> str:
         h = normalize_team_name(home)
@@ -61,24 +59,17 @@ class SlowGameDetector:
             h, a = a, h
         return f"{h}_vs_{a}"
 
-    def _team_key(self, home: str, away: str, league: str = '') -> str:
-        league_part = re.sub(r'[^a-z0-9]', '', league.lower().strip()) if league else ''
-        base = self._base_key(home, away)
-        return f"{league_part}_{base}" if league_part else base
-
     def _resolve_key(self, home: str, away: str, league: str = '') -> str:
         base = self._base_key(home, away)
-        full = self._team_key(home, away, league)
+        league_part = re.sub(r'[^a-z0-9]', '', (league or '').lower())
+        full = f"{league_part}_{base}" if league_part else base
 
-        # Try exact full key
         if full in self.records:
             return full
 
-        # Try base key match
-        for existing_key in self.records:
-            if existing_key.endswith(base) or existing_key == base:
-                return existing_key
-
+        for k in self.records:
+            if k.endswith(base) or k == base:
+                return k
         return full
 
     def _get_or_create(self, key: str, home: str, away: str) -> MatchRecord:
@@ -93,27 +84,25 @@ class SlowGameDetector:
             if not home or not away:
                 return
 
-            league = data.get('league', '')
-            key = self._resolve_key(home, away, league)
+            key = self._resolve_key(home, away, data.get('league', ''))
             played = data.get('played_seconds')
 
-            logger.info(f"[FAST] {home} vs {away} -> key={key} played_seconds={played}")
+            logger.info(f"[FAST] {home} vs {away} -> key={key} played={played}")
 
-            record = self._get_or_create(key, home, away)
-            record.fast_played_seconds = played
-            record.fast_period = data.get('period', '')
-            record.fast_home_score = data.get('home_score', record.fast_home_score)
-            record.fast_away_score = data.get('away_score', record.fast_away_score)
-            record.fast_last_update = datetime.now()
+            rec = self._get_or_create(key, home, away)
+            rec.fast_played = played
+            rec.fast_period = data.get('period', '')
+            rec.fast_score = (data.get('home_score', 0), data.get('away_score', 0))
+            rec.fast_updated = datetime.now()
 
-            was_slow_before = key in self.slow_games
+            was_slow = key in self.slow_games
             self._evaluate(key)
 
-            if not was_slow_before and key in self.slow_games and callback:
+            if not was_slow and key in self.slow_games and callback:
                 await callback(self.slow_games[key])
 
         except Exception as e:
-            logger.error(f"Fast feed handler error: {e}")
+            logger.error(f"Fast feed error: {e}")
 
     async def on_sportybet(self, data: dict, callback: Optional[Callable] = None):
         try:
@@ -125,74 +114,65 @@ class SlowGameDetector:
             key = self._resolve_key(home, away)
             played = data.get('played_seconds')
 
-            logger.info(f"[SB] {home} vs {away} -> key={key} played_seconds={played}")
+            logger.info(f"[SB] {home} vs {away} -> key={key} played={played}")
 
-            record = self._get_or_create(key, home, away)
-            record.sb_event_id = data.get('match_id')
-            record.sb_played_seconds = played
-            record.sb_period = data.get('match_status', data.get('period', ''))
-            record.sb_home_score = data.get('home_score', record.sb_home_score)
-            record.sb_away_score = data.get('away_score', record.sb_away_score)
-            record.sb_last_update = datetime.now()
+            rec = self._get_or_create(key, home, away)
+            rec.sb_event_id = data.get('match_id')
+            rec.sb_played = played
+            rec.sb_period = data.get('match_status') or data.get('period', '')
+            rec.sb_score = (data.get('home_score', 0), data.get('away_score', 0))
+            rec.sb_updated = datetime.now()
 
-            was_slow_before = key in self.slow_games
+            was_slow = key in self.slow_games
             self._evaluate(key)
 
-            if not was_slow_before and key in self.slow_games and callback:
+            if not was_slow and key in self.slow_games and callback:
                 await callback(self.slow_games[key])
 
         except Exception as e:
-            logger.error(f"SportyBet handler error: {e}")
+            logger.error(f"SportyBet feed error: {e}")
 
     def _evaluate(self, key: str):
-        record = self.records.get(key)
-        if not record:
+        rec = self.records.get(key)
+        if not rec:
             return
 
-        # Need both sides
-        if record.fast_played_seconds is None or record.sb_played_seconds is None:
-            return
-        if record.fast_last_update is None or record.sb_last_update is None:
+        if (rec.fast_played is None or rec.sb_played is None or
+            rec.fast_updated is None or rec.sb_updated is None):
             return
 
-        # Skip paused periods
-        if _is_paused_period(record.fast_period) or _is_paused_period(record.sb_period):
+        if _is_paused(rec.fast_period) or _is_paused(rec.sb_period):
             return
 
-        # Both must be fresh
         now = datetime.now()
-        fast_age = (now - record.fast_last_update).total_seconds()
-        sb_age = (now - record.sb_last_update).total_seconds()
+        fast_age = (now - rec.fast_updated).total_seconds()
+        sb_age = (now - rec.sb_updated).total_seconds()
 
-        if fast_age > self.MAX_DATA_AGE_SECONDS or sb_age > self.MAX_DATA_AGE_SECONDS:
+        if fast_age > self.MAX_FAST_AGE or sb_age > self.MAX_SB_AGE:
             return
 
-        # Correct gap direction: positive = SportyBet is behind
-        gap = record.fast_played_seconds - record.sb_played_seconds
+        gap = rec.fast_played - rec.sb_played
 
         if gap >= self.threshold:
-            record.below_threshold_streak = 0
+            rec.below_streak = 0
             if key not in self.slow_games:
                 self.slow_games[key] = {
-                    'match_id': record.sb_event_id or key,
-                    'home_team': record.home_team,
-                    'away_team': record.away_team,
+                    'match_id': rec.sb_event_id or key,
+                    'home_team': rec.home_team,
+                    'away_team': rec.away_team,
                     'gap_seconds': gap,
-                    '_last_score': (record.sb_home_score, record.sb_away_score),
+                    '_last_score': rec.sb_score,
                 }
-                logger.info(
-                    f"⚡ SLOW: {record.home_team} vs {record.away_team} "
-                    f"(SportyBet lagging by {gap:.1f}s)"
-                )
+                logger.info(f"⚡ SLOW: {rec.home_team} vs {rec.away_team} (lag {gap:.1f}s)")
             else:
                 self.slow_games[key]['gap_seconds'] = gap
         else:
             if key in self.slow_games:
-                record.below_threshold_streak += 1
-                if record.below_threshold_streak >= self.UNFLAG_STREAK_REQUIRED:
-                    logger.info(f"Match no longer slow: {record.home_team} vs {record.away_team}")
+                rec.below_streak += 1
+                if rec.below_streak >= self.UNFLAG_STREAK:
+                    logger.info(f"No longer slow: {rec.home_team} vs {rec.away_team}")
                     del self.slow_games[key]
-                    record.below_threshold_streak = 0
+                    rec.below_streak = 0
 
     def is_slow(self, match_id: str) -> bool:
         for v in self.slow_games.values():
