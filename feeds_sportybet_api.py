@@ -1,10 +1,9 @@
 import asyncio
-import json
 import re
 from datetime import datetime
 from typing import Callable, Optional
 from loguru import logger
-import websockets
+import socketio
 from playwright.async_api import Page
 
 
@@ -14,9 +13,9 @@ class SportyBetFeed:
         self.running = False
         self.callback = None
         self.page: Optional[Page] = None
-        self.ws_url: Optional[str] = None
         self.connected = False
-        self.alerter = None   # will be set from main
+        self.alerter = None
+        self.sio: Optional[socketio.AsyncClient] = None
 
     def set_page(self, page: Page):
         self.page = page
@@ -42,7 +41,8 @@ class SportyBetFeed:
         match = re.search(r'(\d+)$', str(event_id or ''))
         return match.group(1) if match else ''
 
-    async def _discover_ws_url(self) -> Optional[str]:
+    async def _discover_socket_url(self) -> Optional[str]:
+        """Find the Socket.IO URL from the browser"""
         if not self.page:
             return None
 
@@ -50,9 +50,15 @@ class SportyBetFeed:
 
         def on_ws(ws):
             url = ws.url
-            if any(x in url.lower() for x in ['sportybet', 'ws', 'socket', 'push', 'live']):
-                found.append(url)
-                logger.info(f"Captured WS candidate: {url}")
+            if "sportybet" in url.lower() and "socket.io" in url.lower():
+                # Convert to the base Socket.IO URL
+                base = url.split("?")[0].replace("/socket.io/", "").replace("/socket.io", "")
+                if base.startswith("wss://"):
+                    base = "https://" + base[6:]
+                elif base.startswith("ws://"):
+                    base = "http://" + base[5:]
+                found.append(base)
+                logger.info(f"Captured Socket.IO candidate: {base}")
 
         self.page.on("websocket", on_ws)
 
@@ -65,7 +71,7 @@ class SportyBetFeed:
             except Exception:
                 pass
         except Exception as e:
-            logger.warning(f"Discovery navigation error: {e}")
+            logger.warning(f"Discovery error: {e}")
 
         try:
             self.page.remove_listener("websocket", on_ws)
@@ -76,11 +82,10 @@ class SportyBetFeed:
             return found[0]
         return None
 
-    async def _handle_message(self, raw: str):
+    async def _handle_event(self, data):
+        """Process incoming Socket.IO data"""
         try:
-            data = json.loads(raw)
             events = []
-
             if isinstance(data, dict):
                 if "data" in data and isinstance(data["data"], list):
                     events = data["data"]
@@ -134,66 +139,77 @@ class SportyBetFeed:
 
                 self.matches[str(event_id)] = match
 
-                if played > 0 or status.upper() in ("H1", "H2", "LIVE", "1H", "2H"):
+                if played > 0 or str(status).upper() in ("H1", "H2", "LIVE", "1H", "2H"):
                     logger.info(
-                        f"[SportyBet WS] {home} vs {away} | {match['home_score']}-{match['away_score']} | "
-                        f"{status} | {played}s"
+                        f"[SportyBet WS] {home} vs {away} | "
+                        f"{match['home_score']}-{match['away_score']} | {status} | {played}s"
                     )
 
                 if self.callback:
                     await self.callback(match)
 
         except Exception as e:
-            logger.debug(f"WS message parse error: {e}")
-
-    async def _connect_loop(self):
-        while self.running:
-            try:
-                if not self.ws_url:
-                    logger.info("Discovering SportyBet WebSocket URL...")
-                    self.ws_url = await self._discover_ws_url()
-
-                    if not self.ws_url:
-                        msg = "❌ SportyBet WebSocket NOT found. Falling back not implemented yet."
-                        logger.error(msg)
-                        if self.alerter:
-                            await self.alerter.send(msg)
-                        await asyncio.sleep(20)
-                        continue
-
-                    logger.success(f"SportyBet WebSocket URL found")
-                    if self.alerter:
-                        await self.alerter.send("✅ <b>SportyBet WebSocket connected successfully!</b>")
-
-                async with websockets.connect(
-                    self.ws_url,
-                    ping_interval=20,
-                    ping_timeout=20,
-                    close_timeout=5,
-                    max_size=10_000_000
-                ) as ws:
-                    self.connected = True
-                    logger.success("SportyBet WebSocket connected!")
-
-                    async for message in ws:
-                        if not self.running:
-                            break
-                        await self._handle_message(message)
-
-            except Exception as e:
-                self.connected = False
-                self.ws_url = None
-                logger.warning(f"SportyBet WS disconnected: {e}")
-                if self.alerter:
-                    await self.alerter.send(f"⚠️ SportyBet WebSocket disconnected. Reconnecting...\n{e}")
-                await asyncio.sleep(8)
+            logger.debug(f"Event handling error: {e}")
 
     async def start(self, callback: Callable):
         self.callback = callback
         self.running = True
         self.connected = False
-        logger.info("Starting SportyBet WebSocket feed...")
-        await self._connect_loop()
+
+        logger.info("Starting SportyBet Socket.IO feed...")
+
+        while self.running:
+            try:
+                url = await self._discover_socket_url()
+                if not url:
+                    msg = "❌ Could not find SportyBet Socket.IO URL"
+                    logger.error(msg)
+                    if self.alerter:
+                        await self.alerter.send(msg)
+                    await asyncio.sleep(15)
+                    continue
+
+                logger.info(f"Connecting to Socket.IO: {url}")
+
+                self.sio = socketio.AsyncClient(
+                    reconnection=True,
+                    reconnection_attempts=0,
+                    logger=False,
+                    engineio_logger=False
+                )
+
+                @self.sio.event
+                async def connect():
+                    self.connected = True
+                    logger.success("SportyBet Socket.IO connected successfully!")
+                    if self.alerter:
+                        await self.alerter.send("✅ <b>SportyBet WebSocket (Socket.IO) connected successfully!</b>")
+
+                @self.sio.event
+                async def disconnect():
+                    self.connected = False
+                    logger.warning("SportyBet Socket.IO disconnected")
+
+                # Listen to common event names SportyBet might use
+                @self.sio.on('*')
+                async def catch_all(event, data):
+                    await self._handle_event(data)
+
+                await self.sio.connect(url, transports=['websocket'], wait_timeout=15)
+
+                # Keep the connection alive
+                while self.running and self.sio.connected:
+                    await asyncio.sleep(1)
+
+            except Exception as e:
+                self.connected = False
+                logger.error(f"SportyBet Socket.IO error: {e}")
+                if self.alerter:
+                    await self.alerter.send(f"⚠️ SportyBet Socket.IO error: {e}")
+                await asyncio.sleep(8)
+            finally:
+                if self.sio and self.sio.connected:
+                    await self.sio.disconnect()
 
     def stop(self):
         self.running = False
