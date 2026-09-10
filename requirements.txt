@@ -1,6 +1,10 @@
 playwright
 python-dotenv
 loguru
-aiohttp
+aiohttp==3.9.5
+python-socketio==5.11.2
+python-engineio==4.9.0
 websocket-client
 python-telegram-bot
+websockets
+curl_cffi
