@@ -75,16 +75,16 @@ class BetExecutor:
 
     async def _read_odds_from_click(self, page: Page, selection_text: str) -> float:
         """
-        FIX: previously main.py used a guessed '[data-team=...] .odds'
-        selector that almost certainly doesn't exist on the real page,
-        so odds always came back as 0 and every goal event was silently
-        dropped. This reads odds directly from the same clickable element's
-        own text (confirmed pattern: 'Home @1.85' style labels).
+        Reads odds from the clickable element text (e.g. "Home @1.85")
         """
         try:
-            elem = await page.query_selector(f'text={selection_text}')
+            # Try multiple ways to find the element
+            elem = await page.query_selector(f'text="{selection_text}"')
+            if not elem:
+                elem = await page.query_selector(f'text={selection_text}')
             if not elem:
                 return 0.0
+
             full_text = await elem.text_content()
             match = re.search(r'(\d+\.\d+)', full_text or '')
             if match:
@@ -102,7 +102,7 @@ class BetExecutor:
         try:
             await self.fast.scroll_to(page, 'text=Next Goal')
             await self.fast.fast_click(page, 'text=Next Goal')
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.4)
         except Exception:
             pass
 
@@ -114,6 +114,7 @@ class BetExecutor:
         self.last_odds_used = odds
         logger.info(f"Odds confirmed: {team} @ {odds}")
 
+        # Validation bet (first slow match only)
         if not self.validation_bet_placed:
             self.validation_bet_placed = True
             success = await self.run_validation_bet(page, match, team, odds, goal_num, match_name)
@@ -216,24 +217,42 @@ class BetExecutor:
             match_name = f"{match['home_team']} vs {match['away_team']}"
 
             if stack_num == 1 and goal_num == 1:
-                await asyncio.sleep(random.uniform(0.5, 1.0))
+                await asyncio.sleep(random.uniform(0.4, 0.8))
                 await page.bring_to_front()
 
             if not skip_market_selection:
-                if not await self.fast.fast_click(page, f'text={team}'):
+                clicked = False
+                # Try multiple selectors for better reliability
+                selectors = [
+                    f'text="{team}"',
+                    f'text={team}',
+                    f'button:has-text("{team}")',
+                    f'div:has-text("{team}")',
+                ]
+                for selector in selectors:
+                    try:
+                        if await self.fast.fast_click(page, selector):
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+
+                if not clicked:
                     logger.warning(f"Could not click team selection for {team}")
                     return False
 
+            # Fill stake
             stake_input = await page.query_selector(
-                'input[type="number"], input[type="tel"][value], input[inputmode="numeric"]'
+                'input[type="number"], input[type="tel"], input[inputmode="numeric"]'
             )
             if stake_input:
                 await stake_input.fill(str(int(stake)))
             else:
                 await self.fast.fast_type(page, 'input', str(int(stake)))
 
-            await asyncio.sleep(random.uniform(0.5, 1.0))
+            await asyncio.sleep(random.uniform(0.4, 0.8))
 
+            # Submit bet
             clicked = await self.fast.fast_click(page, 'button:has-text("Accept Changes")')
             if not clicked:
                 clicked = await self.fast.fast_click(page, 'button:has-text("Place Bet")')
@@ -273,7 +292,9 @@ class BetExecutor:
 
         except Exception as e:
             logger.error(f"Bet error: {e}")
-            await self.alerter.notify_error(f"Bet execution error on {match.get('home_team','')} vs {match.get('away_team','')}: {e}")
+            await self.alerter.notify_error(
+                f"Bet execution error on {match.get('home_team','')} vs {match.get('away_team','')}: {e}"
+            )
             return False
 
     async def handle_slow(self, match):
