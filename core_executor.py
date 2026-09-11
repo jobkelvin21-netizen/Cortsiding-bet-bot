@@ -74,17 +74,12 @@ class BetExecutor:
         return False
 
     async def _read_odds_from_click(self, page: Page, selection_text: str) -> float:
-        """
-        Reads odds from the clickable element text (e.g. "Home @1.85")
-        """
         try:
-            # Try multiple ways to find the element
             elem = await page.query_selector(f'text="{selection_text}"')
             if not elem:
                 elem = await page.query_selector(f'text={selection_text}')
             if not elem:
                 return 0.0
-
             full_text = await elem.text_content()
             match = re.search(r'(\d+\.\d+)', full_text or '')
             if match:
@@ -93,11 +88,50 @@ class BetExecutor:
             logger.debug(f"Odds read error: {e}")
         return 0.0
 
-    async def execute(self, page: Page, match: dict, team: str, goal_num: int = 1) -> bool:
+    # --- NEW: last-moment safety check against SportyBet re-locking the market ---
+    async def _score_still_matches(self, page: Page, expected_home_score: int, expected_away_score: int) -> bool:
+        """
+        Re-reads SportyBet's own live score right before submitting.
+        If it has already advanced past the goal that triggered this bet,
+        the 'Next Goal' market has relocked onto a newer goal — abort.
+        """
+        try:
+            score_elem = await page.query_selector('[class*="score"]')
+            if not score_elem:
+                logger.warning("Could not read current SportyBet score for safety check — aborting bet to be safe")
+                return False
+
+            text = await score_elem.text_content()
+            m = re.search(r'(\d+)\D+(\d+)', text or '')
+            if not m:
+                logger.warning(f"Could not parse SportyBet score '{text}' for safety check — aborting bet to be safe")
+                return False
+
+            current_home, current_away = int(m.group(1)), int(m.group(2))
+
+            if current_home == expected_home_score and current_away == expected_away_score:
+                return True
+
+            logger.warning(f"⚠️ SAFETY ABORT: expected score {expected_home_score}-{expected_away_score} "
+                            f"but SportyBet now shows {current_home}-{current_away} — market has moved on, not betting")
+            return False
+
+        except Exception as e:
+            logger.error(f"Safety score check error: {e} — aborting bet to be safe")
+            return False
+
+    async def execute(self, page: Page, match: dict, team: str, goal_num: int = 1,
+                       expected_home_score: int = None, expected_away_score: int = None) -> bool:
         if self.stopped:
             return False
 
         match_name = f"{match['home_team']} vs {match['away_team']}"
+
+        # --- Safety gate: confirm SportyBet's score hasn't already moved past this goal ---
+        if expected_home_score is not None and expected_away_score is not None:
+            still_valid = await self._score_still_matches(page, expected_home_score, expected_away_score)
+            if not still_valid:
+                return False
 
         odds = await self._read_odds_from_click(page, team)
         if odds <= 0:
@@ -107,7 +141,6 @@ class BetExecutor:
         self.last_odds_used = odds
         logger.info(f"Odds confirmed: {team} @ {odds}")
 
-        # Validation bet (first slow match only)
         if not self.validation_bet_placed:
             self.validation_bet_placed = True
             success = await self.run_validation_bet(page, match, team, odds, goal_num, match_name)
@@ -215,7 +248,6 @@ class BetExecutor:
 
             if not skip_market_selection:
                 clicked = False
-                # Try multiple selectors for better reliability
                 selectors = [
                     f'text="{team}"',
                     f'text={team}',
@@ -234,7 +266,6 @@ class BetExecutor:
                     logger.warning(f"Could not click team selection for {team}")
                     return False
 
-            # Fill stake
             stake_input = await page.query_selector(
                 'input[type="number"], input[type="tel"], input[inputmode="numeric"]'
             )
@@ -245,7 +276,6 @@ class BetExecutor:
 
             await asyncio.sleep(random.uniform(0.4, 0.8))
 
-            # Submit bet
             clicked = await self.fast.fast_click(
                 page, 'button:has-text("Accept Changes")', human_delay=False
             )
