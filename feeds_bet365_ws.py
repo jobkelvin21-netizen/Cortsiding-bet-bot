@@ -15,8 +15,6 @@ SCHEMA_CACHE_FILE = "bet365_schema_cache.json"
 
 
 def try_base64_decode(payload: str):
-    """Attempt to base64-decode a raw frame before parsing as JSON.
-    Returns decoded JSON dict if successful, else None."""
     try:
         padded = payload + "=" * (-len(payload) % 4)
         decoded_bytes = base64.b64decode(padded, validate=True)
@@ -198,6 +196,16 @@ class Bet365Feed:
             page = await browser.new_page(viewport={'width': 412, 'height': 915})
             await page.goto("https://www.bet365.com/", wait_until="domcontentloaded", timeout=20000)
 
+            # NEW: check if we actually landed on a block/challenge page
+            title = await page.title()
+            body_text = await page.evaluate("document.body.innerText.slice(0, 300)")
+            if "blocked" in body_text.lower() or "blocked" in title.lower():
+                logger.warning(f"Proxy #{idx} reached bet365 but got BLOCKED (Cloudflare/anti-bot page)")
+                self.proxy_rotator.mark_bad(idx)
+                await browser.close()
+                return None, None
+
+            logger.success(f"Proxy #{idx} reached bet365 successfully (title: '{title}')")
             return browser, page
 
         except Exception as e:
@@ -215,7 +223,6 @@ class Bet365Feed:
 
         data = None
 
-        # Try base64 decode first (in case bet365 encodes like SportyBet does)
         decoded = try_base64_decode(payload)
         if decoded is not None:
             data = decoded
@@ -241,6 +248,10 @@ class Bet365Feed:
 
         self.matches[match['match_id']] = match
 
+        # NEW: log every real match update, same visibility as Polymarket
+        logger.info(f"[BET365 WS] {match['home_team']} {match['home_score']}-{match['away_score']} "
+                    f"{match['away_team']} | period={match['period']}")
+
         if self.callback and self._loop:
             asyncio.run_coroutine_threadsafe(self.callback(match), self._loop)
 
@@ -253,6 +264,8 @@ class Bet365Feed:
         self.page = page
 
         def on_ws(ws):
+            logger.debug(f"[BET365] WebSocket opened: {ws.url}")  # NEW: confirm a socket even opens
+
             def on_frame(payload):
                 self._on_ws_frame(payload)
             ws.on("framereceived", on_frame)
@@ -266,20 +279,31 @@ class Bet365Feed:
             if live_link:
                 await live_link.click()
                 await asyncio.sleep(3)
+            else:
+                logger.warning("[BET365] Could not find a Live/In-Play link on the page")
 
             football_link = await page.query_selector('a:has-text("Football"), a:has-text("Soccer")')
             if football_link:
                 await football_link.click()
                 await asyncio.sleep(3)
+            else:
+                logger.warning("[BET365] Could not find a Football/Soccer link on the page")
 
             logger.success("bet365 connected via proxy, watching live football...")
 
+            last_no_data_warning = 0
             while self.running:
                 await asyncio.sleep(5)
                 if page.is_closed():
                     logger.warning("bet365 page closed unexpectedly")
                     break
-                if self.last_message_at and (time.time() - self.last_message_at) > 45:
+
+                # NEW: explicit warning if connected but genuinely receiving nothing
+                if self.last_message_at is None:
+                    if time.time() - last_no_data_warning > 15:
+                        logger.warning("[BET365] Connected but no WebSocket data received yet...")
+                        last_no_data_warning = time.time()
+                elif (time.time() - self.last_message_at) > 45:
                     logger.warning("bet365 feed stalled (no messages in 45s) — reconnecting")
                     break
 
