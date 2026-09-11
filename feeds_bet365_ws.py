@@ -267,8 +267,6 @@ class Bet365Feed:
             logger.debug(f"[BET365] WebSocket opened: {ws.url}")
 
             def on_frame(payload):
-                # TEMP DIAGNOSTIC: dump every raw frame, no filtering, so we can
-                # see the real shape of bet365's data (binary/protobuf/JSON/etc.)
                 try:
                     with open(RAW_FRAMES_LOG, "a") as f:
                         f.write(f"{datetime.now()} | LEN={len(payload)} | {payload[:200]}\n")
@@ -282,8 +280,15 @@ class Bet365Feed:
         page.on("websocket", on_ws)
 
         try:
-            # NEW: click "In-Play" using a much broader set of selectors,
-            # since bet365's nav items are icon/div-based, not plain <a>/<button>
+            # NEW: save homepage HTML so we can inspect real bet365 markup
+            try:
+                html_snapshot = await page.content()
+                with open("bet365_homepage.html", "w", encoding="utf-8") as f:
+                    f.write(html_snapshot)
+                logger.info("[BET365] Saved homepage HTML to bet365_homepage.html")
+            except Exception as e:
+                logger.warning(f"[BET365] Could not save homepage HTML: {e}")
+
             in_play_link = await page.query_selector(
                 'a:has-text("In-Play"), div:has-text("In-Play"), span:has-text("In-Play"), '
                 '[class*="in-play"], [class*="inplay"], [href*="in-play"], [href*="inplay"], '
@@ -293,6 +298,15 @@ class Bet365Feed:
                 await in_play_link.click()
                 await asyncio.sleep(3)
                 logger.success("[BET365] Clicked In-Play/Live tab")
+
+                # NEW: save in-play page HTML too
+                try:
+                    html_snapshot2 = await page.content()
+                    with open("bet365_inplay_page.html", "w", encoding="utf-8") as f:
+                        f.write(html_snapshot2)
+                    logger.info("[BET365] Saved in-play page HTML to bet365_inplay_page.html")
+                except Exception as e:
+                    logger.warning(f"[BET365] Could not save in-play page HTML: {e}")
             else:
                 logger.warning("[BET365] Could not find In-Play/Live nav item — trying direct URL fallback")
                 try:
@@ -300,17 +314,6 @@ class Bet365Feed:
                     await asyncio.sleep(3)
                 except Exception as e:
                     logger.warning(f"[BET365] Direct In-Play URL fallback failed: {e}")
-
-            football_link = await page.query_selector(
-                'a:has-text("Football"), div:has-text("Football"), span:has-text("Football"), '
-                '[class*="football"]'
-            )
-            if football_link:
-                await football_link.click()
-                await asyncio.sleep(3)
-                logger.success("[BET365] Clicked Football section")
-            else:
-                logger.warning("[BET365] Could not find Football section link on the In-Play page")
 
             logger.success("bet365 connected via proxy, watching live football...")
 
