@@ -99,13 +99,6 @@ class BetExecutor:
 
         match_name = f"{match['home_team']} vs {match['away_team']}"
 
-        try:
-            await self.fast.scroll_to(page, 'text=Next Goal')
-            await self.fast.fast_click(page, 'text=Next Goal')
-            await asyncio.sleep(0.4)
-        except Exception:
-            pass
-
         odds = await self._read_odds_from_click(page, team)
         if odds <= 0:
             logger.error(f"No odds found for {team} on {match_name} — skipping this goal event")
@@ -231,7 +224,7 @@ class BetExecutor:
                 ]
                 for selector in selectors:
                     try:
-                        if await self.fast.fast_click(page, selector):
+                        if await self.fast.fast_click(page, selector, human_delay=False):
                             clicked = True
                             break
                     except Exception:
@@ -248,14 +241,18 @@ class BetExecutor:
             if stake_input:
                 await stake_input.fill(str(int(stake)))
             else:
-                await self.fast.fast_type(page, 'input', str(int(stake)))
+                await self.fast.fast_type(page, 'input', str(int(stake)), human_delay=False)
 
             await asyncio.sleep(random.uniform(0.4, 0.8))
 
             # Submit bet
-            clicked = await self.fast.fast_click(page, 'button:has-text("Accept Changes")')
+            clicked = await self.fast.fast_click(
+                page, 'button:has-text("Accept Changes")', human_delay=False
+            )
             if not clicked:
-                clicked = await self.fast.fast_click(page, 'button:has-text("Place Bet")')
+                clicked = await self.fast.fast_click(
+                    page, 'button:has-text("Place Bet")', human_delay=False
+                )
 
             if not clicked:
                 logger.error("Could not find submit button (Accept Changes / Place Bet)")
