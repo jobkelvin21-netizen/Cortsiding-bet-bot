@@ -1,4 +1,5 @@
 import re
+import difflib
 from datetime import datetime
 from typing import Callable, Dict, Optional
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ def normalize_team_name(name: str) -> str:
     name = name.lower().strip()
     name = re.sub(r'\b(fc|cf|sc|afc|cd|ac|fk|nk|sk|as|ss|rc|ca|cs|us|sd)\b', '', name)
     name = re.sub(r'\b(united|city|town|rovers|athletic|sporting|club)\b', '', name)
+    name = re.sub(r'\b(u1[0-9]|u2[0-3]|u21|u20|u19|u18|u17|u16|u15)\b', '', name)
     name = re.sub(r'[^a-z0-9]', '', name)
     return name
 
@@ -51,6 +53,7 @@ class SlowGameDetector:
         self.UNFLAG_STREAK = 2
         self.MAX_FAST_AGE = 8.0
         self.MAX_SB_AGE = 7.0
+        self.FUZZY_MATCH_THRESHOLD = 0.82
 
     def _base_key(self, home: str, away: str) -> str:
         h = normalize_team_name(home)
@@ -58,6 +61,27 @@ class SlowGameDetector:
         if h > a:
             h, a = a, h
         return f"{h}_vs_{a}"
+
+    def _fuzzy_find_key(self, base: str) -> Optional[str]:
+        """Fall back to closest-matching existing key if no exact match found."""
+        if not self.records:
+            return None
+
+        candidates = list(self.records.keys())
+        best_match = difflib.get_close_matches(base, candidates, n=1, cutoff=self.FUZZY_MATCH_THRESHOLD)
+
+        if candidates:
+            scored = [(c, difflib.SequenceMatcher(None, base, c).ratio()) for c in candidates]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            top_key, top_score = scored[0]
+            logger.debug(f"[FUZZY] new='{base}' closest='{top_key}' score={top_score:.3f} "
+                         f"(threshold={self.FUZZY_MATCH_THRESHOLD})")
+
+        if best_match:
+            logger.debug(f"[FUZZY] MATCHED '{base}' -> existing key '{best_match[0]}'")
+            return best_match[0]
+
+        return None
 
     def _resolve_key(self, home: str, away: str, league: str = '') -> str:
         base = self._base_key(home, away)
@@ -70,6 +94,11 @@ class SlowGameDetector:
         for k in self.records:
             if k.endswith(base) or k == base:
                 return k
+
+        fuzzy_key = self._fuzzy_find_key(base)
+        if fuzzy_key:
+            return fuzzy_key
+
         return full
 
     def _get_or_create(self, key: str, home: str, away: str) -> MatchRecord:
