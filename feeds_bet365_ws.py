@@ -1,3 +1,4 @@
+# feeds/bet365_ws.py
 import asyncio
 import json
 import re
@@ -12,6 +13,7 @@ from playwright.async_api import async_playwright
 from proxies import ProxyRotator
 
 SCHEMA_CACHE_FILE = "bet365_schema_cache.json"
+RAW_FRAMES_LOG = "bet365_all_frames.log"
 
 
 def try_base64_decode(payload: str):
@@ -106,7 +108,7 @@ class SchemaLearner:
             logger.warning("Schema learning inconclusive so far, waiting for more samples...")
             if len(self.sample_messages) > 30:
                 logger.error("Could not learn bet365 schema after 30 samples. "
-                             "Check bet365_raw_dump.log for manual inspection.")
+                             "Check bet365_raw_dump.log / bet365_all_frames.log for manual inspection.")
 
     def _flatten(self, d, prefix=""):
         out = {}
@@ -196,7 +198,6 @@ class Bet365Feed:
             page = await browser.new_page(viewport={'width': 412, 'height': 915})
             await page.goto("https://www.bet365.com/", wait_until="domcontentloaded", timeout=20000)
 
-            # NEW: check if we actually landed on a block/challenge page
             title = await page.title()
             body_text = await page.evaluate("document.body.innerText.slice(0, 300)")
             if "blocked" in body_text.lower() or "blocked" in title.lower():
@@ -248,7 +249,6 @@ class Bet365Feed:
 
         self.matches[match['match_id']] = match
 
-        # NEW: log every real match update, same visibility as Polymarket
         logger.info(f"[BET365 WS] {match['home_team']} {match['home_score']}-{match['away_score']} "
                     f"{match['away_team']} | period={match['period']}")
 
@@ -264,30 +264,53 @@ class Bet365Feed:
         self.page = page
 
         def on_ws(ws):
-            logger.debug(f"[BET365] WebSocket opened: {ws.url}")  # NEW: confirm a socket even opens
+            logger.debug(f"[BET365] WebSocket opened: {ws.url}")
 
             def on_frame(payload):
+                # TEMP DIAGNOSTIC: dump every raw frame, no filtering, so we can
+                # see the real shape of bet365's data (binary/protobuf/JSON/etc.)
+                try:
+                    with open(RAW_FRAMES_LOG, "a") as f:
+                        f.write(f"{datetime.now()} | LEN={len(payload)} | {payload[:200]}\n")
+                except Exception:
+                    pass
+
                 self._on_ws_frame(payload)
+
             ws.on("framereceived", on_frame)
 
         page.on("websocket", on_ws)
 
         try:
-            live_link = await page.query_selector(
-                'a:has-text("Live"), button:has-text("Live"), a:has-text("In-Play")'
+            # NEW: click "In-Play" using a much broader set of selectors,
+            # since bet365's nav items are icon/div-based, not plain <a>/<button>
+            in_play_link = await page.query_selector(
+                'a:has-text("In-Play"), div:has-text("In-Play"), span:has-text("In-Play"), '
+                '[class*="in-play"], [class*="inplay"], [href*="in-play"], [href*="inplay"], '
+                'a:has-text("Live"), div:has-text("Live")'
             )
-            if live_link:
-                await live_link.click()
+            if in_play_link:
+                await in_play_link.click()
                 await asyncio.sleep(3)
+                logger.success("[BET365] Clicked In-Play/Live tab")
             else:
-                logger.warning("[BET365] Could not find a Live/In-Play link on the page")
+                logger.warning("[BET365] Could not find In-Play/Live nav item — trying direct URL fallback")
+                try:
+                    await page.goto("https://www.bet365.com/#/IP/", wait_until="domcontentloaded", timeout=15000)
+                    await asyncio.sleep(3)
+                except Exception as e:
+                    logger.warning(f"[BET365] Direct In-Play URL fallback failed: {e}")
 
-            football_link = await page.query_selector('a:has-text("Football"), a:has-text("Soccer")')
+            football_link = await page.query_selector(
+                'a:has-text("Football"), div:has-text("Football"), span:has-text("Football"), '
+                '[class*="football"]'
+            )
             if football_link:
                 await football_link.click()
                 await asyncio.sleep(3)
+                logger.success("[BET365] Clicked Football section")
             else:
-                logger.warning("[BET365] Could not find a Football/Soccer link on the page")
+                logger.warning("[BET365] Could not find Football section link on the In-Play page")
 
             logger.success("bet365 connected via proxy, watching live football...")
 
@@ -298,7 +321,6 @@ class Bet365Feed:
                     logger.warning("bet365 page closed unexpectedly")
                     break
 
-                # NEW: explicit warning if connected but genuinely receiving nothing
                 if self.last_message_at is None:
                     if time.time() - last_no_data_warning > 15:
                         logger.warning("[BET365] Connected but no WebSocket data received yet...")
