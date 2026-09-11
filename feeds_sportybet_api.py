@@ -1,5 +1,7 @@
 import asyncio
 import re
+import json
+import base64
 from datetime import datetime
 from typing import Callable, Optional
 from loguru import logger
@@ -81,71 +83,79 @@ class SportyBetFeed:
             return found[0]
         return None
 
-    async def _handle_event(self, data):
-        """Process incoming Socket.IO data"""
+    # --- NEW: decode the real base64 "body" payload into a usable dict ---
+    def _decode_body(self, body_str):
         try:
-            events = []
-            if isinstance(data, dict):
-                if "data" in data and isinstance(data["data"], list):
-                    events = data["data"]
-                elif "events" in data:
-                    events = data["events"]
-                else:
-                    events = [data]
-            elif isinstance(data, list):
-                events = data
+            padded = body_str + "=" * (-len(body_str) % 4)
+            decoded_bytes = base64.b64decode(padded)
+            text = decoded_bytes.decode("utf-8")
+            return json.loads(text)
+        except Exception as e:
+            logger.debug(f"Body decode failed: {e}")
+            return None
 
-            for event in events:
-                if not isinstance(event, dict):
-                    continue
+    async def _handle_event(self, data):
+        """Process incoming Socket.IO data (real SportyBet format: topic + base64 body)"""
+        try:
+            # data here is data_wrapper["data"] JSON-string content already
+            # (parsed one level up in catch_all), containing topic/body
+            if not isinstance(data, dict):
+                return
 
-                event_id = event.get("eventId") or event.get("id") or event.get("matchId")
-                home = event.get("homeTeamName") or event.get("home") or event.get("homeTeam", "")
-                away = event.get("awayTeamName") or event.get("away") or event.get("awayTeam", "")
+            topic = data.get("topic", "")
+            body_str = data.get("body")
 
-                if not event_id or not home or not away:
-                    continue
+            # Ack-only frames (subscription confirmations) have no body — skip quietly
+            if not body_str:
+                return
 
-                played = self._parse_played_seconds(
-                    event.get("playedSeconds") or event.get("time") or event.get("played_time") or 0
-                )
-                status = event.get("matchStatus") or event.get("status") or event.get("period", "")
+            decoded = self._decode_body(body_str)
+            if not decoded:
+                return
 
-                home_score = event.get("homeScore", 0)
-                away_score = event.get("awayScore", 0)
+            # ~status topics decode into a dict with eventScore, eventPlayedTime, etc.
+            if isinstance(decoded, dict) and "fixtureHomeTeamName" in decoded:
+                event_id = self._extract_id(topic)
+                home = decoded.get("fixtureHomeTeamName", "")
+                away = decoded.get("fixtureAwayTeamName", "")
+                played = self._parse_played_seconds(decoded.get("eventPlayedTime", 0))
+                status = decoded.get("eventMatchStatus", "")
 
-                game_score = event.get("gameScore")
-                if game_score and isinstance(game_score, list) and game_score:
-                    try:
-                        last = str(game_score[-1])
-                        h, a = last.split(":")
-                        home_score, away_score = int(h), int(a)
-                    except Exception:
-                        pass
+                home_score, away_score = 0, 0
+                score_str = decoded.get("eventScore", "0:0")
+                try:
+                    h, a = score_str.split(":")
+                    home_score, away_score = int(h), int(a)
+                except Exception:
+                    pass
 
                 match = {
-                    "match_id": str(event_id),
-                    "sportradar_id": self._extract_id(event_id),
+                    "match_id": event_id,
+                    "sportradar_id": event_id,
                     "home_team": home,
                     "away_team": away,
-                    "home_score": int(home_score or 0),
-                    "away_score": int(away_score or 0),
+                    "home_score": home_score,
+                    "away_score": away_score,
                     "period": status,
                     "match_status": status,
                     "played_seconds": played,
                     "timestamp": datetime.now(),
                 }
 
-                self.matches[str(event_id)] = match
+                self.matches[event_id] = match
 
-                if played > 0 or str(status).upper() in ("H1", "H2", "LIVE", "1H", "2H"):
-                    logger.info(
-                        f"[SportyBet WS] {home} vs {away} | "
-                        f"{match['home_score']}-{match['away_score']} | {status} | {played}s"
-                    )
+                logger.info(
+                    f"[SportyBet WS] {home} vs {away} | "
+                    f"{match['home_score']}-{match['away_score']} | {status} | {played}s"
+                )
 
                 if self.callback:
                     await self.callback(match)
+
+            # ~odds topics decode into a list [id, code, market_name, ..., outcomes_list]
+            # Log but don't push into match state unless you want odds tracked separately
+            elif isinstance(decoded, list):
+                logger.debug(f"[SportyBet WS] Odds update on topic {topic}: {decoded[:3]}...")
 
         except Exception as e:
             logger.debug(f"Event handling error: {e}")
@@ -189,13 +199,19 @@ class SportyBetFeed:
                     self.connected = False
                     logger.warning("SportyBet Socket.IO disconnected")
 
+                # --- NEW: unwrap the outer {"data": "<json-string>", "type": "..."} envelope
+                # before handing off to _handle_event, since that's the real frame shape
                 @self.sio.on('*')
-                async def catch_all(event, data):
-                    await self._handle_event(data)
+                async def catch_all(event, raw):
+                    try:
+                        if isinstance(raw, dict) and "data" in raw and isinstance(raw["data"], str):
+                            inner = json.loads(raw["data"])
+                            await self._handle_event(inner)
+                        else:
+                            await self._handle_event(raw)
+                    except Exception as e:
+                        logger.debug(f"catch_all parse error: {e}")
 
-                # FIX: removed the unsupported 'wait_timeout' kwarg — the
-                # installed python-socketio version's AsyncClient.connect()
-                # doesn't accept it, which was causing the crash.
                 await self.sio.connect(url, transports=['websocket'])
 
                 while self.running and self.sio.connected:
