@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Callable, Optional
 from loguru import logger
 import socketio
-from playwright.async_api import Page
+from playwright.async_api import Page, async_playwright
 
 
 class SportyBetFeed:
@@ -19,12 +19,23 @@ class SportyBetFeed:
         self.alerter = None
         self.sio: Optional[socketio.AsyncClient] = None
 
+        # For auto-relaunch/re-login
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.phone = None
+        self.password = None
+
     def set_page(self, page: Page):
         self.page = page
         logger.info("SportyBetFeed received Playwright page")
 
     def set_alerter(self, alerter):
         self.alerter = alerter
+
+    def set_credentials(self, phone: str, password: str):
+        self.phone = phone
+        self.password = password
 
     def _parse_played_seconds(self, value):
         try:
@@ -42,6 +53,70 @@ class SportyBetFeed:
     def _extract_id(self, event_id):
         match = re.search(r'(\d+)$', str(event_id or ''))
         return match.group(1) if match else ''
+
+    async def _login(self):
+        """Perform login on self.page using stored credentials."""
+        try:
+            await self.page.goto("https://www.sportybet.com/ng/", wait_until="domcontentloaded")
+            await asyncio.sleep(2)
+
+            login_button = await self.page.query_selector('button:has-text("Log In"), a:has-text("Log In")')
+
+            if login_button:
+                logger.info("Not logged in yet. Logging in...")
+                await login_button.click()
+                await asyncio.sleep(1)
+
+                await self.page.wait_for_selector('input[name="phone"]', state="visible", timeout=0)
+                await self.page.fill('input[name="phone"]', self.phone)
+                await asyncio.sleep(0.5)
+
+                await self.page.wait_for_selector('input[name="psd"]', state="visible", timeout=0)
+                await self.page.fill('input[name="psd"]', self.password)
+                await asyncio.sleep(0.5)
+
+                await self.page.click('button[name="logIn"]', timeout=0)
+                await asyncio.sleep(5)
+                logger.success("Login complete!")
+            else:
+                logger.success("Already logged in. Continuing...")
+
+        except Exception as e:
+            logger.error(f"Login failed during relaunch: {e}")
+
+    async def _ensure_page_alive(self):
+        """Check if self.page is still usable; if not, relaunch a fresh browser+page and re-login."""
+        if self.page and not self.page.is_closed():
+            try:
+                await self.page.evaluate("1")
+                return True
+            except Exception:
+                pass
+
+        logger.warning("Browser page is dead or closed. Relaunching a fresh browser...")
+
+        try:
+            if self.playwright is None:
+                self.playwright = await async_playwright().start()
+
+            self.browser = await self.playwright.chromium.launch(
+                headless=False,
+                args=['--disable-blink-features=AutomationControlled']
+            )
+            self.context = await self.browser.new_context(viewport={'width': 412, 'height': 915})
+            self.page = await self.context.new_page()
+
+            if self.phone and self.password:
+                await self._login()
+            else:
+                logger.warning("No stored credentials — relaunched page may be logged out.")
+
+            logger.success("Fresh browser/page relaunched.")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to relaunch browser: {e}")
+            return False
 
     async def _discover_socket_url(self) -> Optional[str]:
         """Find the Socket.IO URL from the browser"""
@@ -83,7 +158,6 @@ class SportyBetFeed:
             return found[0]
         return None
 
-    # --- NEW: decode the real base64 "body" payload into a usable dict ---
     def _decode_body(self, body_str):
         try:
             padded = body_str + "=" * (-len(body_str) % 4)
@@ -97,15 +171,12 @@ class SportyBetFeed:
     async def _handle_event(self, data):
         """Process incoming Socket.IO data (real SportyBet format: topic + base64 body)"""
         try:
-            # data here is data_wrapper["data"] JSON-string content already
-            # (parsed one level up in catch_all), containing topic/body
             if not isinstance(data, dict):
                 return
 
             topic = data.get("topic", "")
             body_str = data.get("body")
 
-            # Ack-only frames (subscription confirmations) have no body — skip quietly
             if not body_str:
                 return
 
@@ -113,7 +184,6 @@ class SportyBetFeed:
             if not decoded:
                 return
 
-            # ~status topics decode into a dict with eventScore, eventPlayedTime, etc.
             if isinstance(decoded, dict) and "fixtureHomeTeamName" in decoded:
                 event_id = self._extract_id(topic)
                 home = decoded.get("fixtureHomeTeamName", "")
@@ -152,8 +222,6 @@ class SportyBetFeed:
                 if self.callback:
                     await self.callback(match)
 
-            # ~odds topics decode into a list [id, code, market_name, ..., outcomes_list]
-            # Log but don't push into match state unless you want odds tracked separately
             elif isinstance(decoded, list):
                 logger.debug(f"[SportyBet WS] Odds update on topic {topic}: {decoded[:3]}...")
 
@@ -169,6 +237,11 @@ class SportyBetFeed:
 
         while self.running:
             try:
+                page_ok = await self._ensure_page_alive()
+                if not page_ok:
+                    await asyncio.sleep(15)
+                    continue
+
                 url = await self._discover_socket_url()
                 if not url:
                     msg = "❌ Could not find SportyBet Socket.IO URL"
@@ -199,8 +272,6 @@ class SportyBetFeed:
                     self.connected = False
                     logger.warning("SportyBet Socket.IO disconnected")
 
-                # --- NEW: unwrap the outer {"data": "<json-string>", "type": "..."} envelope
-                # before handing off to _handle_event, since that's the real frame shape
                 @self.sio.on('*')
                 async def catch_all(event, raw):
                     try:
