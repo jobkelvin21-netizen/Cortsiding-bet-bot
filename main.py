@@ -92,9 +92,10 @@ class ArbitrageBot:
 
         logger.success("SportyBet login complete!")
 
-        # Important: pass page and alerter to SportyBet feed
+        # Important: pass page, alerter, and credentials to SportyBet feed
         self.sportybet.set_page(page)
         self.sportybet.set_alerter(self.alerter)
+        self.sportybet.set_credentials(phone, password)  # NEW: enables auto-relogin on relaunch
 
         self.auth.browser = browser
         self.auth.page = page
