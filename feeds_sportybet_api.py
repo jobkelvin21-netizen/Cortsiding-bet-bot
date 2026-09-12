@@ -9,6 +9,7 @@ from typing import Callable, Optional
 from loguru import logger
 import socketio
 from playwright.async_api import Page, async_playwright
+from curl_cffi import requests
 
 
 def _strip_accents(text: str) -> str:
@@ -722,19 +723,10 @@ class SportyBetFeed:
 
         It is NOT used as the live data feed.
 
-        The request is made from the actual SportyBet
-        browser page so the current browser session,
-        cookies and browser context are used.
+        curl_cffi is used here because the SportyBet
+        endpoint returns valid JSON through curl_cffi,
+        while Playwright's API request returned HTTP 202.
         """
-
-        if not self.page:
-
-            logger.warning(
-                "Cannot query factsCenter: "
-                "no Playwright page."
-            )
-
-            return []
 
         url = (
             "https://www.sportybet.com/api/ng/"
@@ -746,125 +738,66 @@ class SportyBetFeed:
 
             logger.info(
                 "Requesting SportyBet factsCenter "
-                "to discover live matches..."
+                "using curl_cffi..."
             )
 
-            result = await self.page.evaluate(
-                """
-                async (url) => {
-
-                    try {
-
-                        const response = await fetch(
-                            url,
-                            {
-                                method: "GET",
-                                credentials: "include",
-                                headers: {
-                                    "Accept":
-                                    "application/json, text/plain, */*"
-                                }
-                            }
-                        );
-
-                        const text =
-                            await response.text();
-
-                        return {
-                            status: response.status,
-                            contentType:
-                                response.headers.get(
-                                    "content-type"
-                                ) || "",
-                            text: text
-                        };
-
-                    } catch (e) {
-
-                        return {
-                            status: 0,
-                            contentType: "",
-                            text: "",
-                            error: String(e)
-                        };
-                    }
-                }
-                """,
-                url
-            )
-
-            status = result.get(
-                "status",
-                0
-            )
-
-            content_type = result.get(
-                "contentType",
-                ""
-            )
-
-            text = result.get(
-                "text",
-                ""
+            response = await asyncio.to_thread(
+                requests.get,
+                url,
+                impersonate="chrome",
+                timeout=20
             )
 
             logger.info(
                 f"factsCenter HTTP status: "
-                f"{status}"
+                f"{response.status_code}"
             )
 
             logger.info(
                 f"factsCenter content type: "
-                f"{content_type}"
+                f"{response.headers.get('content-type', '')}"
             )
 
             logger.info(
                 f"factsCenter response size: "
-                f"{len(text)} bytes"
+                f"{len(response.text)} bytes"
             )
 
-            if status < 200 or status >= 300:
+            if response.status_code != 200:
 
                 logger.warning(
                     f"factsCenter returned HTTP "
-                    f"{status}"
+                    f"{response.status_code}"
                 )
 
                 logger.debug(
                     f"factsCenter response: "
-                    f"{text[:3000]}"
+                    f"{response.text[:3000]}"
                 )
 
                 return []
 
-            if not text.strip():
-
-                logger.warning(
-                    "factsCenter returned an empty response."
-                )
-
-                return []
-
-            # Try JSON
             try:
 
-                result = json.loads(text)
+                result = response.json()
 
-            except Exception:
+            except Exception as e:
 
                 logger.warning(
-                    "factsCenter did not return normal JSON."
+                    f"factsCenter JSON decode failed: "
+                    f"{e}"
                 )
 
                 logger.debug(
                     f"factsCenter response: "
-                    f"{text[:3000]}"
+                    f"{response.text[:3000]}"
                 )
 
                 return []
 
             logger.success(
-                "factsCenter returned valid JSON."
+                "factsCenter returned valid JSON "
+                "through curl_cffi."
             )
 
             return result
@@ -872,7 +805,8 @@ class SportyBetFeed:
         except Exception as e:
 
             logger.error(
-                f"factsCenter request failed: {e}"
+                f"factsCenter curl_cffi request failed: "
+                f"{e}"
             )
 
             return []
