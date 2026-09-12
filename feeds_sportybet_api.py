@@ -2,11 +2,42 @@ import asyncio
 import re
 import json
 import base64
+import unicodedata
 from datetime import datetime
 from typing import Callable, Optional
 from loguru import logger
 import socketio
 from playwright.async_api import Page, async_playwright
+
+
+def _strip_accents(text: str) -> str:
+    if not text:
+        return ''
+    nfkd = unicodedata.normalize('NFKD', text)
+    return ''.join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def _normalize_team_name(name: str) -> str:
+    if not name:
+        return ''
+    name = _strip_accents(name).lower().strip()
+    words = re.findall(r'[a-z0-9]+', name)
+    filler = {
+        'fc', 'cf', 'sc', 'afc', 'cd', 'ac', 'fk', 'nk', 'sk', 'as', 'ss',
+        'rc', 'ca', 'cs', 'us', 'sd', 'ec',
+        'united', 'city', 'town', 'rovers', 'athletic', 'sporting', 'club'
+    }
+    words = [w for w in words if w not in filler]
+    if len(words) > 1 and len(words[-1]) <= 3:
+        words = words[:-1]
+    return ''.join(words)
+
+
+def _match_key(home: str, away: str) -> str:
+    h, a = _normalize_team_name(home), _normalize_team_name(away)
+    if h > a:
+        h, a = a, h
+    return f"{h}_vs_{a}"
 
 
 class SportyBetFeed:
@@ -214,10 +245,8 @@ class SportyBetFeed:
 
                 self.matches[event_id] = match
 
-                logger.info(
-                    f"[SportyBet WS] {home} vs {away} | "
-                    f"{match['home_score']}-{match['away_score']} | {status} | {played}s"
-                )
+                key = _match_key(home, away)
+                logger.info(f"[SLOW] {home} vs {away} -> key={key} played={played}")
 
                 if self.callback:
                     await self.callback(match)
