@@ -1,4 +1,3 @@
-# feeds/polymarket_ws.py
 import asyncio
 import json
 import threading
@@ -10,12 +9,6 @@ import websocket
 
 
 class PolymarketFeed:
-    """
-    Backup fast-feed source: Polymarket sports WebSocket.
-    Used only when bet365 is unhealthy/unreachable. Filters strictly
-    to soccer/football matches (confirmed field: eventState.type).
-    """
-
     def __init__(self, callback: Callable):
         self.callback = callback
         self.running = False
@@ -40,8 +33,11 @@ class PolymarketFeed:
             if not isinstance(data, dict) or 'homeTeam' not in data:
                 return
 
-            event_type = data.get('eventState', {}).get('type', '')
-            if event_type != 'soccer':
+            # CHANGED: case-insensitive check, accepts 'soccer' or 'football'
+            event_type = str(data.get('eventState', {}).get('type', '')).lower()
+            if event_type not in ('soccer', 'football'):
+                logger.debug(f"[POLYMARKET] Skipping non-soccer event: type='{event_type}' "
+                             f"home='{data.get('homeTeam')}'")
                 return
 
             match = {
@@ -64,8 +60,16 @@ class PolymarketFeed:
                 except Exception:
                     match['home_score'] = 0
                     match['away_score'] = 0
+            else:
+                match['home_score'] = 0
+                match['away_score'] = 0
 
             self.matches[match['match_id']] = match
+
+            logger.debug(f"[POLYMARKET] {match['home_team']} {match['home_score']}-"
+                         f"{match['away_score']} {match['away_team']} | league={match['league']} "
+                         f"| live={match['live']}")
+
             if self.callback and self._loop:
                 asyncio.run_coroutine_threadsafe(self.callback(match), self._loop)
 
@@ -82,7 +86,7 @@ class PolymarketFeed:
             self._run()
 
     def _on_open(self, ws):
-        logger.success("Polymarket sports WebSocket connected! (soccer-only filter active)")
+        logger.success("Polymarket sports WebSocket connected! (all live soccer/football matches)")
         self.last_message_at = time.time()
 
     def _run(self):
@@ -99,7 +103,7 @@ class PolymarketFeed:
         self.running = True
         self._loop = asyncio.get_event_loop()
         threading.Thread(target=self._run, daemon=True).start()
-        logger.success("Backup feed started: Polymarket (soccer only)")
+        logger.success("Polymarket feed started (soccer/football only)")
 
     def stop(self):
         self.running = False
