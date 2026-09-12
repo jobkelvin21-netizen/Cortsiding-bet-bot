@@ -5,9 +5,6 @@ from datetime import datetime
 from typing import Callable, Dict, Optional
 from dataclasses import dataclass
 from loguru import logger
-from config import Config
-
-HALF_LENGTH_SECONDS = 45 * 60  # 2700 — standard soccer half length
 
 
 def strip_accents(text: str) -> str:
@@ -18,13 +15,13 @@ def strip_accents(text: str) -> str:
 
 
 def normalize_team_name(name: str) -> str:
-    """Turn a raw team name into a comparable key.
-    Safe against nuking short names (e.g. 'PSG') — only strips a trailing
-    short code (like 'GO', 'RS') when there's more than one word left.
+    """
+    Turns raw team names from either feed into a comparable key.
+    Handles the fact that Polymarket and SportyBet format team names very
+    differently (e.g. 'Man United' vs 'Manchester United FC').
     """
     if not name:
         return ''
-
     name = strip_accents(name).lower().strip()
     words = re.findall(r'[a-z0-9]+', name)
 
@@ -36,41 +33,13 @@ def normalize_team_name(name: str) -> str:
     words = [w for w in words if w not in filler]
     words = [w for w in words if not re.match(r'^u1[5-9]$|^u2[0-3]$', w)]
 
-    # Only strip a trailing short code (state/country tag) if it's not the
-    # only word left — protects single-word short names like "PSG".
+    # Only strip a trailing short code (state/region tag, common in
+    # SportyBet's lower-league naming) if it's not the only word left —
+    # protects genuinely short names like "PSG".
     if len(words) > 1 and len(words[-1]) <= 3:
         words = words[:-1]
 
     return ''.join(words)
-
-
-def _is_paused(period: str) -> bool:
-    if not period:
-        return False
-    p = str(period).upper().strip()
-    return p in ('HT', 'HALFTIME', 'BREAK', 'PAUSED', 'HALF TIME')
-
-
-def normalize_fast_played(played_seconds, period: str):
-    """
-    Fixes the Polymarket half-time clock reset: if the period is second
-    half (or later) and the elapsed value looks like it restarted near
-    zero, add one full half length so it's cumulative — matching how
-    SportyBet reports played time.
-    """
-    if played_seconds is None:
-        return None
-
-    p = (period or '').upper().strip()
-
-    if p == 'HT':
-        return float(HALF_LENGTH_SECONDS)
-
-    if p in ('2H', 'FT', 'FT OT', 'FT NR'):
-        if played_seconds < HALF_LENGTH_SECONDS:
-            return played_seconds + HALF_LENGTH_SECONDS
-
-    return played_seconds
 
 
 @dataclass
@@ -79,41 +48,34 @@ class MatchRecord:
     home_team: str = ''
     away_team: str = ''
 
-    fast_played: Optional[float] = None
-    fast_period: str = ''
     fast_score: tuple = (0, 0)
     fast_updated: Optional[datetime] = None
 
     sb_event_id: Optional[str] = None
-    sb_played: Optional[float] = None
-    sb_period: str = ''
     sb_score: tuple = (0, 0)
     sb_updated: Optional[datetime] = None
 
-    below_streak: int = 0
-    unmatched_warned: bool = False
+    matched_notified: bool = False
 
 
-class SlowGameDetector:
+class GoalMatchDetector:
+    """
+    Match-pairing + goal-event architecture:
+    1. Tracks matches live on BOTH Polymarket and SportyBet at once.
+    2. Fires 'matched_callback' the first time a match is confirmed live
+       on both sides — used to send you a Telegram notification.
+    3. Fires 'goal_callback' whenever Polymarket's score total increases
+       for an already-matched match.
+    4. is_market_still_valid() lets main.py check, right before betting,
+       whether SportyBet's own feed already caught up to this goal (in
+       which case their market has moved on and betting would hit the
+       wrong market).
+    """
+
     def __init__(self):
         self.records: Dict[str, MatchRecord] = {}
-        self.slow_games: Dict[str, dict] = {}
-        self.threshold = Config.SLOW_THRESHOLD_SECONDS
-
-        self.UNFLAG_STREAK = 2
-        self.MAX_FAST_AGE = 8.0
-        self.MAX_SB_AGE = 7.0
-
-        # If a flagged-slow match goes silent on either side for this long,
-        # force-remove the flag instead of leaving it stuck forever.
-        self.STALE_REMOVE_AFTER = 60.0
-
-        # Drop records that haven't been touched by either feed in this
-        # long — prevents unbounded memory growth over a long-running bot.
-        self.RECORD_EXPIRE_AFTER = 6 * 60 * 60  # 6 hours
-
-        self.FUZZY_MATCH_THRESHOLD = 0.82
-        self.UNMATCHED_WARNING_AFTER = 20.0
+        self.FUZZY_MATCH_THRESHOLD = 0.85
+        self.RECORD_EXPIRE_AFTER = 6 * 60 * 60
 
     def _base_key(self, home: str, away: str) -> str:
         h = normalize_team_name(home)
@@ -126,55 +88,40 @@ class SlowGameDetector:
         if not self.records:
             return None
         candidates = list(self.records.keys())
-        best_match = difflib.get_close_matches(base, candidates, n=1, cutoff=self.FUZZY_MATCH_THRESHOLD)
-        if best_match:
-            logger.debug(f"[FUZZY] MATCHED '{base}' -> existing key '{best_match[0]}'")
-            return best_match[0]
+        best = difflib.get_close_matches(base, candidates, n=1, cutoff=self.FUZZY_MATCH_THRESHOLD)
+        if best:
+            logger.debug(f"[FUZZY MATCH] '{base}' -> existing '{best[0]}'")
+            return best[0]
         return None
 
     def _resolve_key(self, home: str, away: str) -> str:
-        """Resolve to an existing MatchRecord key, using team names only.
-        (League is intentionally not used — the two feeds format league
-        names too differently to compare reliably.)
-        """
         base = self._base_key(home, away)
-
         if base in self.records:
             return base
+        fuzzy = self._fuzzy_find_key(base)
+        return fuzzy if fuzzy else base
 
-        fuzzy_key = self._fuzzy_find_key(base)
-        if fuzzy_key:
-            return fuzzy_key
-
-        return base
-
-    def _prune_expired_records(self):
+    def _prune_expired(self):
         now = datetime.now()
         expired = []
         for key, rec in self.records.items():
-            last_seen = max(
-                rec.fast_updated or datetime.min,
-                rec.sb_updated or datetime.min,
-            )
+            last_seen = max(rec.fast_updated or datetime.min, rec.sb_updated or datetime.min)
             if last_seen == datetime.min:
                 continue
             if (now - last_seen).total_seconds() > self.RECORD_EXPIRE_AFTER:
                 expired.append(key)
-
         for key in expired:
             del self.records[key]
-            self.slow_games.pop(key, None)
-
-        if expired:
-            logger.debug(f"Pruned {len(expired)} expired match record(s)")
 
     def _get_or_create(self, key: str, home: str, away: str) -> MatchRecord:
         if key not in self.records:
-            self._prune_expired_records()
+            self._prune_expired()
             self.records[key] = MatchRecord(key=key, home_team=home, away_team=away)
         return self.records[key]
 
-    async def on_bet365(self, data: dict, callback: Optional[Callable] = None):
+    async def on_bet365(self, data: dict, matched_callback: Optional[Callable] = None,
+                         goal_callback: Optional[Callable] = None):
+        """Callback target for the fast feed (Polymarket)."""
         try:
             home = data.get('home_team', '')
             away = data.get('away_team', '')
@@ -182,27 +129,34 @@ class SlowGameDetector:
                 return
 
             key = self._resolve_key(home, away)
-            period = data.get('period', '')
-            played = normalize_fast_played(data.get('played_seconds'), period)
-
-            logger.info(f"[FAST] {home} vs {away} -> key={key} played={played}")
+            new_score = (data.get('home_score', 0), data.get('away_score', 0))
 
             rec = self._get_or_create(key, home, away)
-            rec.fast_played = played
-            rec.fast_period = period
-            rec.fast_score = (data.get('home_score', 0), data.get('away_score', 0))
+            prev_score = rec.fast_score
+            rec.fast_score = new_score
             rec.fast_updated = datetime.now()
 
-            was_slow = key in self.slow_games
-            self._evaluate(key)
+            now_matched = rec.sb_updated is not None
+            if now_matched and not rec.matched_notified:
+                rec.matched_notified = True
+                logger.info(f"✅ MATCHED: {home} vs {away} (live on both Polymarket & SportyBet)")
+                if matched_callback:
+                    await matched_callback(rec)
 
-            if not was_slow and key in self.slow_games and callback:
-                await callback(self.slow_games[key])
+            if now_matched and sum(new_score) > sum(prev_score):
+                scoring_side = 'home' if new_score[0] > prev_score[0] else 'away'
+                logger.info(
+                    f"⚡ GOAL (Polymarket): {home} vs {away} "
+                    f"{prev_score} -> {new_score} ({scoring_side} scored)"
+                )
+                if goal_callback:
+                    await goal_callback(rec, scoring_side, prev_score, new_score)
 
         except Exception as e:
             logger.error(f"Fast feed error: {e}")
 
-    async def on_sportybet(self, data: dict, callback: Optional[Callable] = None):
+    async def on_sportybet(self, data: dict, matched_callback: Optional[Callable] = None):
+        """Callback target for feeds/sportybet_api.py."""
         try:
             home = data.get('home_team', '')
             away = data.get('away_team', '')
@@ -210,105 +164,41 @@ class SlowGameDetector:
                 return
 
             key = self._resolve_key(home, away)
-            played = data.get('played_seconds')
-
-            logger.info(f"[SB] {home} vs {away} -> key={key} played={played}")
-
             rec = self._get_or_create(key, home, away)
+
             rec.sb_event_id = data.get('match_id')
-            rec.sb_played = played
-            rec.sb_period = data.get('match_status') or data.get('period', '')
             rec.sb_score = (data.get('home_score', 0), data.get('away_score', 0))
             rec.sb_updated = datetime.now()
 
-            was_slow = key in self.slow_games
-            self._evaluate(key)
-
-            if not was_slow and key in self.slow_games and callback:
-                await callback(self.slow_games[key])
+            now_matched = rec.fast_updated is not None
+            if now_matched and not rec.matched_notified:
+                rec.matched_notified = True
+                logger.info(f"✅ MATCHED: {home} vs {away} (live on both Polymarket & SportyBet)")
+                if matched_callback:
+                    await matched_callback(rec)
 
         except Exception as e:
             logger.error(f"SportyBet feed error: {e}")
 
-    def _evaluate(self, key: str):
+    def is_market_still_valid(self, key: str, expected_total_before_goal: int) -> bool:
+        """
+        Safety check: only bet if SportyBet's own last-known score total
+        still matches what it was BEFORE the goal Polymarket just reported.
+        If SportyBet already shows the goal (or more), their market has
+        already moved on to the next goal number — betting now would hit
+        the wrong market.
+        """
         rec = self.records.get(key)
         if not rec:
-            return
+            return False
+        sb_total = sum(rec.sb_score)
+        return sb_total <= expected_total_before_goal
 
-        now = datetime.now()
+    def get(self, key: str) -> Optional[MatchRecord]:
+        return self.records.get(key)
 
-        # --- Visibility: warn once if only one side has ever reported ---
-        if rec.fast_updated and not rec.sb_updated:
-            age = (now - rec.fast_updated).total_seconds()
-            if age > self.UNMATCHED_WARNING_AFTER and not rec.unmatched_warned:
-                logger.warning(f"⚠️ UNMATCHED: '{rec.home_team}' vs '{rec.away_team}' seen on FAST feed "
-                                f"but never on SportyBet after {age:.0f}s — possible name mismatch")
-                rec.unmatched_warned = True
-        elif rec.sb_updated and not rec.fast_updated:
-            age = (now - rec.sb_updated).total_seconds()
-            if age > self.UNMATCHED_WARNING_AFTER and not rec.unmatched_warned:
-                logger.warning(f"⚠️ UNMATCHED: '{rec.home_team}' vs '{rec.away_team}' seen on SportyBet "
-                                f"but never on FAST feed after {age:.0f}s — possible name mismatch")
-                rec.unmatched_warned = True
-        elif rec.fast_updated and rec.sb_updated:
-            rec.unmatched_warned = False
-
-        # --- Force-clear a stuck "slow" flag if a feed has gone silent ---
-        if key in self.slow_games:
-            fast_dead = (rec.fast_updated is None or
-                         (now - rec.fast_updated).total_seconds() > self.STALE_REMOVE_AFTER)
-            sb_dead = (rec.sb_updated is None or
-                       (now - rec.sb_updated).total_seconds() > self.STALE_REMOVE_AFTER)
-            if fast_dead or sb_dead:
-                logger.info(f"Clearing stale SLOW flag (feed went silent): {rec.home_team} vs {rec.away_team}")
-                del self.slow_games[key]
-                rec.below_streak = 0
-                return
-
-        if (rec.fast_played is None or rec.sb_played is None or
-                rec.fast_updated is None or rec.sb_updated is None):
-            return
-
-        if _is_paused(rec.fast_period) or _is_paused(rec.sb_period):
-            return
-
-        fast_age = (now - rec.fast_updated).total_seconds()
-        sb_age = (now - rec.sb_updated).total_seconds()
-
-        if fast_age > self.MAX_FAST_AGE or sb_age > self.MAX_SB_AGE:
-            return
-
-        gap = rec.fast_played - rec.sb_played
-
-        if gap >= self.threshold:
-            rec.below_streak = 0
-            if key not in self.slow_games:
-                self.slow_games[key] = {
-                    'match_id': rec.sb_event_id or key,
-                    'home_team': rec.home_team,
-                    'away_team': rec.away_team,
-                    'gap_seconds': gap,
-                    '_last_score': rec.sb_score,
-                }
-                logger.info(f"⚡ SLOW: {rec.home_team} vs {rec.away_team} (lag {gap:.1f}s)")
-            else:
-                self.slow_games[key]['gap_seconds'] = gap
-        else:
-            if key in self.slow_games:
-                rec.below_streak += 1
-                if rec.below_streak >= self.UNFLAG_STREAK:
-                    logger.info(f"No longer slow: {rec.home_team} vs {rec.away_team}")
-                    del self.slow_games[key]
-                    rec.below_streak = 0
-
-    def is_slow(self, match_id: str) -> bool:
-        for v in self.slow_games.values():
-            if v.get('match_id') == match_id:
-                return True
-        return match_id in self.slow_games
-
-    def get(self, match_id: str) -> Optional[dict]:
-        for v in self.slow_games.values():
-            if v.get('match_id') == match_id:
-                return v
-        return self.slow_games.get(match_id)
+    def get_by_match_id(self, match_id: str) -> Optional[MatchRecord]:
+        for rec in self.records.values():
+            if rec.sb_event_id == match_id:
+                return rec
+        return None
