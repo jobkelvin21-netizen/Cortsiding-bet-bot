@@ -267,9 +267,12 @@ class Bet365Feed:
             logger.debug(f"[BET365] WebSocket opened: {ws.url}")
 
             def on_frame(payload):
+                # CHANGED: log the FULL payload, no truncation, so we can
+                # catch complete object-definition messages (team names,
+                # scores) that may only be sent once, right after connecting
                 try:
                     with open(RAW_FRAMES_LOG, "a") as f:
-                        f.write(f"{datetime.now()} | LEN={len(payload)} | {payload[:200]}\n")
+                        f.write(f"{datetime.now()} | LEN={len(payload)} | FULL={payload}\n")
                 except Exception:
                     pass
 
@@ -280,7 +283,6 @@ class Bet365Feed:
         page.on("websocket", on_ws)
 
         try:
-            # NEW: save homepage HTML so we can inspect real bet365 markup
             try:
                 html_snapshot = await page.content()
                 with open("bet365_homepage.html", "w", encoding="utf-8") as f:
@@ -299,7 +301,6 @@ class Bet365Feed:
                 await asyncio.sleep(3)
                 logger.success("[BET365] Clicked In-Play/Live tab")
 
-                # NEW: save in-play page HTML too
                 try:
                     html_snapshot2 = await page.content()
                     with open("bet365_inplay_page.html", "w", encoding="utf-8") as f:
