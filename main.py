@@ -1,14 +1,13 @@
 import asyncio
 import sys
 import time
-from datetime import datetime
 from loguru import logger
 
 from config import Config
 from auth_sportybet_login import SportyBetAuth
-from feeds.bet365_ws import Bet365Feed
+from feeds.polymarket_ws import PolymarketFeed
 from feeds.sportybet_api import SportyBetFeed
-from core.detector import GoalMatchDetector
+from core.match_linker import MatchLinker
 from core.executor import BetExecutor
 from core.cashout import CashOutManager
 from utils.telegram import TelegramAlerter
@@ -20,15 +19,22 @@ class ArbitrageBot:
         self.account_manager = AccountManager()
         self.alerter = TelegramAlerter()
         self.auth = SportyBetAuth()
-        self.bet365 = Bet365Feed(self.on_bet365)
+
         self.sportybet = SportyBetFeed()
-        self.detector = GoalMatchDetector()
+        self.polymarket = PolymarketFeed(self._noop_callback)
+
+        self.linker = MatchLinker(self.sportybet.matches)
+        self.linker.set_goal_callback(self.on_goal)
+
         self.executor = None
         self.cashout = CashOutManager(self.alerter)
-        self.match_pages = {}
+        self.slow_pages = {}
         self.running = False
         self._processing = {}
         self.browser = None
+
+    async def _noop_callback(self, match):
+        pass
 
     async def setup(self):
         if not self.account_manager.accounts:
@@ -46,17 +52,16 @@ class ArbitrageBot:
     async def start(self):
         await self.setup()
 
-        logger.info("="*60)
-        logger.info("BOT STARTING - POLYMARKET (FAST) + SPORTYBET")
-        logger.info("MATCH-PAIRING + GOAL-EVENT MODE")
-        logger.info("="*60)
+        logger.info("=" * 60)
+        logger.info("BOT STARTING - POLYMARKET + SPORTYBET")
+        logger.info("=" * 60)
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("SPORTYBET LOGIN")
-        print("="*60)
+        print("=" * 60)
         phone = input("Phone Number: ")
         password = input("Password: ")
-        print("="*60)
+        print("=" * 60)
 
         from playwright.async_api import async_playwright
         playwright = await async_playwright().start()
@@ -92,17 +97,12 @@ class ArbitrageBot:
 
         logger.success("SportyBet login complete!")
 
+        self.sportybet.set_page(page)
+        self.sportybet.set_alerter(self.alerter)
+        self.sportybet.set_credentials(phone, password)
+
         self.auth.browser = browser
         self.auth.page = page
-
-        try:
-            self.sportybet.set_page(page)
-        except AttributeError:
-            pass
-        try:
-            self.sportybet.set_alerter(self.alerter)
-        except AttributeError:
-            pass
 
         self.executor = BetExecutor(self.alerter, self.account_manager, None)
         self.executor.current_account = self.account_manager.get_active()
@@ -116,116 +116,84 @@ class ArbitrageBot:
         logger.info("Starting feeds...")
         self.running = True
 
-        try:
-            asyncio.create_task(self.bet365.start())
-            asyncio.create_task(self.sportybet.start(self.on_sb))
-        except Exception as e:
-            logger.warning(f"Feed error: {e}")
+        self.polymarket.callback = self.linker.on_polymarket
 
-        asyncio.create_task(self.daily_report())
+        await self.polymarket.start()
+        asyncio.create_task(self.sportybet.start(self.on_sportybet_update))
 
-        logger.success("Bot running! Watching for matched games + goals.")
+        logger.success("Bot running! Watching Polymarket for goals, betting on SportyBet.")
 
         while self.running:
             await asyncio.sleep(1)
 
-    async def on_bet365(self, data):
+    async def on_sportybet_update(self, data):
+        pass
+
+    async def on_goal(self, goal_data: dict):
         try:
-            await self.detector.on_bet365(
-                data,
-                matched_callback=self._on_match_confirmed,
-                goal_callback=self._on_goal_from_fast_feed
-            )
+            mid = goal_data['match_id']
+
+            if mid not in self.slow_pages:
+                await self.open_match_page(goal_data)
+
+            if self._processing.get(mid):
+                return
+            self._processing[mid] = True
+
+            try:
+                page = self.slow_pages.get(mid)
+                if not page:
+                    logger.warning(f"No open SportyBet page for {mid} — cannot bet")
+                    return
+
+                match = {
+                    'match_id': mid,
+                    'home_team': goal_data['home_team'],
+                    'away_team': goal_data['away_team'],
+                }
+
+                result = await self.executor.execute(
+                    page, match, goal_data['scoring_team'], goal_data['goal_num'],
+                    expected_home_score=goal_data['home_score'],
+                    expected_away_score=goal_data['away_score'],
+                )
+
+                if result == "SWITCH":
+                    logger.info("Account switch requested")
+                elif result is True:
+                    bet_id = f"{mid}_G{goal_data['goal_num']}_{int(time.time())}"
+                    stake = (Config.VALIDATION_STAKE if not self.executor.validation_passed
+                             else self.executor.calc_stake(self.executor.last_odds_used))
+                    self.cashout.register(mid, bet_id, stake, f"Goal {goal_data['goal_num']}")
+                    asyncio.create_task(self.cashout.monitor(bet_id, goal_data, page))
+
+            finally:
+                self._processing[mid] = False
+
         except Exception as e:
-            logger.error(f"Fast feed handler error: {e}")
+            logger.error(f"Goal handling error: {e}")
 
-    async def on_sb(self, data):
-        try:
-            await self.detector.on_sportybet(data, matched_callback=self._on_match_confirmed)
-        except Exception as e:
-            logger.error(f"SportyBet handler error: {e}")
-
-    async def _on_match_confirmed(self, rec):
-        """Fires once, the moment a match is confirmed live on BOTH feeds."""
-        asyncio.create_task(
-            self.alerter.notify_match_matched(rec.home_team, rec.away_team)
-        )
-        asyncio.create_task(self._ensure_page_open(rec))
-
-    async def _ensure_page_open(self, rec):
-        key = rec.key
-        if key in self.match_pages or not rec.sb_event_id:
-            return
+    async def open_match_page(self, goal_data: dict):
+        mid = goal_data['match_id']
         try:
             new_context = await self.browser.new_context(viewport={'width': 412, 'height': 915})
             new_page = await new_context.new_page()
-            await new_page.goto(f"{Config.SPORTYBET_BASE_URL}/ng/m/{rec.sb_event_id}")
+            await new_page.goto(f"{Config.SPORTYBET_BASE_URL}/ng/m/{mid}")
             await asyncio.sleep(4)
+
             try:
                 await new_page.click('text=Next Goal')
                 await asyncio.sleep(1.5)
             except Exception:
                 pass
-            self.match_pages[key] = new_page
-            logger.info(f"Monitoring page opened: {rec.home_team} vs {rec.away_team}")
-        except Exception as e:
-            logger.error(f"Could not open monitoring page for {rec.home_team} vs {rec.away_team}: {e}")
 
-    async def _on_goal_from_fast_feed(self, rec, scoring_side, prev_score, new_score):
-        key = rec.key
-        if key not in self.match_pages:
-            return
-        if self._processing.get(key):
-            return
-        asyncio.create_task(self._handle_goal(rec, scoring_side, prev_score, new_score))
-
-    async def _handle_goal(self, rec, scoring_side, prev_score, new_score):
-        key = rec.key
-        self._processing[key] = True
-
-        try:
-            goals_before = sum(prev_score)
-            if not self.detector.is_market_still_valid(key, goals_before):
-                logger.warning(
-                    f"🚫 SKIPPING bet on {rec.home_team} vs {rec.away_team} — "
-                    f"SportyBet already reflects this goal (market has moved on)"
-                )
-                await self.alerter.notify_market_skipped(rec.home_team, rec.away_team)
-                return
-
-            scoring_team = rec.home_team if scoring_side == 'home' else rec.away_team
-            goal_num = sum(new_score)
-
-            page = self.match_pages[key]
-            match = {
-                'match_id': rec.sb_event_id or key,
-                'home_team': rec.home_team,
-                'away_team': rec.away_team,
-            }
-
-            result = await self.executor.execute(page, match, scoring_team, goal_num)
-
-            if result == "SWITCH":
-                logger.info("Account switch requested")
-            elif result is True:
-                bet_id = f"{rec.sb_event_id}_G{goal_num}_{int(time.time())}"
-                stake = (Config.VALIDATION_STAKE if not self.executor.validation_passed
-                         else self.executor.calc_stake(self.executor.last_odds_used))
-                self.cashout.register(rec.sb_event_id, bet_id, stake, f"Goal {goal_num}")
-                asyncio.create_task(self.cashout.monitor(rec.sb_event_id, match, page))
+            self.slow_pages[mid] = new_page
+            await self.alerter.notify_slow_match_found(
+                goal_data['home_team'], goal_data['away_team'], 0
+            )
 
         except Exception as e:
-            logger.error(f"Goal handling error: {e}")
-        finally:
-            self._processing[key] = False
-
-    async def daily_report(self):
-        while self.running:
-            await asyncio.sleep(86400)
-            try:
-                await self.alerter.send_daily_report()
-            except Exception as e:
-                logger.error(f"Report error: {e}")
+            logger.error(f"Page open error for {mid}: {e}")
 
 
 if __name__ == "__main__":
