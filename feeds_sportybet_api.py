@@ -98,7 +98,7 @@ class SportyBetFeed:
         self.password = None
 
         # =========================================================
-        # NEW SOCKET SUBSCRIPTION STATE
+        # SOCKET SUBSCRIPTION STATE
         # =========================================================
 
         self.request_id = 1
@@ -107,7 +107,6 @@ class SportyBetFeed:
 
         self.subscription_lock = asyncio.Lock()
 
-        # Used to prevent duplicate subscription jobs
         self.subscription_task = None
 
     # =============================================================
@@ -197,10 +196,6 @@ class SportyBetFeed:
 
     async def _login(self):
 
-        """
-        Perform login on self.page using stored credentials.
-        """
-
         if not self.page:
             return
 
@@ -283,13 +278,6 @@ class SportyBetFeed:
 
     async def _ensure_page_alive(self):
 
-        """
-        Check if self.page is still usable.
-
-        If dead, launch a completely new browser,
-        create a new page and login again.
-        """
-
         if (
             self.page
             and not self.page.is_closed()
@@ -317,7 +305,6 @@ class SportyBetFeed:
                     await async_playwright().start()
                 )
 
-            # Close old browser if necessary
             if self.browser:
 
                 try:
@@ -373,15 +360,6 @@ class SportyBetFeed:
     async def _discover_socket_url(
         self
     ) -> Optional[str]:
-
-        """
-        Automatically discover the current SportyBet
-        Socket.IO server from the browser.
-
-        This is intentionally done every connection cycle
-        so if SportyBet changes the Socket.IO host, we
-        discover the new host automatically.
-        """
 
         if not self.page:
             return None
@@ -466,7 +444,6 @@ class SportyBetFeed:
 
             await asyncio.sleep(6)
 
-            # Try Live button.
             try:
 
                 await self.page.click(
@@ -499,8 +476,6 @@ class SportyBetFeed:
 
         if found:
 
-            # The first discovered SportyBet Socket.IO
-            # server is normally the one used by the page.
             url = found[0]
 
             logger.success(
@@ -559,156 +534,218 @@ class SportyBetFeed:
         obj
     ):
         """
-        SportyBet's factsCenter response can change structure.
+        Extract match/tournament IDs from the actual
+        SportyBet factsCenter structure.
 
-        Instead of assuming one exact JSON layout, recursively
-        search the entire response for:
+        Structure:
 
-            sr:match:XXXXXXXX
+            {
+                "bizCode": 10000,
+                "message": "OKO",
+                "data": [
+                    {
+                        "id": "sr:tournament:8",
+                        "name": "LaLiga",
+                        "events": [
+                            {
+                                "eventId": "sr:match:72478555",
+                                ...
+                                "tournament": {
+                                    "id": "sr:tournament:8",
+                                    "name": "LaLiga"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
 
-        and its nearest tournament ID.
+        IMPORTANT:
+        This endpoint is ONLY used to discover IDs.
 
-        Returns:
-
-            [
-                {
-                    "match_id": "...",
-                    "tournament_id": "..."
-                }
-            ]
+        Live match data still comes from Socket.IO.
         """
 
         found = {}
 
-        def walk(
-            value,
-            tournament_id=None
-        ):
+        try:
 
-            if isinstance(value, dict):
+            if not isinstance(obj, dict):
 
-                # -------------------------------------------------
-                # Look for tournament ID
-                # -------------------------------------------------
-
-                current_tournament = (
-                    tournament_id
+                logger.warning(
+                    "factsCenter response is not a dictionary."
                 )
 
-                for key, val in value.items():
+                return []
 
-                    key_lower = str(
-                        key
-                    ).lower()
+            tournaments = obj.get(
+                "data",
+                []
+            )
 
-                    if (
-                        "tournament" in key_lower
-                        and isinstance(
-                            val,
-                            (str, int)
-                        )
-                    ):
-
-                        text = str(val)
-
-                        match = re.search(
-                            r'sr:tournament:(\d+)',
-                            text
-                        )
-
-                        if match:
-
-                            current_tournament = (
-                                match.group(1)
-                            )
-
-                        elif text.isdigit():
-
-                            current_tournament = text
-
-                # -------------------------------------------------
-                # Search every value
-                # -------------------------------------------------
-
-                for key, val in value.items():
-
-                    # Check strings for match IDs
-                    if isinstance(
-                        val,
-                        str
-                    ):
-
-                        matches = re.findall(
-                            r'sr:match:(\d+)',
-                            val
-                        )
-
-                        for match_id in matches:
-
-                            if current_tournament:
-
-                                found[
-                                    (
-                                        match_id,
-                                        current_tournament
-                                    )
-                                ] = {
-                                    "match_id": match_id,
-                                    "tournament_id": (
-                                        current_tournament
-                                    )
-                                }
-
-                    walk(
-                        val,
-                        current_tournament
-                    )
-
-            elif isinstance(value, list):
-
-                for item in value:
-
-                    walk(
-                        item,
-                        tournament_id
-                    )
-
-            elif isinstance(
-                value,
-                str
+            if not isinstance(
+                tournaments,
+                list
             ):
 
-                matches = re.findall(
-                    r'sr:match:(\d+)',
-                    value
+                logger.warning(
+                    "factsCenter 'data' is not a list."
                 )
 
-                for match_id in matches:
+                return []
 
-                    if tournament_id:
+            for tournament in tournaments:
 
-                        found[
-                            (
-                                match_id,
-                                tournament_id
+                if not isinstance(
+                    tournament,
+                    dict
+                ):
+                    continue
+
+                # -------------------------------------------------
+                # Tournament ID
+                # -------------------------------------------------
+
+                tournament_id = ""
+
+                tournament_value = (
+                    tournament.get(
+                        "id",
+                        ""
+                    )
+                )
+
+                tournament_match = re.search(
+                    r'sr:tournament:(\d+)',
+                    str(tournament_value)
+                )
+
+                if tournament_match:
+
+                    tournament_id = (
+                        tournament_match.group(1)
+                    )
+
+                # -------------------------------------------------
+                # Events
+                # -------------------------------------------------
+
+                events = tournament.get(
+                    "events",
+                    []
+                )
+
+                if not isinstance(
+                    events,
+                    list
+                ):
+                    continue
+
+                for event in events:
+
+                    if not isinstance(
+                        event,
+                        dict
+                    ):
+                        continue
+
+                    # ---------------------------------------------
+                    # Match ID
+                    # ---------------------------------------------
+
+                    event_id = event.get(
+                        "eventId",
+                        ""
+                    )
+
+                    match_id_match = re.search(
+                        r'sr:match:(\d+)',
+                        str(event_id)
+                    )
+
+                    if not match_id_match:
+
+                        continue
+
+                    match_id = (
+                        match_id_match.group(1)
+                    )
+
+                    # ---------------------------------------------
+                    # Prefer the tournament ID attached directly
+                    # to the event.
+                    # ---------------------------------------------
+
+                    event_tournament = (
+                        event.get(
+                            "tournament"
+                        )
+                    )
+
+                    if isinstance(
+                        event_tournament,
+                        dict
+                    ):
+
+                        event_tournament_id = (
+                            event_tournament.get(
+                                "id",
+                                ""
                             )
-                        ] = {
-                            "match_id": match_id,
-                            "tournament_id": tournament_id
-                        }
+                        )
 
-        walk(obj)
+                        event_tournament_match = re.search(
+                            r'sr:tournament:(\d+)',
+                            str(event_tournament_id)
+                        )
 
-        result = list(
-            found.values()
-        )
+                        if event_tournament_match:
 
-        logger.info(
-            f"factsCenter: discovered "
-            f"{len(result)} match subscriptions"
-        )
+                            tournament_id = (
+                                event_tournament_match.group(1)
+                            )
 
-        return result
+                    if not tournament_id:
+
+                        continue
+
+                    key = (
+                        tournament_id,
+                        match_id
+                    )
+
+                    found[key] = {
+                        "match_id": match_id,
+                        "tournament_id": tournament_id
+                    }
+
+            result = list(
+                found.values()
+            )
+
+            logger.info(
+                f"factsCenter: discovered "
+                f"{len(result)} match subscriptions"
+            )
+
+            # Show a small sample for verification.
+            if result:
+
+                logger.debug(
+                    f"factsCenter subscription sample: "
+                    f"{result[:5]}"
+                )
+
+            return result
+
+        except Exception as e:
+
+            logger.error(
+                f"Failed to extract match subscriptions: "
+                f"{e}"
+            )
+
+            return []
 
     # =============================================================
     # GET CURRENT LIVE MATCHES
@@ -719,13 +756,15 @@ class SportyBetFeed:
     ):
 
         """
-        REST is used ONLY to discover which matches exist.
+        IMPORTANT:
 
-        It is NOT used as the live data feed.
+        This request is NOT the live feed.
 
-        curl_cffi is used here because the SportyBet
-        endpoint returns valid JSON through curl_cffi,
-        while Playwright's API request returned HTTP 202.
+        curl_cffi is used ONLY to obtain the match IDs
+        and tournament IDs required for Socket.IO
+        subscriptions.
+
+        All live updates continue to come from Socket.IO.
         """
 
         url = (
@@ -822,17 +861,14 @@ class SportyBetFeed:
     ):
 
         """
-        Send the same type of Socket.IO SUB message
-        observed from the SportyBet browser.
+        Socket.IO is the LIVE DATA SOURCE.
 
-        Example:
+        factsCenter only provides:
 
-        topic =
-        \\1^52^sr:tournament:402^sr:match:72151136^status
+            match_id
+            tournament_id
 
-        subType = SUB
-        pushType = GROUP
-        productCode = 7
+        Then we send the SUB through Socket.IO.
         """
 
         if not self.sio:
@@ -845,8 +881,6 @@ class SportyBetFeed:
             f"{tournament_id}:{match_id}"
         )
 
-        # Avoid subscribing to the same match twice
-        # during the same connection.
         if subscription_key in self.subscribed_matches:
 
             return
@@ -891,16 +925,6 @@ class SportyBetFeed:
 
         try:
 
-            # This creates:
-            #
-            # 42["data",{
-            #   "type":"sub",
-            #   "data":"{...}"
-            # }]
-            #
-            # which is the structure observed from
-            # the SportyBet browser.
-
             await self.sio.emit(
                 "data",
                 payload
@@ -926,12 +950,11 @@ class SportyBetFeed:
     ):
 
         """
-        Discover current live matches using factsCenter,
-        then subscribe to their STATUS streams through
-        Socket.IO.
+        1. Use curl_cffi factsCenter to discover IDs.
+        2. Send SUB messages through Socket.IO.
+        3. Receive live updates through Socket.IO.
 
-        This function is called after every successful
-        Socket.IO connection.
+        The factsCenter endpoint is NOT used for live updates.
         """
 
         if not self.sio:
@@ -955,11 +978,12 @@ class SportyBetFeed:
                     "Socket.IO subscriptions..."
                 )
 
-                # New Socket.IO connection means we need
-                # fresh subscriptions.
                 self.subscribed_matches.clear()
 
-                # Get current matches
+                # -------------------------------------------------
+                # ONLY ID DISCOVERY
+                # -------------------------------------------------
+
                 response = (
                     await self._get_live_matches_for_subscription()
                 )
@@ -972,7 +996,10 @@ class SportyBetFeed:
 
                     return
 
-                # Extract sr:match + tournament
+                # -------------------------------------------------
+                # Extract IDs from factsCenter
+                # -------------------------------------------------
+
                 matches = (
                     self._extract_subscription_matches(
                         response
@@ -993,7 +1020,10 @@ class SportyBetFeed:
                     f"live match subscription(s)."
                 )
 
-                # Send subscriptions
+                # -------------------------------------------------
+                # SOCKET.IO SUBSCRIPTIONS
+                # -------------------------------------------------
+
                 for item in matches:
 
                     if not self.running:
@@ -1011,8 +1041,6 @@ class SportyBetFeed:
                         ]
                     )
 
-                    # Small delay to reproduce browser-like
-                    # subscription pacing.
                     await asyncio.sleep(
                         0.05
                     )
@@ -1037,12 +1065,6 @@ class SportyBetFeed:
         self,
         data
     ):
-
-        """
-        Process incoming Socket.IO data.
-
-        Your original event parsing is kept here.
-        """
 
         try:
 
@@ -1272,7 +1294,6 @@ class SportyBetFeed:
                     engineio_logger=False
                 )
 
-                # New connection = new subscriptions
                 self.subscribed_matches.clear()
 
                 # =================================================
@@ -1284,8 +1305,6 @@ class SportyBetFeed:
 
                     self.connected = True
 
-                    # Reset subscriptions because this is
-                    # a new Socket.IO connection.
                     self.subscribed_matches.clear()
 
                     logger.success(
@@ -1310,17 +1329,7 @@ class SportyBetFeed:
                             )
 
                     # =================================================
-                    # THIS IS THE IMPORTANT PART
-                    #
-                    # Browser-style flow:
-                    #
-                    # CONNECT
-                    #   ↓
-                    # factsCenter
-                    #   ↓
-                    # get match IDs
-                    #   ↓
-                    # send SUB through Socket.IO
+                    # ID DISCOVERY → SOCKET.IO SUB
                     # =================================================
 
                     try:
@@ -1366,8 +1375,6 @@ class SportyBetFeed:
                             f"event={event}"
                         )
 
-                        # Some Socket.IO responses can arrive
-                        # wrapped in a data string.
                         if (
                             isinstance(
                                 raw,
@@ -1388,8 +1395,6 @@ class SportyBetFeed:
                                     raw["data"]
                                 )
 
-                                # Handle normal SportyBet
-                                # topic/body message.
                                 if isinstance(
                                     inner,
                                     dict
@@ -1476,10 +1481,6 @@ class SportyBetFeed:
 
                 self.subscribed_matches.clear()
 
-                # =================================================
-                # CLOSE OLD SOCKET CLEANLY
-                # =================================================
-
                 if (
                     self.sio
                     and
@@ -1494,21 +1495,6 @@ class SportyBetFeed:
                         pass
 
                 self.sio = None
-
-                # =================================================
-                # IMPORTANT:
-                #
-                # When the loop starts again, it will:
-                #
-                # 1. Check browser
-                # 2. Discover Socket.IO URL AGAIN
-                # 3. Connect to the NEW URL
-                # 4. Call factsCenter
-                # 5. Subscribe again
-                #
-                # So a changed SportyBet Socket.IO host
-                # is automatically handled.
-                # =================================================
 
         logger.info(
             "SportyBet Socket.IO feed stopped."
