@@ -19,12 +19,25 @@ class TelegramAlerter:
         self.matches_flagged_slow = 0
         self.slow_submissions = 0
 
-        self._loop = None
-        self._log_queue = asyncio.Queue() if asyncio.get_event_loop().is_running() else None
+        # NEW: simple rate limiter — Telegram allows ~1 msg/sec sustained;
+        # this prevents the 429 "Too Many Requests" flood you hit earlier
+        self._send_lock = asyncio.Lock()
+        self._last_send_time = 0.0
+        self._min_interval = 1.2  # seconds between messages
+
         self._setup_log_mirror()
 
     def _setup_log_mirror(self):
-        """Mirror every loguru log message (INFO+) straight to Telegram."""
+        """
+        Mirror important loguru log messages to Telegram.
+
+        CHANGED: only WARNING and above get mirrored automatically now.
+        INFO/DEBUG/SUCCESS stay terminal-only — those fire hundreds of
+        times per subscription batch and were flooding Telegram with
+        429 rate-limit errors. Curated notify_* calls below still cover
+        the important events (bets, cashouts, goals) at INFO-equivalent
+        importance regardless of this filter.
+        """
 
         def sink(message):
             record = message.record
@@ -32,10 +45,10 @@ class TelegramAlerter:
             text = record["message"]
             module = record["name"]
 
+            if level not in ("WARNING", "ERROR", "CRITICAL"):
+                return
+
             emoji = {
-                "DEBUG": "🔧",
-                "INFO": "ℹ️",
-                "SUCCESS": "✅",
                 "WARNING": "⚠️",
                 "ERROR": "❌",
                 "CRITICAL": "🔥",
@@ -50,23 +63,34 @@ class TelegramAlerter:
             except RuntimeError:
                 pass
 
-        # Only mirror INFO and above — DEBUG stays terminal-only to avoid spam
-        logger.add(sink, level="INFO", format="{message}")
+        logger.add(sink, level="WARNING", format="{message}")
 
     async def send(self, message: str, parse_mode: str = "HTML"):
+        # NEW: rate-limit outgoing messages so we never trigger Telegram's 429
+        async with self._send_lock:
+            now = asyncio.get_event_loop().time()
+            wait = self._min_interval - (now - self._last_send_time)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_send_time = asyncio.get_event_loop().time()
+
         try:
             async with aiohttp.ClientSession() as session:
                 url = f"{self.base_url}/sendMessage"
                 payload = {
                     "chat_id": self.chat_id,
-                    "text": message,
+                    "text": message[:4000],  # Telegram's hard message length limit
                     "parse_mode": parse_mode,
                     "disable_web_page_preview": True,
                 }
                 async with session.post(url, json=payload) as resp:
-                    if resp.status != 200:
+                    if resp.status == 429:
+                        body = await resp.json()
+                        retry_after = body.get("parameters", {}).get("retry_after", 5)
+                        print(f"Telegram rate limited, backing off {retry_after}s")
+                        await asyncio.sleep(retry_after)
+                    elif resp.status != 200:
                         body = await resp.text()
-                        # Use print here, not logger, to avoid infinite loop
                         print(f"Telegram error: {body}")
         except Exception as e:
             print(f"Telegram send error: {e}")
@@ -86,7 +110,7 @@ class TelegramAlerter:
             f"Mode: watching for live goals -> betting Next Goal market\n"
             f"Started: {self.session_start.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"All terminal activity is now mirrored here."
+            f"Warnings and errors are mirrored here automatically."
         )
         await self.send(msg)
 
