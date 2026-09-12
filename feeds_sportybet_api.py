@@ -11,13 +11,7 @@ class SportyBetFeed:
     """
     SportyBet live-match REST feed.
 
-    This feed is ONLY responsible for discovering live SportyBet matches.
-
-    It does not:
-    - place bets
-    - open browser pages
-    - perform goal detection
-    - depend on SportyBet browser login
+    Responsible only for discovering live SportyBet matches.
     """
 
     FACTS_CENTER_URL = (
@@ -42,8 +36,6 @@ class SportyBetFeed:
         self.last_success_at = None
         self.last_error_at = None
 
-        # Set after the first successful HTTP response, even if the response
-        # contains zero live matches.
         self.ready_event = asyncio.Event()
 
     # =========================================================================
@@ -68,18 +60,12 @@ class SportyBetFeed:
     def _extract_id(event_id):
         text = str(event_id or "")
 
-        match = re.search(
-            r"sr:match:(\d+)",
-            text
-        )
+        match = re.search(r"sr:match:(\d+)", text)
 
         if match:
             return match.group(1)
 
-        match = re.search(
-            r"(\d+)",
-            text
-        )
+        match = re.search(r"(\d+)", text)
 
         if match:
             return match.group(1)
@@ -92,16 +78,6 @@ class SportyBetFeed:
 
     @staticmethod
     def _parse_score(value):
-        """
-        SportyBet normally provides football score as:
-
-            0:0
-            1:0
-            2:1
-
-        We also tolerate '-' and whitespace.
-        """
-
         if value is None:
             return 0, 0
 
@@ -110,7 +86,6 @@ class SportyBetFeed:
         if not text:
             return 0, 0
 
-        # Most common SportyBet format.
         match = re.match(
             r"^\s*(\d+)\s*[:\-]\s*(\d+)\s*$",
             text
@@ -154,10 +129,7 @@ class SportyBetFeed:
                 tournament.get("name", "")
             ).strip()
 
-            events = tournament.get(
-                "events",
-                []
-            )
+            events = tournament.get("events", [])
 
             if not isinstance(events, list):
                 continue
@@ -173,9 +145,7 @@ class SportyBetFeed:
                     or ""
                 )
 
-                match_id = self._extract_id(
-                    event_id_raw
-                )
+                match_id = self._extract_id(event_id_raw)
 
                 if not match_id:
                     continue
@@ -194,7 +164,7 @@ class SportyBetFeed:
                     continue
 
                 # -------------------------------------------------------------
-                # Score
+                # SCORE
                 # -------------------------------------------------------------
 
                 score_value = (
@@ -203,51 +173,44 @@ class SportyBetFeed:
                     or ""
                 )
 
-                home_score, away_score = (
-                    self._parse_score(score_value)
+                home_score, away_score = self._parse_score(
+                    score_value
                 )
 
                 # -------------------------------------------------------------
-                # Played seconds
+                # PLAYED SECONDS
                 # -------------------------------------------------------------
 
                 played_seconds = 0.0
 
-                played_raw = event.get(
-                    "playedSeconds"
-                )
+                played_raw = event.get("playedSeconds")
 
                 if played_raw is not None:
 
                     try:
-                        if isinstance(
-                            played_raw,
-                            str
-                        ) and ":" in played_raw:
+
+                        if (
+                            isinstance(played_raw, str)
+                            and ":" in played_raw
+                        ):
 
                             pieces = played_raw.split(":")
 
                             if len(pieces) == 2:
-                                minutes = float(
-                                    pieces[0]
-                                )
-                                seconds = float(
-                                    pieces[1]
-                                )
+
+                                minutes = float(pieces[0])
+                                seconds = float(pieces[1])
 
                                 played_seconds = (
                                     minutes * 60
                                     + seconds
                                 )
+
                             else:
-                                played_seconds = float(
-                                    played_raw
-                                )
+                                played_seconds = float(played_raw)
 
                         else:
-                            played_seconds = float(
-                                played_raw
-                            )
+                            played_seconds = float(played_raw)
 
                     except (
                         TypeError,
@@ -256,7 +219,7 @@ class SportyBetFeed:
                         played_seconds = 0.0
 
                 # -------------------------------------------------------------
-                # Status
+                # STATUS
                 # -------------------------------------------------------------
 
                 match_status = (
@@ -266,12 +229,10 @@ class SportyBetFeed:
                     or ""
                 )
 
-                match_status = str(
-                    match_status
-                ).strip()
+                match_status = str(match_status).strip()
 
                 # -------------------------------------------------------------
-                # Keep complete useful structure.
+                # MATCH
                 # -------------------------------------------------------------
 
                 match = {
@@ -383,12 +344,35 @@ class SportyBetFeed:
 
                 new_matches = await self._fetch_once()
 
-                # A successful HTTP/JSON response is considered readiness,
-                # even if there are currently no matches.
+                # -------------------------------------------------------------
+                # READY
+                # -------------------------------------------------------------
+
                 if self.last_success_at is not None:
 
                     if not self.ready_event.is_set():
                         self.ready_event.set()
+
+                # -------------------------------------------------------------
+                # IMPORTANT FIX
+                #
+                # NEVER do:
+                #
+                #     self.matches = new_matches
+                #
+                # because MatchLinker keeps a reference to self.matches.
+                #
+                # Instead, mutate the existing dictionary in place.
+                # -------------------------------------------------------------
+
+                if self.last_success_at is not None:
+
+                    self.matches.clear()
+                    self.matches.update(new_matches)
+
+                # -------------------------------------------------------------
+                # EMPTY RESPONSE
+                # -------------------------------------------------------------
 
                 if not new_matches:
 
@@ -412,29 +396,9 @@ class SportyBetFeed:
                             except Exception:
                                 pass
 
-                    # IMPORTANT:
-                    #
-                    # If the API successfully returns an empty list, replace
-                    # the old dictionary with {}. This removes stale matches.
-                    #
-                    # If the request itself failed, _fetch_once also returns
-                    # {}, which means we could temporarily clear matches.
-                    # To avoid destroying a valid snapshot during transient
-                    # HTTP failures, only replace here when we know the
-                    # response was successful.
-                    #
-                    if self.last_success_at is not None:
-                        self.matches = {}
-
                 else:
 
                     consecutive_failures = 0
-
-                    old_count = len(
-                        self.matches
-                    )
-
-                    self.matches = new_matches
 
                     if first_success:
 
@@ -456,37 +420,34 @@ class SportyBetFeed:
                             except Exception:
                                 pass
 
-                    elif old_count == 0:
+                    elif len(self.matches) == 0:
 
                         logger.info(
                             f"SportyBet: "
                             f"{len(new_matches)} live matches available."
                         )
 
-                    # ---------------------------------------------------------
-                    # IMPORTANT:
-                    #
-                    # Notify MatchLinker immediately after replacing the
-                    # snapshot. Do NOT wait for the next 2-second reconciliation
-                    # cycle.
-                    # ---------------------------------------------------------
+                # -------------------------------------------------------------
+                # CALLBACK
+                # -------------------------------------------------------------
 
-                    if self.callback:
+                if self.callback:
 
-                        try:
-                            await self.callback(
-                                {
-                                    "type": "snapshot",
-                                    "count": len(new_matches),
-                                    "matches": new_matches,
-                                }
-                            )
+                    try:
 
-                        except Exception as e:
+                        await self.callback(
+                            {
+                                "type": "snapshot",
+                                "count": len(self.matches),
+                                "matches": self.matches,
+                            }
+                        )
 
-                            logger.debug(
-                                f"SportyBet callback error: {e}"
-                            )
+                    except Exception as e:
+
+                        logger.debug(
+                            f"SportyBet callback error: {e}"
+                        )
 
                 await asyncio.sleep(
                     self.poll_interval
