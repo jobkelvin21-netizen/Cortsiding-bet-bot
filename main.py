@@ -20,10 +20,14 @@ class ArbitrageBot:
         self.alerter = TelegramAlerter()
         self.auth = SportyBetAuth()
 
-        self.sportybet = SportyBetFeed()
+        self.sportybet = SportyBetFeed(poll_interval=2.0)
+        self.sportybet.set_alerter(self.alerter)
+
         self.polymarket = PolymarketFeed(self._noop_callback)
 
-        self.linker = MatchLinker(self.sportybet.matches)
+        # NEW: linker now needs the polymarket feed itself (to scan all its
+        # live matches continuously), not just a callback hook
+        self.linker = MatchLinker(self.polymarket, self.sportybet.matches)
         self.linker.set_goal_callback(self.on_goal)
 
         self.executor = None
@@ -53,11 +57,11 @@ class ArbitrageBot:
         await self.setup()
 
         logger.info("=" * 60)
-        logger.info("BOT STARTING - POLYMARKET + SPORTYBET")
+        logger.info("BOT STARTING - POLYMARKET (goals) + SPORTYBET REST (matching) + SPORTYBET BROWSER (betting)")
         logger.info("=" * 60)
 
         print("\n" + "=" * 60)
-        print("SPORTYBET LOGIN")
+        print("SPORTYBET LOGIN (for placing bets)")
         print("=" * 60)
         phone = input("Phone Number: ")
         password = input("Password: ")
@@ -73,7 +77,7 @@ class ArbitrageBot:
 
         page = await browser.new_page(viewport={'width': 412, 'height': 915})
 
-        logger.info("Opening SportyBet login...")
+        logger.info("Opening SportyBet login (for betting)...")
         await page.goto("https://www.sportybet.com/ng/", wait_until="domcontentloaded")
         await asyncio.sleep(2)
 
@@ -95,11 +99,7 @@ class ArbitrageBot:
         await page.click('button[name="logIn"]')
         await asyncio.sleep(5)
 
-        logger.success("SportyBet login complete!")
-
-        self.sportybet.set_page(page)
-        self.sportybet.set_alerter(self.alerter)
-        self.sportybet.set_credentials(phone, password)
+        logger.success("SportyBet login complete (browser ready for betting)!")
 
         self.auth.browser = browser
         self.auth.page = page
@@ -121,7 +121,10 @@ class ArbitrageBot:
         await self.polymarket.start()
         asyncio.create_task(self.sportybet.start(self.on_sportybet_update))
 
-        logger.success("Bot running! Watching Polymarket for goals, betting on SportyBet.")
+        # NEW: start the continuous background match-linking loop
+        await self.linker.start()
+
+        logger.success("Bot running! Continuously linking matches, watching for goals.")
 
         while self.running:
             await asyncio.sleep(1)
