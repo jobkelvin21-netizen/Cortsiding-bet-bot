@@ -1,4 +1,5 @@
 import aiohttp
+import asyncio
 from datetime import datetime
 from loguru import logger
 from config import Config
@@ -15,8 +16,42 @@ class TelegramAlerter:
         self.total_staked = 0.0
         self.total_cashed_out = 0
         self.total_cashout_profit = 0.0
-        self.matches_matched = 0
+        self.matches_flagged_slow = 0
         self.slow_submissions = 0
+
+        self._loop = None
+        self._log_queue = asyncio.Queue() if asyncio.get_event_loop().is_running() else None
+        self._setup_log_mirror()
+
+    def _setup_log_mirror(self):
+        """Mirror every loguru log message (INFO+) straight to Telegram."""
+
+        def sink(message):
+            record = message.record
+            level = record["level"].name
+            text = record["message"]
+            module = record["name"]
+
+            emoji = {
+                "DEBUG": "🔧",
+                "INFO": "ℹ️",
+                "SUCCESS": "✅",
+                "WARNING": "⚠️",
+                "ERROR": "❌",
+                "CRITICAL": "🔥",
+            }.get(level, "📋")
+
+            formatted = f"{emoji} <code>[{module}]</code> {text}"
+
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(self.send(formatted))
+            except RuntimeError:
+                pass
+
+        # Only mirror INFO and above — DEBUG stays terminal-only to avoid spam
+        logger.add(sink, level="INFO", format="{message}")
 
     async def send(self, message: str, parse_mode: str = "HTML"):
         try:
@@ -31,9 +66,10 @@ class TelegramAlerter:
                 async with session.post(url, json=payload) as resp:
                     if resp.status != 200:
                         body = await resp.text()
-                        logger.error(f"Telegram error: {body}")
+                        # Use print here, not logger, to avoid infinite loop
+                        print(f"Telegram error: {body}")
         except Exception as e:
-            logger.error(f"Telegram send error: {e}")
+            print(f"Telegram send error: {e}")
 
     def _uptime(self) -> str:
         delta = datetime.now() - self.session_start
@@ -46,34 +82,23 @@ class TelegramAlerter:
             f"💰 <b>BOT STARTED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Starting balance: <b>₦{balance:,.2f}</b>\n"
-            f"Fast feed: Polymarket (soccer only)\n"
-            f"You'll get a notification every time a match is confirmed\n"
-            f"live on BOTH Polymarket and SportyBet.\n"
-            f"First matched goal triggers a ₦{int(Config.VALIDATION_STAKE)} validation bet.\n"
+            f"Data sources: Polymarket (live goals) + SportyBet (betting)\n"
+            f"Mode: watching for live goals -> betting Next Goal market\n"
             f"Started: {self.session_start.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"All terminal activity is now mirrored here."
         )
         await self.send(msg)
 
-    async def notify_match_matched(self, home_team: str, away_team: str):
-        self.matches_matched += 1
+    async def notify_slow_match_found(self, home_team: str, away_team: str, gap_seconds: float):
+        self.matches_flagged_slow += 1
         msg = (
-            f"🔗 <b>MATCH MATCHED</b>\n"
+            f"🐢 <b>MATCH OPENED FOR BETTING</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚽ {home_team} vs {away_team}\n"
-            f"Now live on both Polymarket and SportyBet — monitoring for goals.\n"
+            f"📊 Now monitoring for next goal...\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Total matched this session: {self.matches_matched}"
-        )
-        await self.send(msg)
-
-    async def notify_market_skipped(self, home_team: str, away_team: str):
-        msg = (
-            f"🚫 <b>BET SKIPPED — MARKET MOVED ON</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚽ {home_team} vs {away_team}\n"
-            f"SportyBet already reflects this goal — betting now would\n"
-            f"hit the wrong (next) goal market. No bet placed."
+            f"Total opened this session: {self.matches_flagged_slow}"
         )
         await self.send(msg)
 
@@ -211,7 +236,7 @@ class TelegramAlerter:
                 f"⚽ {match_name}\n"
                 f"🎯 {team} @ {odds}\n"
                 f"💵 ₦{stake:,.2f} bet placed and confirmed\n\n"
-                f"✅ Match pairing → Goal detection → Market select →\n"
+                f"✅ Detection → Navigation → Market select → Team select →\n"
                 f"Stake entry → Submission → Confirmation — all working.\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎉 Bot will now place real, full-stake bets automatically."
@@ -234,7 +259,7 @@ class TelegramAlerter:
             f"📊 <b>SESSION REPORT</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⏱ Uptime: {self._uptime()}\n"
-            f"🔗 Matches matched: {self.matches_matched}\n"
+            f"⚽ Matches opened: {self.matches_flagged_slow}\n"
             f"🎯 Total bets placed: {self.total_bets}\n"
             f"💵 Total staked: ₦{self.total_staked:,.2f}\n"
             f"🐌 Slow submissions: {self.slow_submissions}\n"
