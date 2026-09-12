@@ -721,6 +721,10 @@ class SportyBetFeed:
         REST is used ONLY to discover which matches exist.
 
         It is NOT used as the live data feed.
+
+        The request is made from the actual SportyBet
+        browser page so the current browser session,
+        cookies and browser context are used.
         """
 
         if not self.page:
@@ -745,21 +749,98 @@ class SportyBetFeed:
                 "to discover live matches..."
             )
 
-            response = await self.page.request.get(
-                url,
-                timeout=20000
+            result = await self.page.evaluate(
+                """
+                async (url) => {
+
+                    try {
+
+                        const response = await fetch(
+                            url,
+                            {
+                                method: "GET",
+                                credentials: "include",
+                                headers: {
+                                    "Accept":
+                                    "application/json, text/plain, */*"
+                                }
+                            }
+                        );
+
+                        const text =
+                            await response.text();
+
+                        return {
+                            status: response.status,
+                            contentType:
+                                response.headers.get(
+                                    "content-type"
+                                ) || "",
+                            text: text
+                        };
+
+                    } catch (e) {
+
+                        return {
+                            status: 0,
+                            contentType: "",
+                            text: "",
+                            error: String(e)
+                        };
+                    }
+                }
+                """,
+                url
+            )
+
+            status = result.get(
+                "status",
+                0
+            )
+
+            content_type = result.get(
+                "contentType",
+                ""
+            )
+
+            text = result.get(
+                "text",
+                ""
             )
 
             logger.info(
                 f"factsCenter HTTP status: "
-                f"{response.status}"
+                f"{status}"
             )
 
-            if not response.ok:
+            logger.info(
+                f"factsCenter content type: "
+                f"{content_type}"
+            )
+
+            logger.info(
+                f"factsCenter response size: "
+                f"{len(text)} bytes"
+            )
+
+            if status < 200 or status >= 300:
 
                 logger.warning(
                     f"factsCenter returned HTTP "
-                    f"{response.status}"
+                    f"{status}"
+                )
+
+                logger.debug(
+                    f"factsCenter response: "
+                    f"{text[:3000]}"
+                )
+
+                return []
+
+            if not text.strip():
+
+                logger.warning(
+                    "factsCenter returned an empty response."
                 )
 
                 return []
@@ -767,11 +848,9 @@ class SportyBetFeed:
             # Try JSON
             try:
 
-                result = await response.json()
+                result = json.loads(text)
 
             except Exception:
-
-                text = await response.text()
 
                 logger.warning(
                     "factsCenter did not return normal JSON."
@@ -783,6 +862,10 @@ class SportyBetFeed:
                 )
 
                 return []
+
+            logger.success(
+                "factsCenter returned valid JSON."
+            )
 
             return result
 
