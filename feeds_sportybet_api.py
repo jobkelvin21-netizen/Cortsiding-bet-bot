@@ -180,7 +180,15 @@ class SportyBetFeed:
     def _extract_id(self, event_id):
 
         match = re.search(
-            r'(\d+)$',
+            r'sr:match:(\d+)',
+            str(event_id or '')
+        )
+
+        if match:
+            return match.group(1)
+
+        match = re.search(
+            r'(\d+)',
             str(event_id or '')
         )
 
@@ -500,22 +508,54 @@ class SportyBetFeed:
         body_str
     ):
 
+        if not body_str:
+            return None
+
         try:
 
-            padded = (
-                body_str
-                + "=" * (-len(body_str) % 4)
-            )
+            if isinstance(
+                body_str,
+                bytes
+            ):
 
-            decoded_bytes = base64.b64decode(
-                padded
-            )
+                raw = body_str
 
-            text = decoded_bytes.decode(
+            else:
+
+                value = str(
+                    body_str
+                ).strip()
+
+                value = re.sub(
+                    r'\s+',
+                    '',
+                    value
+                )
+
+                value += '=' * (
+                    -len(value) % 4
+                )
+
+                try:
+
+                    raw = base64.b64decode(
+                        value,
+                        validate=False
+                    )
+
+                except Exception:
+
+                    raw = base64.urlsafe_b64decode(
+                        value
+                    )
+
+            text = raw.decode(
                 "utf-8"
-            )
+            ).strip()
 
-            return json.loads(text)
+            return json.loads(
+                text
+            )
 
         except Exception as e:
 
@@ -533,44 +573,15 @@ class SportyBetFeed:
         self,
         obj
     ):
-        """
-        Extract match/tournament IDs from the actual
-        SportyBet factsCenter structure.
-
-        Structure:
-
-            {
-                "bizCode": 10000,
-                "message": "OKO",
-                "data": [
-                    {
-                        "id": "sr:tournament:8",
-                        "name": "LaLiga",
-                        "events": [
-                            {
-                                "eventId": "sr:match:72478555",
-                                ...
-                                "tournament": {
-                                    "id": "sr:tournament:8",
-                                    "name": "LaLiga"
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
-
-        IMPORTANT:
-        This endpoint is ONLY used to discover IDs.
-
-        Live match data still comes from Socket.IO.
-        """
 
         found = {}
 
         try:
 
-            if not isinstance(obj, dict):
+            if not isinstance(
+                obj,
+                dict
+            ):
 
                 logger.warning(
                     "factsCenter response is not a dictionary."
@@ -602,10 +613,6 @@ class SportyBetFeed:
                 ):
                     continue
 
-                # -------------------------------------------------
-                # Tournament ID
-                # -------------------------------------------------
-
                 tournament_id = ""
 
                 tournament_value = (
@@ -626,10 +633,6 @@ class SportyBetFeed:
                         tournament_match.group(1)
                     )
 
-                # -------------------------------------------------
-                # Events
-                # -------------------------------------------------
-
                 events = tournament.get(
                     "events",
                     []
@@ -649,10 +652,6 @@ class SportyBetFeed:
                     ):
                         continue
 
-                    # ---------------------------------------------
-                    # Match ID
-                    # ---------------------------------------------
-
                     event_id = event.get(
                         "eventId",
                         ""
@@ -664,17 +663,11 @@ class SportyBetFeed:
                     )
 
                     if not match_id_match:
-
                         continue
 
                     match_id = (
                         match_id_match.group(1)
                     )
-
-                    # ---------------------------------------------
-                    # Prefer the tournament ID attached directly
-                    # to the event.
-                    # ---------------------------------------------
 
                     event_tournament = (
                         event.get(
@@ -706,7 +699,6 @@ class SportyBetFeed:
                             )
 
                     if not tournament_id:
-
                         continue
 
                     key = (
@@ -728,7 +720,6 @@ class SportyBetFeed:
                 f"{len(result)} match subscriptions"
             )
 
-            # Show a small sample for verification.
             if result:
 
                 logger.debug(
@@ -754,18 +745,6 @@ class SportyBetFeed:
     async def _get_live_matches_for_subscription(
         self
     ):
-
-        """
-        IMPORTANT:
-
-        This request is NOT the live feed.
-
-        curl_cffi is used ONLY to obtain the match IDs
-        and tournament IDs required for Socket.IO
-        subscriptions.
-
-        All live updates continue to come from Socket.IO.
-        """
 
         url = (
             "https://www.sportybet.com/api/ng/"
@@ -860,56 +839,51 @@ class SportyBetFeed:
         tournament_id: str
     ):
 
-        """
-        Socket.IO is the LIVE DATA SOURCE.
-
-        factsCenter only provides:
-
-            match_id
-            tournament_id
-
-        Then we send the SUB through Socket.IO.
-        """
-
         if not self.sio:
-            return
+            return False
 
         if not self.sio.connected:
-            return
+            return False
 
         subscription_key = (
             f"{tournament_id}:{match_id}"
         )
 
         if subscription_key in self.subscribed_matches:
-
-            return
+            return True
 
         request_id = self.request_id
 
         self.request_id += 1
 
+        # =========================================================
+        # IMPORTANT:
+        #
+        # This is the exact topic structure from the browser
+        # traffic you captured.
+        # =========================================================
+
         topic = (
-            "\\1^52^"
-            f"sr:tournament:{tournament_id}"
-            "^"
-            f"sr:match:{match_id}"
-            "^status"
+            "\\1\\1\\1\\\\52"
+            f"^sr:tournament:{tournament_id}"
+            f"^sr:match:{match_id}"
+            "*status"
         )
 
         inner = {
             "topic": topic,
             "subType": "SUB",
             "pushType": "GROUP",
-            "requestId": request_id,
-            "productCode": 7,
+            "requestId": str(request_id),
+            "productCode": 2,
         }
 
         payload = {
             "type": "sub",
             "data": json.dumps(
                 inner,
-                separators=(",", ":")
+                separators=(",", ":"),
+                ensure_ascii=False
             )
         }
 
@@ -919,8 +893,13 @@ class SportyBetFeed:
             f"requestId={request_id}"
         )
 
+        logger.info(
+            f"[SUB TOPIC] {repr(topic)}"
+        )
+
         logger.debug(
-            f"[SUB] payload={payload}"
+            f"[SUB PAYLOAD] "
+            f"{json.dumps(payload, ensure_ascii=False)}"
         )
 
         try:
@@ -934,12 +913,21 @@ class SportyBetFeed:
                 subscription_key
             )
 
+            logger.success(
+                f"[SUB SENT] "
+                f"{tournament_id}:{match_id}"
+            )
+
+            return True
+
         except Exception as e:
 
             logger.error(
-                f"Subscription failed for "
-                f"{match_id}: {e}"
+                f"[SUB FAILED] "
+                f"{tournament_id}:{match_id}: {e}"
             )
+
+            return False
 
     # =============================================================
     # SUBSCRIBE TO ALL CURRENT LIVE MATCHES
@@ -948,14 +936,6 @@ class SportyBetFeed:
     async def _subscribe_all_live_matches(
         self
     ):
-
-        """
-        1. Use curl_cffi factsCenter to discover IDs.
-        2. Send SUB messages through Socket.IO.
-        3. Receive live updates through Socket.IO.
-
-        The factsCenter endpoint is NOT used for live updates.
-        """
 
         if not self.sio:
             return
@@ -978,12 +958,6 @@ class SportyBetFeed:
                     "Socket.IO subscriptions..."
                 )
 
-                self.subscribed_matches.clear()
-
-                # -------------------------------------------------
-                # ONLY ID DISCOVERY
-                # -------------------------------------------------
-
                 response = (
                     await self._get_live_matches_for_subscription()
                 )
@@ -995,10 +969,6 @@ class SportyBetFeed:
                     )
 
                     return
-
-                # -------------------------------------------------
-                # Extract IDs from factsCenter
-                # -------------------------------------------------
 
                 matches = (
                     self._extract_subscription_matches(
@@ -1020,9 +990,7 @@ class SportyBetFeed:
                     f"live match subscription(s)."
                 )
 
-                # -------------------------------------------------
-                # SOCKET.IO SUBSCRIPTIONS
-                # -------------------------------------------------
+                sent = 0
 
                 for item in matches:
 
@@ -1032,14 +1000,13 @@ class SportyBetFeed:
                     if not self.sio.connected:
                         break
 
-                    await self._subscribe_match(
-                        match_id=item[
-                            "match_id"
-                        ],
-                        tournament_id=item[
-                            "tournament_id"
-                        ]
+                    result = await self._subscribe_match(
+                        match_id=item["match_id"],
+                        tournament_id=item["tournament_id"]
                     )
+
+                    if result:
+                        sent += 1
 
                     await asyncio.sleep(
                         0.05
@@ -1047,12 +1014,12 @@ class SportyBetFeed:
 
                 logger.success(
                     f"Socket.IO subscriptions sent: "
-                    f"{len(self.subscribed_matches)}"
+                    f"{sent}"
                 )
 
             except Exception as e:
 
-                logger.error(
+                logger.exception(
                     f"Error subscribing to live "
                     f"matches: {e}"
                 )
@@ -1068,15 +1035,77 @@ class SportyBetFeed:
 
         try:
 
+            logger.debug(
+                f"[SOCKET RAW] "
+                f"type={type(data).__name__}"
+            )
+
+            # -----------------------------------------------------
+            # Actual packet observed:
+            #
+            # {
+            #   "type": "ret",
+            #   "data": "{\"body\":\"...\",\"topic\":\"...\"}"
+            # }
+            # -----------------------------------------------------
+
+            if isinstance(
+                data,
+                dict
+            ):
+
+                packet_type = data.get(
+                    "type"
+                )
+
+                inner = data.get(
+                    "data"
+                )
+
+                logger.debug(
+                    f"[SOCKET PACKET TYPE] "
+                    f"{packet_type}"
+                )
+
+                if isinstance(
+                    inner,
+                    str
+                ):
+
+                    try:
+
+                        inner = json.loads(
+                            inner
+                        )
+
+                    except json.JSONDecodeError:
+
+                        logger.debug(
+                            "[SOCKET] "
+                            "Nested data was not JSON."
+                        )
+
+                        return
+
+                if isinstance(
+                    inner,
+                    dict
+                ):
+
+                    data = inner
+
             if not isinstance(
                 data,
                 dict
             ):
+
                 return
 
-            topic = data.get(
-                "topic",
-                ""
+            topic = str(
+                data.get(
+                    "topic",
+                    ""
+                )
             )
 
             body_str = data.get(
@@ -1084,129 +1113,306 @@ class SportyBetFeed:
             )
 
             if not body_str:
+
+                logger.debug(
+                    f"[SOCKET] No body. "
+                    f"topic={topic}"
+                )
+
                 return
+
+            logger.info(
+                f"[SOCKET RET] topic={topic}"
+            )
+
+            # -----------------------------------------------------
+            # DECODE BODY
+            # -----------------------------------------------------
 
             decoded = self._decode_body(
                 body_str
             )
 
-            if not decoded:
-                return
+            if decoded is None:
 
-            # =====================================================
-            # LIVE MATCH STATUS
-            # =====================================================
+                if isinstance(
+                    body_str,
+                    str
+                ):
 
-            if (
-                isinstance(decoded, dict)
-                and
-                "fixtureHomeTeamName" in decoded
+                    try:
+
+                        decoded = json.loads(
+                            body_str
+                        )
+
+                    except Exception:
+
+                        logger.debug(
+                            f"[SOCKET] "
+                            f"Unable to decode body: "
+                            f"{body_str[:500]}"
+                        )
+
+                        return
+
+                else:
+
+                    return
+
+            # -----------------------------------------------------
+            # PRINT ACTUAL SOCKET DATA
+            # -----------------------------------------------------
+
+            logger.info(
+                "=" * 80
+            )
+
+            logger.info(
+                "[SOCKET LIVE DATA]"
+            )
+
+            logger.info(
+                f"TOPIC: {topic}"
+            )
+
+            try:
+
+                logger.info(
+                    json.dumps(
+                        decoded,
+                        ensure_ascii=False,
+                        indent=2
+                    )[:15000]
+                )
+
+            except Exception:
+
+                logger.info(
+                    repr(decoded)[:15000]
+                )
+
+            logger.info(
+                "=" * 80
+            )
+
+            if not isinstance(
+                decoded,
+                dict
             ):
 
-                event_id = (
-                    self._extract_id(topic)
-                )
+                return
 
-                home = decoded.get(
+            # -----------------------------------------------------
+            # DETECT MATCH DATA
+            # -----------------------------------------------------
+
+            is_match_payload = any(
+                key in decoded
+                for key in (
+                    "eventScore",
+                    "eventPlayedTime",
+                    "eventMatchStatus",
                     "fixtureHomeTeamName",
-                    ""
-                )
-
-                away = decoded.get(
                     "fixtureAwayTeamName",
-                    ""
+                    "eventMatchPeriod"
+                )
+            )
+
+            if not is_match_payload:
+
+                return
+
+            # -----------------------------------------------------
+            # MATCH ID
+            # -----------------------------------------------------
+
+            match_id_match = re.search(
+                r'sr:match:(\d+)',
+                topic
+            )
+
+            if match_id_match:
+
+                event_id = (
+                    match_id_match.group(1)
                 )
 
-                played = (
-                    self._parse_played_seconds(
+            else:
+
+                event_id = (
+                    str(
                         decoded.get(
-                            "eventPlayedTime",
-                            0
+                            "matchId",
+                            decoded.get(
+                                "eventId",
+                                ""
+                            )
                         )
                     )
                 )
 
-                status = decoded.get(
-                    "eventMatchStatus",
+                event_id = self._extract_id(
+                    event_id
+                )
+
+            # -----------------------------------------------------
+            # TEAMS
+            # -----------------------------------------------------
+
+            home = decoded.get(
+                "fixtureHomeTeamName",
+                decoded.get(
+                    "homeTeamName",
                     ""
                 )
+            )
 
-                home_score = 0
-                away_score = 0
+            away = decoded.get(
+                "fixtureAwayTeamName",
+                decoded.get(
+                    "awayTeamName",
+                    ""
+                )
+            )
 
-                score_str = decoded.get(
-                    "eventScore",
-                    "0:0"
+            # -----------------------------------------------------
+            # SCORE
+            # -----------------------------------------------------
+
+            score = decoded.get(
+                "eventScore",
+                "0:0"
+            )
+
+            home_score = 0
+            away_score = 0
+
+            if isinstance(
+                score,
+                str
+            ):
+
+                score_match = re.search(
+                    r'(\d+)\s*:\s*(\d+)',
+                    score
                 )
 
-                try:
+                if score_match:
 
-                    h, a = score_str.split(
-                        ":"
+                    home_score = int(
+                        score_match.group(1)
                     )
 
-                    home_score = int(h)
-                    away_score = int(a)
+                    away_score = int(
+                        score_match.group(2)
+                    )
 
-                except Exception:
-                    pass
+            elif isinstance(
+                score,
+                dict
+            ):
 
-                match = {
-                    "match_id": event_id,
-                    "sportradar_id": event_id,
-                    "home_team": home,
-                    "away_team": away,
-                    "home_score": home_score,
-                    "away_score": away_score,
-                    "period": status,
-                    "match_status": status,
-                    "played_seconds": played,
-                    "timestamp": datetime.now(),
-                }
+                home_score = int(
+                    score.get(
+                        "home",
+                        score.get(
+                            "homeScore",
+                            0
+                        )
+                    )
+                    or 0
+                )
+
+                away_score = int(
+                    score.get(
+                        "away",
+                        score.get(
+                            "awayScore",
+                            0
+                        )
+                    )
+                    or 0
+                )
+
+            # -----------------------------------------------------
+            # PLAYED TIME
+            # -----------------------------------------------------
+
+            played = (
+                self._parse_played_seconds(
+                    decoded.get(
+                        "eventPlayedTime",
+                        0
+                    )
+                )
+            )
+
+            # -----------------------------------------------------
+            # STATUS
+            # -----------------------------------------------------
+
+            status = decoded.get(
+                "eventMatchStatus",
+                decoded.get(
+                    "eventMatchPeriod",
+                    ""
+                )
+            )
+
+            match = {
+                "match_id": event_id,
+                "sportradar_id": event_id,
+                "home_team": home,
+                "away_team": away,
+                "home_score": home_score,
+                "away_score": away_score,
+                "period": status,
+                "match_status": status,
+                "played_seconds": played,
+                "timestamp": datetime.now(),
+                "topic": topic,
+                "raw": decoded,
+            }
+
+            if event_id:
 
                 self.matches[
                     event_id
                 ] = match
 
-                key = _match_key(
-                    home,
-                    away
-                )
+            key = _match_key(
+                home,
+                away
+            )
 
-                logger.info(
-                    f"[LIVE] "
-                    f"{home} vs {away} "
-                    f"-> key={key} "
-                    f"score={home_score}:{away_score} "
-                    f"played={played} "
-                    f"status={status}"
-                )
+            logger.success(
+                f"[LIVE MATCH] "
+                f"{home} vs {away} "
+                f"| key={key} "
+                f"| score={home_score}:{away_score} "
+                f"| played={played}s "
+                f"| status={status} "
+                f"| id={event_id}"
+            )
 
-                if self.callback:
+            if self.callback:
+
+                try:
 
                     await self.callback(
                         match
                     )
 
-            # =====================================================
-            # OTHER DATA
-            # =====================================================
+                except Exception as e:
 
-            elif isinstance(
-                decoded,
-                list
-            ):
-
-                logger.debug(
-                    f"[SportyBet WS] "
-                    f"Odds update on topic "
-                    f"{topic}: "
-                    f"{decoded[:3]}..."
-                )
+                    logger.error(
+                        f"Match callback failed: {e}"
+                    )
 
         except Exception as e:
 
-            logger.debug(
+            logger.exception(
                 f"Event handling error: {e}"
             )
 
@@ -1264,7 +1470,9 @@ class SportyBetFeed:
                         "SportyBet Socket.IO URL"
                     )
 
-                    logger.error(msg)
+                    logger.error(
+                        msg
+                    )
 
                     if self.alerter:
 
@@ -1284,12 +1492,83 @@ class SportyBetFeed:
                 )
 
                 # =================================================
+                # GET BROWSER USER AGENT
+                # =================================================
+
+                headers = {}
+
+                try:
+
+                    user_agent = await self.page.evaluate(
+                        "() => navigator.userAgent"
+                    )
+
+                    if user_agent:
+
+                        headers[
+                            "User-Agent"
+                        ] = user_agent
+
+                except Exception as e:
+
+                    logger.debug(
+                        f"Could not obtain browser "
+                        f"user-agent: {e}"
+                    )
+
+                headers[
+                    "Origin"
+                ] = "https://www.sportybet.com"
+
+                headers[
+                    "Referer"
+                ] = "https://www.sportybet.com/ng/"
+
+                # =================================================
+                # GET BROWSER COOKIES
+                # =================================================
+
+                try:
+
+                    cookies = await self.context.cookies()
+
+                    cookie_header = "; ".join(
+                        f"{cookie['name']}={cookie['value']}"
+                        for cookie in cookies
+                        if cookie.get("name")
+                    )
+
+                    if cookie_header:
+
+                        headers[
+                            "Cookie"
+                        ] = cookie_header
+
+                        logger.info(
+                            f"Using {len(cookies)} "
+                            f"browser cookies for "
+                            f"Socket.IO."
+                        )
+
+                    else:
+
+                        logger.warning(
+                            "No browser cookies found."
+                        )
+
+                except Exception as e:
+
+                    logger.debug(
+                        f"Could not read browser "
+                        f"cookies: {e}"
+                    )
+
+                # =================================================
                 # CREATE NEW SOCKET.IO CLIENT
                 # =================================================
 
                 self.sio = socketio.AsyncClient(
-                    reconnection=True,
-                    reconnection_attempts=0,
+                    reconnection=False,
                     logger=False,
                     engineio_logger=False
                 )
@@ -1305,11 +1584,20 @@ class SportyBetFeed:
 
                     self.connected = True
 
+                    self.request_id = 1
+
                     self.subscribed_matches.clear()
 
                     logger.success(
-                        "SportyBet Socket.IO "
-                        "connected successfully!"
+                        "========================================"
+                    )
+
+                    logger.success(
+                        "SPORTYBET SOCKET.IO CONNECTED"
+                    )
+
+                    logger.success(
+                        "========================================"
                     )
 
                     if self.alerter:
@@ -1328,9 +1616,10 @@ class SportyBetFeed:
                                 f"Alerter error: {e}"
                             )
 
-                    # =================================================
-                    # ID DISCOVERY → SOCKET.IO SUB
-                    # =================================================
+                    # Give Socket.IO a short moment before SUB.
+                    await asyncio.sleep(
+                        0.5
+                    )
 
                     try:
 
@@ -1338,7 +1627,7 @@ class SportyBetFeed:
 
                     except Exception as e:
 
-                        logger.error(
+                        logger.exception(
                             f"Initial subscription "
                             f"failed: {e}"
                         )
@@ -1355,83 +1644,73 @@ class SportyBetFeed:
                     self.subscribed_matches.clear()
 
                     logger.warning(
-                        "SportyBet Socket.IO disconnected"
+                        "SportyBet Socket.IO "
+                        "disconnected"
                     )
 
                 # =================================================
-                # CATCH ALL SOCKET.IO EVENTS
+                # CONNECT ERROR
                 # =================================================
 
-                @self.sio.on('*')
-                async def catch_all(
-                    event,
-                    raw
+                @self.sio.event
+                async def connect_error(
+                    data
                 ):
+
+                    self.connected = False
+
+                    logger.error(
+                        f"Socket.IO connect_error: "
+                        f"{data}"
+                    )
+
+                # =================================================
+                # ACTUAL DATA EVENT
+                # =================================================
+
+                @self.sio.on("data")
+                async def on_data(
+                    data
+                ):
+
+                    logger.info(
+                        f"[Socket.IO DATA] "
+                        f"type={type(data).__name__}"
+                    )
 
                     try:
 
-                        logger.debug(
-                            f"[Socket.IO] "
-                            f"event={event}"
+                        await self._handle_event(
+                            data
                         )
-
-                        if (
-                            isinstance(
-                                raw,
-                                dict
-                            )
-                            and
-                            "data" in raw
-                            and
-                            isinstance(
-                                raw["data"],
-                                str
-                            )
-                        ):
-
-                            try:
-
-                                inner = json.loads(
-                                    raw["data"]
-                                )
-
-                                if isinstance(
-                                    inner,
-                                    dict
-                                ):
-
-                                    await self._handle_event(
-                                        inner
-                                    )
-
-                            except json.JSONDecodeError:
-
-                                await self._handle_event(
-                                    raw
-                                )
-
-                        else:
-
-                            await self._handle_event(
-                                raw
-                            )
 
                     except Exception as e:
 
-                        logger.debug(
-                            f"catch_all parse error: "
-                            f"{e}"
+                        logger.exception(
+                            f"data event processing "
+                            f"failed: {e}"
                         )
 
                 # =================================================
                 # CONNECT
                 # =================================================
 
+                logger.info(
+                    "Connecting to SportyBet "
+                    "Socket.IO..."
+                )
+
                 await self.sio.connect(
                     url,
                     transports=[
-                        'websocket'
-                    ]
+                        "websocket"
+                    ],
+                    headers=headers,
+                    wait_timeout=20
+                )
+
+                logger.success(
+                    "Socket.IO connection established."
                 )
 
                 # =================================================
@@ -1454,7 +1733,7 @@ class SportyBetFeed:
 
                 self.connected = False
 
-                logger.error(
+                logger.exception(
                     f"SportyBet Socket.IO error: "
                     f"{e}"
                 )
@@ -1481,18 +1760,19 @@ class SportyBetFeed:
 
                 self.subscribed_matches.clear()
 
-                if (
-                    self.sio
-                    and
-                    self.sio.connected
-                ):
+                if self.sio:
 
                     try:
 
-                        await self.sio.disconnect()
+                        if self.sio.connected:
 
-                    except Exception:
-                        pass
+                            await self.sio.disconnect()
+
+                    except Exception as e:
+
+                        logger.debug(
+                            f"Socket.IO cleanup error: {e}"
+                        )
 
                 self.sio = None
 
