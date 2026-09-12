@@ -24,3 +24,10 @@ class Config:
     MAX_STACK_PER_GOAL = 3
     MIN_STACK_DELAY = 0.8
     MAX_STACK_DELAY = 1.5
+
+    # --- New: executor hardening ---
+    CONFIRMATION_TIMEOUT_MS = int(os.getenv('CONFIRMATION_TIMEOUT_MS', '5000'))
+    ODDS_READ_TIMEOUT_MS = int(os.getenv('ODDS_READ_TIMEOUT_MS', '1500'))
+
+    # --- New: match linker grace period before unlinking ---
+    LINK_GRACE_PERIOD_SECONDS = float(os.getenv('LINK_GRACE_PERIOD_SECONDS', '12'))
