@@ -15,7 +15,7 @@ class TelegramAlerter:
         self.total_staked = 0.0
         self.total_cashed_out = 0
         self.total_cashout_profit = 0.0
-        self.matches_flagged_slow = 0
+        self.matches_matched = 0
         self.slow_submissions = 0
 
     async def send(self, message: str, parse_mode: str = "HTML"):
@@ -46,25 +46,34 @@ class TelegramAlerter:
             f"💰 <b>BOT STARTED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Starting balance: <b>₦{balance:,.2f}</b>\n"
-            f"Data sources: Polymarket (fast) + SportyBet (own feed)\n"
-            f"Slow-detection threshold: <b>{Config.SLOW_THRESHOLD_SECONDS}s</b>\n"
-            f"First slow match will trigger a ₦{int(Config.VALIDATION_STAKE)} validation bet.\n"
+            f"Fast feed: Polymarket (soccer only)\n"
+            f"You'll get a notification every time a match is confirmed\n"
+            f"live on BOTH Polymarket and SportyBet.\n"
+            f"First matched goal triggers a ₦{int(Config.VALIDATION_STAKE)} validation bet.\n"
             f"Started: {self.session_start.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Watching all live football matches for Next Goal opportunities."
+            f"━━━━━━━━━━━━━━━━━━━━"
         )
         await self.send(msg)
 
-    async def notify_slow_match_found(self, home_team: str, away_team: str, gap_seconds: float):
-        self.matches_flagged_slow += 1
+    async def notify_match_matched(self, home_team: str, away_team: str):
+        self.matches_matched += 1
         msg = (
-            f"🐢 <b>SLOW MATCH DETECTED</b>\n"
+            f"🔗 <b>MATCH MATCHED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚽ {home_team} vs {away_team}\n"
-            f"⏱ SportyBet lagging by <b>{gap_seconds:.1f}s</b>\n"
-            f"📊 Now monitoring for next goal...\n"
+            f"Now live on both Polymarket and SportyBet — monitoring for goals.\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Total flagged this session: {self.matches_flagged_slow}"
+            f"Total matched this session: {self.matches_matched}"
+        )
+        await self.send(msg)
+
+    async def notify_market_skipped(self, home_team: str, away_team: str):
+        msg = (
+            f"🚫 <b>BET SKIPPED — MARKET MOVED ON</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚽ {home_team} vs {away_team}\n"
+            f"SportyBet already reflects this goal — betting now would\n"
+            f"hit the wrong (next) goal market. No bet placed."
         )
         await self.send(msg)
 
@@ -202,7 +211,7 @@ class TelegramAlerter:
                 f"⚽ {match_name}\n"
                 f"🎯 {team} @ {odds}\n"
                 f"💵 ₦{stake:,.2f} bet placed and confirmed\n\n"
-                f"✅ Detection → Navigation → Market select → Team select →\n"
+                f"✅ Match pairing → Goal detection → Market select →\n"
                 f"Stake entry → Submission → Confirmation — all working.\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎉 Bot will now place real, full-stake bets automatically."
@@ -225,7 +234,7 @@ class TelegramAlerter:
             f"📊 <b>SESSION REPORT</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⏱ Uptime: {self._uptime()}\n"
-            f"⚽ Slow matches flagged: {self.matches_flagged_slow}\n"
+            f"🔗 Matches matched: {self.matches_matched}\n"
             f"🎯 Total bets placed: {self.total_bets}\n"
             f"💵 Total staked: ₦{self.total_staked:,.2f}\n"
             f"🐌 Slow submissions: {self.slow_submissions}\n"
