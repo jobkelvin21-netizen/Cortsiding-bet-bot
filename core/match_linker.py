@@ -39,6 +39,7 @@ class MatchLinker:
     def __init__(self, sportybet_matches_ref: dict):
         self.sportybet_matches = sportybet_matches_ref
         self.last_scores: Dict[str, tuple] = {}
+        self.links: Dict[str, str] = {}          # poly match_id -> sportybet match_id (cached)
         self.goal_callback: Optional[Callable] = None
         self.FUZZY_THRESHOLD = 0.75
 
@@ -47,8 +48,9 @@ class MatchLinker:
 
     def _find_sportybet_match(self, home: str, away: str) -> Optional[dict]:
         target_key = match_key(home, away)
+        snapshot = list(self.sportybet_matches.values())
 
-        for sb_match in self.sportybet_matches.values():
+        for sb_match in snapshot:
             sb_key = match_key(sb_match.get('home_team', ''), sb_match.get('away_team', ''))
             if sb_key == target_key:
                 logger.debug(f"[MATCH] Exact: '{target_key}'")
@@ -56,7 +58,7 @@ class MatchLinker:
 
         best_match = None
         best_score = 0.0
-        for sb_match in self.sportybet_matches.values():
+        for sb_match in snapshot:
             sb_key = match_key(sb_match.get('home_team', ''), sb_match.get('away_team', ''))
             score = difflib.SequenceMatcher(None, target_key, sb_key).ratio()
             if score > best_score:
@@ -75,15 +77,20 @@ class MatchLinker:
         return None
 
     async def on_polymarket(self, match: dict):
-        key = match_key(match.get('home_team', ''), match.get('away_team', ''))
-        new_score = (match.get('home_score', 0), match.get('away_score', 0))
-        old_score = self.last_scores.get(key)
+        poly_id = match.get('match_id', '')          # <-- FIX: track by Polymarket's own id, not team-key
+        home, away = match.get('home_team', ''), match.get('away_team', '')
 
-        self.last_scores[key] = new_score
+        new_score = (match.get('home_score', 0), match.get('away_score', 0))
+        old_score = self.last_scores.get(poly_id)
+        self.last_scores[poly_id] = new_score
+
+        if match.get('ended'):                        # <-- FIX: clean up finished matches
+            self.last_scores.pop(poly_id, None)
+            self.links.pop(poly_id, None)
+            return
 
         if old_score is None:
-            logger.debug(f"[TRACKING] New match: {match['home_team']} vs {match['away_team']} "
-                         f"(score={new_score})")
+            logger.debug(f"[TRACKING] New match: {home} vs {away} (score={new_score})")
             return
 
         if new_score == old_score:
@@ -91,18 +98,26 @@ class MatchLinker:
 
         total_old = sum(old_score)
         total_new = sum(new_score)
-        if total_new <= total_old:
+        if total_new <= total_old:                     # score correction, not a goal
             return
 
-        scoring_team = match['home_team'] if new_score[0] > old_score[0] else match['away_team']
+        scoring_team = home if new_score[0] > old_score[0] else away
         goal_num = total_new
 
-        sb_match = self._find_sportybet_match(match['home_team'], match['away_team'])
+        # FIX: reuse a cached link if we already found this match before,
+        # instead of re-searching (and possibly landing on a different candidate) every time.
+        sb_id = self.links.get(poly_id)
+        sb_match = self.sportybet_matches.get(sb_id) if sb_id else None
+        if sb_match is None:
+            sb_match = self._find_sportybet_match(home, away)
+            if sb_match:
+                self.links[poly_id] = sb_match.get('match_id')
+
         if not sb_match:
             return
 
-        logger.info(f"⚽ GOAL: {match['home_team']} {new_score[0]}-{new_score[1]} "
-                    f"{match['away_team']} (goal #{goal_num}, scorer: {scoring_team})")
+        logger.info(f"⚽ GOAL: {home} {new_score[0]}-{new_score[1]} "
+                    f"{away} (goal #{goal_num}, scorer: {scoring_team})")
 
         if self.goal_callback:
             await self.goal_callback({
