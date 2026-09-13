@@ -3,7 +3,7 @@ import re
 import time
 import difflib
 import unicodedata
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Set
 
 from loguru import logger
 from config import Config
@@ -20,16 +20,29 @@ def normalize_team_name(name: str) -> str:
     if not name:
         return ""
     name = strip_accents(name).lower().strip()
-    words = re.findall(r"[a-z0-9]+", name)
-    filler = {
-        "fc", "cf", "sc", "afc", "cd", "ac", "fk", "nk", "sk", "as", "ss",
-        "rc", "ca", "cs", "us", "sd", "ec", "ud", "cp", "ce", "sad",
-        "united", "city", "town", "rovers", "athletic", "sporting", "club",
-    }
-    words = [w for w in words if w not in filler]
-    if len(words) > 1 and len(words[-1]) <= 3:
+
+    # Remove common prefixes/suffixes and noise
+    name = re.sub(r'\b(fc|cf|sc|afc|cd|ac|fk|nk|sk|as|ss|rc|ca|cs|us|sd|ec|ud|cp|ce|sad|club|united|city|town|rovers|athletic|sporting)\b', ' ', name)
+    name = re.sub(r'[^a-z0-9\s]', ' ', name)
+    words = [w for w in name.split() if len(w) > 1]
+
+    # Remove very short trailing words
+    if len(words) > 1 and len(words[-1]) <= 2:
         words = words[:-1]
+
     return "".join(words)
+
+
+def get_tokens(name: str) -> Set[str]:
+    """Return significant tokens from a team name"""
+    if not name:
+        return set()
+    name = strip_accents(name).lower()
+    name = re.sub(r'[^a-z0-9\s]', ' ', name)
+    tokens = {w for w in name.split() if len(w) > 2}
+    # Remove very common filler
+    filler = {"the", "and", "fc", "cf", "sc", "united", "city", "club"}
+    return tokens - filler
 
 
 def match_key(home: str, away: str) -> str:
@@ -51,12 +64,10 @@ class MatchLinker:
         self._missing_since: Dict[str, float] = {}
 
         self.goal_callback: Optional[Callable] = None
-        # NEW: fired the instant a new link is confirmed, so main.py can
-        # pre-open the SportyBet page ahead of any goal, not at goal-time.
         self.link_callback: Optional[Callable] = None
 
         self.running = False
-        self.FUZZY_THRESHOLD = 0.75
+        self.FUZZY_THRESHOLD = 0.68          # slightly more aggressive
         self.RECONCILE_INTERVAL = 2.0
         self.GRACE_PERIOD = Config.LINK_GRACE_PERIOD_SECONDS
 
@@ -73,24 +84,43 @@ class MatchLinker:
 
     def _find_sportybet_match(self, home: str, away: str) -> Optional[dict]:
         target_key = match_key(home, away)
+        target_home_tokens = get_tokens(home)
+        target_away_tokens = get_tokens(away)
 
+        # 1. Exact normalized key match
         for sb_match in self.sportybet_matches.values():
             sb_key = match_key(sb_match.get("home_team", ""), sb_match.get("away_team", ""))
             if sb_key == target_key:
                 return sb_match
 
+        # 2. Strong fuzzy match on normalized key
         best_match = None
         best_score = 0.0
+
         for sb_match in self.sportybet_matches.values():
-            sb_key = match_key(sb_match.get("home_team", ""), sb_match.get("away_team", ""))
+            sb_home = sb_match.get("home_team", "")
+            sb_away = sb_match.get("away_team", "")
+            sb_key = match_key(sb_home, sb_away)
+
             score = difflib.SequenceMatcher(None, target_key, sb_key).ratio()
+
+            # Bonus for token overlap
+            sb_home_tokens = get_tokens(sb_home)
+            sb_away_tokens = get_tokens(sb_away)
+
+            home_overlap = len(target_home_tokens & sb_home_tokens) + len(target_home_tokens & sb_away_tokens)
+            away_overlap = len(target_away_tokens & sb_away_tokens) + len(target_away_tokens & sb_home_tokens)
+
+            if home_overlap >= 1 and away_overlap >= 1:
+                score += 0.12   # strong bonus when both sides have token matches
+
             if score > best_score:
                 best_score = score
                 best_match = sb_match
 
         if best_match and best_score >= self.FUZZY_THRESHOLD:
             logger.debug(
-                f"[LINK] Fuzzy match {home} vs {away} -> "
+                f"[LINK] Fuzzy match {home} vs {away} → "
                 f"{best_match.get('home_team')} vs {best_match.get('away_team')} "
                 f"(score={best_score:.2f})"
             )
@@ -151,6 +181,7 @@ class MatchLinker:
 
         current_sb_ids = {m.get("match_id") for m in self.sportybet_matches.values()}
 
+        # Unlink expired matches
         for poly_id in list(self.links.keys()):
             linked_sb = self.links.get(poly_id)
             if not linked_sb:
@@ -167,18 +198,12 @@ class MatchLinker:
 
             if first_missed is None:
                 self._missing_since[poly_id] = now
-                logger.debug(
-                    f"[LINK] match_id={sb_id} missing from this poll — "
-                    f"starting {self.GRACE_PERIOD}s grace period before unlinking"
-                )
                 continue
 
             if (now - first_missed) < self.GRACE_PERIOD:
                 continue
 
-            poly_match = next(
-                (m for m in poly_matches if m.get("match_id") == poly_id), None
-            )
+            poly_match = next((m for m in poly_matches if m.get("match_id") == poly_id), None)
             if poly_match:
                 home = poly_match.get("home_team", "")
                 away = poly_match.get("away_team", "")
@@ -189,6 +214,7 @@ class MatchLinker:
             self._missing_since.pop(poly_id, None)
             newly_unlinked += 1
 
+        # Link new matches
         for poly_match in poly_matches:
             poly_id = poly_match.get("match_id")
             if not poly_id:
@@ -198,7 +224,6 @@ class MatchLinker:
             away = poly_match.get("away_team", "")
 
             existing_link = self.links.get(poly_id)
-
             if existing_link and existing_link.get("match_id") in current_sb_ids:
                 continue
 
@@ -206,11 +231,11 @@ class MatchLinker:
 
             if sb_match:
                 newly_linked += 1
-                logger.success(f"[LINK] '{home}' vs '{away}' -> SportyBet match_id={sb_match.get('match_id')}")
+                logger.success(f"[LINK] '{home}' vs '{away}' → SportyBet match_id={sb_match.get('match_id')}")
                 self.links[poly_id] = sb_match
                 self._missing_since.pop(poly_id, None)
                 self._notify_link(home, away, sb_match)
-                self._fire_link_callback(sb_match)  # NEW: pre-open page
+                self._fire_link_callback(sb_match)
 
         if newly_linked or newly_unlinked:
             logger.info(
@@ -259,10 +284,9 @@ class MatchLinker:
                 sb_match = self._find_sportybet_match(home, away)
                 if sb_match:
                     self.links[poly_id] = sb_match
-                    logger.success(f"[LINK] Immediate link: {home} vs {away} -> SportyBet {sb_match.get('match_id')}")
+                    logger.success(f"[LINK] Immediate link: {home} vs {away} → SportyBet {sb_match.get('match_id')}")
                     self._notify_link(home, away, sb_match)
-                    self._fire_link_callback(sb_match)  # NEW
-
+                    self._fire_link_callback(sb_match)
             return
 
         if new_score == old_score:
@@ -281,7 +305,7 @@ class MatchLinker:
         else:
             logger.warning(
                 f"[GOAL] Unable to determine scorer for {home} "
-                f"{old_score[0]}-{old_score[1]} -> {new_score[0]}-{new_score[1]} {away}"
+                f"{old_score[0]}-{old_score[1]} → {new_score[0]}-{new_score[1]} {away}"
             )
             return
 
@@ -290,19 +314,16 @@ class MatchLinker:
         sb_match = self.links.get(poly_id)
 
         if not sb_match:
-            logger.info(
-                f"[LINK] Goal detected before normal reconciliation for "
-                f"'{home}' vs '{away}'. Attempting immediate SportyBet lookup..."
-            )
+            logger.info(f"[LINK] Goal detected before link for '{home}' vs '{away}'. Trying immediate lookup...")
             sb_match = self._find_sportybet_match(home, away)
             if sb_match:
                 self.links[poly_id] = sb_match
-                logger.success(f"[LINK] Immediate goal-time link: {home} vs {away} -> SportyBet {sb_match.get('match_id')}")
+                logger.success(f"[LINK] Immediate goal-time link: {home} vs {away} → SportyBet {sb_match.get('match_id')}")
                 self._notify_link(home, away, sb_match)
-                self._fire_link_callback(sb_match)  # NEW
+                self._fire_link_callback(sb_match)
 
         if not sb_match:
-            logger.warning(f"⚠️ Goal detected for '{home}' vs '{away}' but no active SportyBet link exists.")
+            logger.warning(f"⚠️ Goal detected for '{home}' vs '{away}' but no SportyBet link exists.")
             return
 
         logger.success(
