@@ -33,3 +33,5 @@ class Config:
     LINK_GRACE_PERIOD_SECONDS = float(os.getenv('LINK_GRACE_PERIOD_SECONDS', '12'))
     # --- New: match-linker page pre-opening ---
     MAX_PREOPENED_MATCH_PAGES = int(os.getenv('MAX_PREOPENED_MATCH_PAGES', '15'))
+    # --- New: on-demand refresh + timing ---
+    SPORTYBET_POLL_INTERVAL = float(os.getenv('SPORTYBET_POLL_INTERVAL', '1.5'))
