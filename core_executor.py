@@ -53,38 +53,40 @@ class BetExecutor:
         self.validation_passed = False
 
     # =========================================================================
-    # BALANCE — never silently returns a stale value
+    # BALANCE — runs all selectors concurrently instead of sequentially,
+    # never silently returns a stale value
     # =========================================================================
 
     async def fetch_balance(self, page: Page) -> Optional[float]:
         selectors = ['.user-balance', '.account-balance',
                      '[data-testid="balance"]', '[class*="balance"]']
 
-        for sel in selectors:
+        async def try_selector(sel):
             try:
                 elem = await page.query_selector(sel)
                 if not elem:
-                    continue
-
+                    return None
                 text = await elem.text_content()
                 cleaned = (text or '').replace('₦', '').replace('NGN', '').replace(',', '').strip()
-
                 if not cleaned:
-                    logger.warning(f"[BALANCE_READ_ERROR] selector='{sel}' matched but text was empty")
-                    continue
+                    logger.debug(f"[BALANCE_READ_ERROR] selector='{sel}' matched but text was empty")
+                    return None
+                return float(cleaned)
+            except (ValueError, TypeError) as e:
+                logger.debug(f"[BALANCE_READ_ERROR] selector='{sel}' unparsable: {e}")
+                return None
+            except Exception as e:
+                logger.debug(f"[BALANCE_READ_ERROR] selector='{sel}' unexpected: {e}")
+                return None
 
-                bal = float(cleaned)
+        results = await asyncio.gather(*(try_selector(sel) for sel in selectors))
+
+        for bal in results:
+            if bal is not None:
                 self.balance = bal
                 if self.current_account:
                     self.account_manager.update_balance(self.current_account['username'], bal)
                 return bal
-
-            except (ValueError, TypeError) as e:
-                logger.warning(f"[BALANCE_READ_ERROR] selector='{sel}' unparsable: {e}")
-                continue
-            except Exception as e:
-                logger.warning(f"[BALANCE_READ_ERROR] selector='{sel}' unexpected: {e}")
-                continue
 
         logger.error("[BALANCE_READ_ERROR] No balance selector succeeded — balance NOT refreshed, keeping stale value flagged as unrefreshed")
         return None
@@ -144,16 +146,24 @@ class BetExecutor:
         return False
 
     # =========================================================================
-    # ODDS PARSER — normalizes text, validates numeric result
+    # ODDS PARSER — narrow selector first, broad fallback only if needed;
+    # normalizes text, validates numeric result
     # =========================================================================
 
     async def _read_odds_from_click(self, page: Page, selection_text: str) -> float:
         try:
-            # Use Playwright's locator API with exact text, safe against
-            # special characters in team/selection names (fixes unsafe
-            # selector interpolation)
-            locator = page.get_by_text(selection_text, exact=False)
+            # Prefer a specific selection/button element over scanning the
+            # whole page — much less DOM to search
+            locator = page.locator(
+                f'[class*="selection"]:has-text("{selection_text}"), '
+                f'button:has-text("{selection_text}")'
+            )
             count = await locator.count()
+
+            if count == 0:
+                # Fallback to broader text search only if the narrow one finds nothing
+                locator = page.get_by_text(selection_text, exact=False)
+                count = await locator.count()
 
             if count == 0:
                 logger.warning(f"[ODDS_PARSE] No element found for selection '{selection_text}'")
@@ -182,16 +192,12 @@ class BetExecutor:
             return 0.0
 
     # =========================================================================
-    # SCORE SAFETY CHECK — now reads from the live SportyBet REST feed dict,
-    # NOT the DOM. This is instant, reliable, and doesn't depend on any
-    # score-container selector guessing.
+    # SCORE SAFETY CHECK — reads from the live SportyBet REST feed dict,
+    # NOT the DOM. Instant, reliable, no selector guessing.
     # =========================================================================
 
     def _check_score_state(self, match_id: str, expected_home: int,
                             expected_away: int) -> tuple:
-        """
-        Returns (ScoreState, extracted_home, extracted_away, raw_match_or_None)
-        """
         sb_match = self.sportybet_matches.get(match_id)
 
         if not sb_match:
@@ -216,20 +222,27 @@ class BetExecutor:
 
         return ScoreState.CHANGED, current_home, current_away, sb_match
 
+    # =========================================================================
+    # MATCH IDENTITY — reads a targeted header element instead of the whole
+    # page's text, falls back to full-page read only if no header found
+    # =========================================================================
+
     async def _verify_match_identity(self, page: Page, expected_home: str,
                                       expected_away: str) -> bool:
-        """
-        Confirms the currently open SportyBet page actually shows the
-        expected teams before we trust anything read from it (fixes #4, #24).
-        """
         try:
-            body_text = await page.evaluate("document.body.innerText") or ""
+            header = await page.query_selector(
+                '[data-testid="match-header"], [class*="match-header"], h1, h2'
+            )
+            if header:
+                header_text = (await header.text_content() or "").lower()
+            else:
+                header_text = (await page.evaluate("document.body.innerText") or "").lower()
         except Exception as e:
-            logger.error(f"[MATCH_IDENTITY_ERROR] Could not read page body: {e}")
+            logger.error(f"[MATCH_IDENTITY_ERROR] Could not read page identity: {e}")
             return False
 
-        home_present = expected_home.split()[0].lower() in body_text.lower() if expected_home else False
-        away_present = expected_away.split()[0].lower() in body_text.lower() if expected_away else False
+        home_present = expected_home.split()[0].lower() in header_text if expected_home else False
+        away_present = expected_away.split()[0].lower() in header_text if expected_away else False
 
         if not (home_present and away_present):
             logger.warning(
@@ -275,7 +288,6 @@ class BetExecutor:
             )
             return False
 
-        # state == MATCHES
         logger.debug(
             f"[SCORE_DIAGNOSTIC] state=MATCHES match_id={match_id} "
             f"score={current_home}-{current_away} time={timestamp}"
@@ -295,14 +307,12 @@ class BetExecutor:
         match_id = match.get('match_id')
         match_name = f"{match['home_team']} vs {match['away_team']}"
 
-        # --- Safety gate #1: confirm page shows the right match ---
         identity_ok = await self._verify_match_identity(
             page, match.get('home_team', ''), match.get('away_team', '')
         )
         if not identity_ok:
             return BetResult.ABORTED_SAFETY
 
-        # --- Safety gate #2: confirm score hasn't moved past this goal ---
         if expected_home_score is not None and expected_away_score is not None:
             still_valid = await self._score_still_matches(
                 page, match_id, expected_home_score, expected_away_score
@@ -407,7 +417,6 @@ class BetExecutor:
         total_staked = 0.0
 
         for i in range(split_count):
-            # Recalculate from current balance each iteration (fixes #14)
             if not self.balance or self.balance < 100:
                 break
 
@@ -443,8 +452,6 @@ class BetExecutor:
             if not skip_market_selection:
                 clicked = False
                 try:
-                    # Locator API instead of raw f-string CSS/text interpolation
-                    # (fixes unsafe selector construction for names with quotes etc.)
                     locator = page.get_by_text(team, exact=False)
                     if await locator.count() > 0:
                         await locator.first.click(force=True, timeout=1500)
@@ -481,8 +488,6 @@ class BetExecutor:
                 return False
 
             try:
-                # More specific confirmation selector than a generic
-                # "contains success/confirmation" text match
                 await page.wait_for_selector(
                     'text=Rebet, [data-testid="bet-confirmation"], [class*="bet-success"]',
                     timeout=Config.CONFIRMATION_TIMEOUT_MS
