@@ -69,7 +69,6 @@ class BetExecutor:
                 if not text:
                     continue
                 cleaned = text.replace('₦', '').replace('NGN', '').replace(',', '').strip()
-                # Extract first number
                 match = re.search(r'([\d.]+)', cleaned)
                 if match:
                     bal = float(match.group(1))
@@ -128,23 +127,20 @@ class BetExecutor:
         return False
 
     # =========================================================================
-    # ODDS READER (more flexible)
+    # ODDS READER
     # =========================================================================
 
     async def _read_odds_from_click(self, page: Page, selection_text: str) -> float:
         try:
-            # Clean the team name for better matching
             clean_name = re.sub(r'\s+(FC|CF|SC|AFC|United|City)$', '', selection_text, flags=re.IGNORECASE).strip()
             keywords = [w for w in clean_name.split() if len(w) > 2]
 
-            # Try different ways to find the selection
             candidates = [
                 f'button:has-text("{selection_text}")',
                 f'[class*="selection"]:has-text("{selection_text}")',
                 f'div:has-text("{selection_text}")',
             ]
 
-            # Add shorter versions
             if keywords:
                 candidates.append(f'button:has-text("{keywords[0]}")')
                 candidates.append(f'[class*="selection"]:has-text("{keywords[0]}")')
@@ -160,7 +156,6 @@ class BetExecutor:
                     if not full_text:
                         continue
 
-                    # Extract odds number
                     match = re.search(r'(\d+\.\d{1,3}|\d+)', full_text.replace(',', '.'))
                     if match:
                         odds = float(match.group(1))
@@ -169,7 +164,6 @@ class BetExecutor:
                 except Exception:
                     continue
 
-            # Last fallback: search any text containing the team
             try:
                 locator = page.get_by_text(selection_text, exact=False)
                 if await locator.count() > 0:
@@ -221,14 +215,26 @@ class BetExecutor:
             logger.warning(f"[SAFETY] Invalid score data for match {match_id}")
             return False
 
-        if state == ScoreState.CHANGED:
-            logger.warning(
-                f"⚠️ SAFETY ABORT: Score changed! Expected {expected_home}-{expected_away}, "
-                f"now {current_home}-{current_away}"
-            )
+        if current_home is None or current_away is None:
             return False
 
-        return True
+        expected_total = expected_home + expected_away
+        current_total = current_home + current_away
+
+        # SportyBet is still behind → this is the opportunity, allow bet
+        if current_total < expected_total:
+            logger.info(
+                f"[SAFETY] SportyBet lagging ({current_home}-{current_away} vs Polymarket {expected_home}-{expected_away}). "
+                f"Allowing bet."
+            )
+            return True
+
+        # Scores are the same or SportyBet is ahead → market already moved, abort
+        logger.warning(
+            f"⚠️ SAFETY ABORT: SportyBet score is {current_home}-{current_away} "
+            f"(Polymarket {expected_home}-{expected_away}). Market already updated."
+        )
+        return False
 
     # =========================================================================
     # MATCH IDENTITY CHECK
@@ -399,7 +405,6 @@ class BetExecutor:
             if not skip_market_selection:
                 clicked = False
                 try:
-                    # Try full name first
                     locator = page.get_by_text(team, exact=False)
                     if await locator.count() > 0:
                         await locator.first.click(force=True, timeout=2000)
@@ -408,7 +413,6 @@ class BetExecutor:
                     pass
 
                 if not clicked:
-                    # Try first significant word
                     first_word = team.split()[0] if team else ""
                     if first_word:
                         try:
