@@ -26,16 +26,18 @@ class ArbitrageBot:
 
         self.polymarket = PolymarketFeed(self._noop_callback)
 
-        self.linker = MatchLinker(
-            self.polymarket,
-            self.sportybet.matches,
-            self.alerter,
-        )
+        self.linker = MatchLinker(self.polymarket, self.sportybet.matches, self.alerter)
         self.linker.set_goal_callback(self.on_goal)
+        self.linker.set_link_callback(self.on_new_link)  # NEW
 
         self.executor = None
         self.cashout = CashOutManager(self.alerter)
-        self.slow_pages = {}
+
+        # match_id -> Page (pre-opened or opened-on-demand)
+        self.match_pages = {}
+        # match_id -> True while a page open is in progress, avoids duplicates
+        self._opening_pages = set()
+
         self.running = False
         self._processing = {}
         self.browser = None
@@ -60,7 +62,7 @@ class ArbitrageBot:
         await self.setup()
 
         logger.info("=" * 60)
-        logger.info("BOT STARTING - POLYMARKET (goals) + SPORTYBET REST (matching + live score) + SPORTYBET BROWSER (betting)")
+        logger.info("BOT STARTING - POLYMARKET (goals) + SPORTYBET REST (matching + score) + SPORTYBET BROWSER (betting)")
         logger.info("=" * 60)
 
         print("\n" + "=" * 60)
@@ -107,14 +109,7 @@ class ArbitrageBot:
         self.auth.browser = browser
         self.auth.page = page
 
-        # CHANGED: BetExecutor now receives the live SportyBet matches dict
-        # so it can read the current score directly instead of scraping the DOM
-        self.executor = BetExecutor(
-            self.alerter,
-            self.account_manager,
-            self.sportybet.matches,
-            None,
-        )
+        self.executor = BetExecutor(self.alerter, self.account_manager, self.sportybet.matches, None)
         self.executor.current_account = self.account_manager.get_active()
 
         print("\nEnter your current SportyBet balance:")
@@ -129,7 +124,6 @@ class ArbitrageBot:
         self.polymarket.callback = self.linker.on_polymarket
 
         await self.polymarket.start()
-
         asyncio.create_task(self.sportybet.start(self.on_sportybet_update))
 
         logger.info("Waiting for SportyBet feed...")
@@ -147,7 +141,7 @@ class ArbitrageBot:
         except Exception as e:
             logger.error(f"Initial match reconciliation error: {e}")
 
-        logger.success("Bot running! Continuously linking matches, watching for goals.")
+        logger.success("Bot running! Continuously linking matches, pre-opening pages, watching for goals.")
 
         while self.running:
             await asyncio.sleep(1)
@@ -168,19 +162,120 @@ class ArbitrageBot:
         except Exception as e:
             logger.error(f"SportyBet update handling error: {e}")
 
+    # =========================================================================
+    # NEW: pre-open a match's SportyBet page the moment it's linked, so the
+    # goal->bet path at execution time is just click->bet, not navigate->bet.
+    # Capped so we don't open unlimited tabs.
+    # =========================================================================
+
+    async def on_new_link(self, sb_match: dict):
+        mid = sb_match.get("match_id")
+        if not mid or mid in self.match_pages or mid in self._opening_pages:
+            return
+
+        if len(self.match_pages) >= Config.MAX_PREOPENED_MATCH_PAGES:
+            logger.debug(
+                f"[PAGE_LOAD_ERROR] Pre-open cap reached ({Config.MAX_PREOPENED_MATCH_PAGES}) — "
+                f"match {mid} will open on-demand at goal time instead"
+            )
+            return
+
+        self._opening_pages.add(mid)
+        try:
+            await self._open_match_page(sb_match)
+        finally:
+            self._opening_pages.discard(mid)
+
+    # =========================================================================
+    # REAL NAVIGATION: no guessed direct URL — go to the live listing and
+    # click the actual match by team name, same technique confirmed working
+    # earlier in this project.
+    # =========================================================================
+
+    async def _open_match_page(self, sb_match: dict) -> bool:
+        mid = sb_match.get("match_id")
+        home = sb_match.get("home_team", "")
+        away = sb_match.get("away_team", "")
+
+        try:
+            new_context = await self.browser.new_context(viewport={"width": 412, "height": 915})
+            new_page = await new_context.new_page()
+
+            await new_page.goto(
+                "https://www.sportybet.com/ng/sport/football",
+                wait_until="domcontentloaded",
+                timeout=20000,
+            )
+            await asyncio.sleep(2)
+
+            try:
+                await new_page.click("text=Live", timeout=3000)
+                await asyncio.sleep(2)
+            except Exception:
+                logger.debug(f"[PAGE_LOAD_ERROR] Could not click 'Live' tab for {home} vs {away}, continuing anyway")
+
+            # Search for the match by team name using Playwright's locator
+            # API (safe against special characters, no manual CSS building)
+            home_word = home.split()[0] if home else ""
+            locator = new_page.get_by_text(home_word, exact=False)
+
+            found = False
+            try:
+                count = await locator.count()
+                if count > 0:
+                    await locator.first.click(timeout=5000)
+                    await asyncio.sleep(2)
+                    found = True
+            except Exception as e:
+                logger.warning(f"[PAGE_LOAD_ERROR] Click on '{home_word}' failed for {home} vs {away}: {e}")
+
+            if not found:
+                logger.error(
+                    f"[PAGE_LOAD_ERROR] Could not locate '{home}' vs '{away}' on the live listing page — "
+                    f"match_id={mid}, will retry at goal-time if needed"
+                )
+                await new_context.close()
+                return False
+
+            try:
+                await new_page.click("text=Next Goal", timeout=3000)
+                await asyncio.sleep(1.5)
+            except Exception:
+                logger.debug(f"[PAGE_LOAD_ERROR] 'Next Goal' market tab not found for {home} vs {away}")
+
+            self.match_pages[mid] = new_page
+            logger.success(f"[PAGE_READY] Pre-opened SportyBet page for {home} vs {away} (match_id={mid})")
+            return True
+
+        except Exception as e:
+            logger.error(f"[PAGE_LOAD_ERROR] Failed to open page for {home} vs {away} (match_id={mid}): {e}")
+            return False
+
     async def on_goal(self, goal_data: dict):
         try:
             mid = goal_data["match_id"]
 
-            if mid not in self.slow_pages:
-                await self.open_match_page(goal_data)
+            # Page should already be open from on_new_link. If not
+            # (cap reached, earlier failure), open it now as a fallback —
+            # slower, but still correct.
+            if mid not in self.match_pages:
+                logger.warning(f"[PAGE_LOAD_ERROR] No pre-opened page for match {mid} — opening now (slower path)")
+                sb_match = {
+                    "match_id": mid,
+                    "home_team": goal_data["home_team"],
+                    "away_team": goal_data["away_team"],
+                }
+                opened = await self._open_match_page(sb_match)
+                if not opened:
+                    logger.error(f"Could not open SportyBet page for {mid} — cannot bet on this goal")
+                    return
 
             if self._processing.get(mid):
                 return
             self._processing[mid] = True
 
             try:
-                page = self.slow_pages.get(mid)
+                page = self.match_pages.get(mid)
                 if not page:
                     logger.warning(f"No open SportyBet page for {mid} — cannot bet")
                     return
@@ -197,8 +292,6 @@ class ArbitrageBot:
                     expected_away_score=goal_data["away_score"],
                 )
 
-                # CHANGED: compare against explicit BetResult enum, not
-                # string/bool truthiness
                 if result == BetResult.SWITCHED:
                     logger.info("Account switch requested")
 
@@ -217,28 +310,6 @@ class ArbitrageBot:
 
         except Exception as e:
             logger.error(f"Goal handling error: {e}")
-
-    async def open_match_page(self, goal_data: dict):
-        mid = goal_data["match_id"]
-        try:
-            new_context = await self.browser.new_context(viewport={"width": 412, "height": 915})
-            new_page = await new_context.new_page()
-            await new_page.goto(f"{Config.SPORTYBET_BASE_URL}/ng/m/{mid}")
-            await asyncio.sleep(4)
-
-            try:
-                await new_page.click("text=Next Goal")
-                await asyncio.sleep(1.5)
-            except Exception:
-                pass
-
-            self.slow_pages[mid] = new_page
-            await self.alerter.notify_slow_match_found(
-                goal_data["home_team"], goal_data["away_team"], 0
-            )
-
-        except Exception as e:
-            logger.error(f"Page open error for {mid}: {e}")
 
 
 if __name__ == "__main__":
