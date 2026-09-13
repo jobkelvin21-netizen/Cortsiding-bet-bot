@@ -1,5 +1,5 @@
 import asyncio
-import json
+import json as _json
 import threading
 import time
 from datetime import datetime
@@ -7,6 +7,17 @@ from typing import Callable, Dict, List, Optional
 
 from loguru import logger
 import websocket
+
+# NEW: orjson is a C-accelerated JSON parser — meaningfully faster than the
+# standard library at the message volumes this feed sees. Falls back to the
+# standard json module if orjson isn't installed (pip install orjson).
+try:
+    import orjson
+    def _fast_loads(raw):
+        return orjson.loads(raw)
+except ImportError:
+    def _fast_loads(raw):
+        return _json.loads(raw)
 
 
 class PolymarketFeed:
@@ -24,7 +35,7 @@ class PolymarketFeed:
         self._thread = None
 
         self.last_message_at: Optional[float] = None
-        self._reconnect_delay = 1.5          # faster reconnect
+        self._reconnect_delay = 1.5
         self._skipped_count = 0
         self._last_skip_log = 0.0
 
@@ -34,7 +45,6 @@ class PolymarketFeed:
         return (time.time() - self.last_message_at) < 25
 
     def _on_message(self, ws, message):
-        # Ultra-fast path for ping
         if message == "ping":
             try:
                 ws.send("pong")
@@ -43,7 +53,7 @@ class PolymarketFeed:
             return
 
         try:
-            data = json.loads(message)
+            data = _fast_loads(message)
         except Exception:
             return
 
@@ -55,7 +65,6 @@ class PolymarketFeed:
         event_state = data.get("eventState") or {}
         event_type = str(event_state.get("type", "")).lower()
 
-        # Only soccer / football
         if event_type not in ("soccer", "football"):
             self._skipped_count += 1
             now = time.time()
@@ -73,7 +82,6 @@ class PolymarketFeed:
         ended = bool(data.get("ended", event_state.get("ended", False)))
         match_id = f"poly:{game_id}"
 
-        # Remove ended matches immediately
         if ended:
             with self._lock:
                 removed = self.matches.pop(match_id, None)
@@ -111,7 +119,6 @@ class PolymarketFeed:
         with self._lock:
             self.matches[match_id] = match
 
-        # Fire callback as fast as possible
         if self.callback and self._loop:
             try:
                 asyncio.run_coroutine_threadsafe(self.callback(match), self._loop)
@@ -132,7 +139,6 @@ class PolymarketFeed:
             return 0, 0
 
     def _on_error(self, ws, error):
-        # Keep this very quiet to avoid log spam
         logger.debug(f"[POLYMARKET] WS error: {error}")
 
     def _on_close(self, ws, code, msg):
@@ -152,7 +158,6 @@ class PolymarketFeed:
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
-                # Important: disable the internal ping so we handle it ourselves
                 self._ws.run_forever(ping_interval=0, ping_timeout=None)
             except Exception as e:
                 logger.error(f"[POLYMARKET] Thread error: {e}")
@@ -167,11 +172,7 @@ class PolymarketFeed:
             return
         self.running = True
         self._loop = asyncio.get_running_loop()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="polymarket-ws",
-            daemon=True
-        )
+        self._thread = threading.Thread(target=self._run, name="polymarket-ws", daemon=True)
         self._thread.start()
         logger.success("Polymarket feed started (sub-second / ultra-low latency)")
 
