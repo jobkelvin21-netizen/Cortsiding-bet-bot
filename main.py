@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import time
+import re
 from loguru import logger
 
 from config import Config
@@ -187,9 +188,7 @@ class ArbitrageBot:
             self._opening_pages.discard(mid)
 
     # =========================================================================
-    # REAL NAVIGATION: no guessed direct URL — go to the live listing and
-    # click the actual match by team name, same technique confirmed working
-    # earlier in this project.
+    # IMPROVED NAVIGATION: much stronger match finding
     # =========================================================================
 
     async def _open_match_page(self, sb_match: dict) -> bool:
@@ -204,44 +203,97 @@ class ArbitrageBot:
             await new_page.goto(
                 "https://www.sportybet.com/ng/sport/football",
                 wait_until="domcontentloaded",
-                timeout=20000,
+                timeout=25000,
             )
-            await asyncio.sleep(2)
+            await asyncio.sleep(2.5)
 
+            # Click Live tab
             try:
-                await new_page.click("text=Live", timeout=3000)
+                await new_page.click("text=Live", timeout=4000)
                 await asyncio.sleep(2)
             except Exception:
-                logger.debug(f"[PAGE_LOAD_ERROR] Could not click 'Live' tab for {home} vs {away}, continuing anyway")
+                logger.debug(f"[PAGE_LOAD] Could not click Live tab for {home} vs {away}")
 
-            # Search for the match by team name using Playwright's locator
-            # API (safe against special characters, no manual CSS building)
-            home_word = home.split()[0] if home else ""
-            locator = new_page.get_by_text(home_word, exact=False)
+            # Build search keywords (longest unique words first)
+            def get_keywords(name: str):
+                if not name:
+                    return []
+                words = [w for w in re.split(r'[\s\-\.]+', name) if len(w) > 2]
+                words = sorted(words, key=len, reverse=True)
+                return words[:3]
+
+            home_keywords = get_keywords(home)
+            away_keywords = get_keywords(away)
 
             found = False
+
+            # Strategy 1: Try to find a row that contains both teams
             try:
-                count = await locator.count()
-                if count > 0:
-                    await locator.first.click(timeout=5000)
-                    await asyncio.sleep(2)
-                    found = True
+                for kw in home_keywords:
+                    locator = new_page.get_by_text(kw, exact=False)
+                    count = await locator.count()
+                    if count == 0:
+                        continue
+
+                    for i in range(min(count, 8)):
+                        try:
+                            elem = locator.nth(i)
+                            text = (await elem.text_content() or "").lower()
+                            if any(aw.lower() in text for aw in away_keywords):
+                                await elem.click(timeout=4000)
+                                await asyncio.sleep(2)
+                                found = True
+                                logger.info(f"[PAGE_LOAD] Found match using both teams keywords: {kw}")
+                                break
+                        except Exception:
+                            continue
+                    if found:
+                        break
             except Exception as e:
-                logger.warning(f"[PAGE_LOAD_ERROR] Click on '{home_word}' failed for {home} vs {away}: {e}")
+                logger.debug(f"[PAGE_LOAD] Strategy 1 failed: {e}")
+
+            # Strategy 2: Fallback - just click the best home team keyword
+            if not found:
+                for kw in home_keywords:
+                    try:
+                        locator = new_page.get_by_text(kw, exact=False)
+                        if await locator.count() > 0:
+                            await locator.first.click(timeout=4000)
+                            await asyncio.sleep(2)
+                            found = True
+                            logger.info(f"[PAGE_LOAD] Found match using home keyword: {kw}")
+                            break
+                    except Exception:
+                        continue
+
+            # Strategy 3: Last fallback - try away team
+            if not found:
+                for kw in away_keywords:
+                    try:
+                        locator = new_page.get_by_text(kw, exact=False)
+                        if await locator.count() > 0:
+                            await locator.first.click(timeout=4000)
+                            await asyncio.sleep(2)
+                            found = True
+                            logger.info(f"[PAGE_LOAD] Found match using away keyword: {kw}")
+                            break
+                    except Exception:
+                        continue
 
             if not found:
                 logger.error(
                     f"[PAGE_LOAD_ERROR] Could not locate '{home}' vs '{away}' on the live listing page — "
-                    f"match_id={mid}, will retry at goal-time if needed"
+                    f"match_id={mid}"
                 )
                 await new_context.close()
                 return False
 
+            # Try to open Next Goal market
             try:
-                await new_page.click("text=Next Goal", timeout=3000)
+                await new_page.click("text=Next Goal", timeout=3500)
                 await asyncio.sleep(1.5)
             except Exception:
-                logger.debug(f"[PAGE_LOAD_ERROR] 'Next Goal' market tab not found for {home} vs {away}")
+                logger.debug(f"[PAGE_LOAD] 'Next Goal' tab not found for {home} vs {away}")
 
             self.match_pages[mid] = new_page
             logger.success(f"[PAGE_READY] Pre-opened SportyBet page for {home} vs {away} (match_id={mid})")
