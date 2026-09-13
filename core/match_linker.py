@@ -20,27 +20,20 @@ def normalize_team_name(name: str) -> str:
     if not name:
         return ""
     name = strip_accents(name).lower().strip()
-
-    # Remove common prefixes/suffixes and noise
     name = re.sub(r'\b(fc|cf|sc|afc|cd|ac|fk|nk|sk|as|ss|rc|ca|cs|us|sd|ec|ud|cp|ce|sad|club|united|city|town|rovers|athletic|sporting)\b', ' ', name)
     name = re.sub(r'[^a-z0-9\s]', ' ', name)
     words = [w for w in name.split() if len(w) > 1]
-
-    # Remove very short trailing words
     if len(words) > 1 and len(words[-1]) <= 2:
         words = words[:-1]
-
     return "".join(words)
 
 
 def get_tokens(name: str) -> Set[str]:
-    """Return significant tokens from a team name"""
     if not name:
         return set()
     name = strip_accents(name).lower()
     name = re.sub(r'[^a-z0-9\s]', ' ', name)
     tokens = {w for w in name.split() if len(w) > 2}
-    # Remove very common filler
     filler = {"the", "and", "fc", "cf", "sc", "united", "city", "club"}
     return tokens - filler
 
@@ -67,7 +60,7 @@ class MatchLinker:
         self.link_callback: Optional[Callable] = None
 
         self.running = False
-        self.FUZZY_THRESHOLD = 0.68          # slightly more aggressive
+        self.FUZZY_THRESHOLD = 0.68
         self.RECONCILE_INTERVAL = 2.0
         self.GRACE_PERIOD = Config.LINK_GRACE_PERIOD_SECONDS
 
@@ -87,13 +80,11 @@ class MatchLinker:
         target_home_tokens = get_tokens(home)
         target_away_tokens = get_tokens(away)
 
-        # 1. Exact normalized key match
         for sb_match in self.sportybet_matches.values():
             sb_key = match_key(sb_match.get("home_team", ""), sb_match.get("away_team", ""))
             if sb_key == target_key:
                 return sb_match
 
-        # 2. Strong fuzzy match on normalized key
         best_match = None
         best_score = 0.0
 
@@ -104,7 +95,6 @@ class MatchLinker:
 
             score = difflib.SequenceMatcher(None, target_key, sb_key).ratio()
 
-            # Bonus for token overlap
             sb_home_tokens = get_tokens(sb_home)
             sb_away_tokens = get_tokens(sb_away)
 
@@ -112,7 +102,7 @@ class MatchLinker:
             away_overlap = len(target_away_tokens & sb_away_tokens) + len(target_away_tokens & sb_home_tokens)
 
             if home_overlap >= 1 and away_overlap >= 1:
-                score += 0.12   # strong bonus when both sides have token matches
+                score += 0.12
 
             if score > best_score:
                 best_score = score
@@ -181,7 +171,6 @@ class MatchLinker:
 
         current_sb_ids = {m.get("match_id") for m in self.sportybet_matches.values()}
 
-        # Unlink expired matches
         for poly_id in list(self.links.keys()):
             linked_sb = self.links.get(poly_id)
             if not linked_sb:
@@ -214,7 +203,6 @@ class MatchLinker:
             self._missing_since.pop(poly_id, None)
             newly_unlinked += 1
 
-        # Link new matches
         for poly_match in poly_matches:
             poly_id = poly_match.get("match_id")
             if not poly_id:
@@ -326,6 +314,8 @@ class MatchLinker:
             logger.warning(f"⚠️ Goal detected for '{home}' vs '{away}' but no SportyBet link exists.")
             return
 
+        detected_at = time.time()  # NEW: exact moment this goal was confirmed
+
         logger.success(
             f"⚽ GOAL: {home} {new_score[0]}-{new_score[1]} {away} "
             f"(goal #{goal_num}, scorer: {scoring_team})"
@@ -340,4 +330,5 @@ class MatchLinker:
                 "away_score": new_score[1],
                 "scoring_team": scoring_team,
                 "goal_num": goal_num,
+                "detected_at": detected_at,  # NEW
             })
