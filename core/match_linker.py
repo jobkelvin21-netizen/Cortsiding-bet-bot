@@ -48,12 +48,13 @@ class MatchLinker:
 
         self.links: Dict[str, dict] = {}
         self.last_scores: Dict[str, tuple] = {}
-
-        # Tracks when a linked SportyBet match first went missing, so a
-        # single transient poll miss doesn't instantly destroy the link
         self._missing_since: Dict[str, float] = {}
 
         self.goal_callback: Optional[Callable] = None
+        # NEW: fired the instant a new link is confirmed, so main.py can
+        # pre-open the SportyBet page ahead of any goal, not at goal-time.
+        self.link_callback: Optional[Callable] = None
+
         self.running = False
         self.FUZZY_THRESHOLD = 0.75
         self.RECONCILE_INTERVAL = 2.0
@@ -63,6 +64,9 @@ class MatchLinker:
 
     def set_goal_callback(self, callback: Callable):
         self.goal_callback = callback
+
+    def set_link_callback(self, callback: Callable):
+        self.link_callback = callback
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -131,6 +135,15 @@ class MatchLinker:
         except RuntimeError:
             pass
 
+    def _fire_link_callback(self, sb_match: dict):
+        if not self.link_callback:
+            return
+        try:
+            asyncio.get_running_loop()
+            asyncio.create_task(self.link_callback(sb_match))
+        except RuntimeError:
+            pass
+
     def _reconcile_once(self):
         poly_matches = self.polymarket_feed.get_matches()
         newly_linked = 0
@@ -138,7 +151,6 @@ class MatchLinker:
 
         current_sb_ids = {m.get("match_id") for m in self.sportybet_matches.values()}
 
-        # Handle links whose SportyBet match is currently missing
         for poly_id in list(self.links.keys()):
             linked_sb = self.links.get(poly_id)
             if not linked_sb:
@@ -177,7 +189,6 @@ class MatchLinker:
             self._missing_since.pop(poly_id, None)
             newly_unlinked += 1
 
-        # Find new links
         for poly_match in poly_matches:
             poly_id = poly_match.get("match_id")
             if not poly_id:
@@ -199,6 +210,7 @@ class MatchLinker:
                 self.links[poly_id] = sb_match
                 self._missing_since.pop(poly_id, None)
                 self._notify_link(home, away, sb_match)
+                self._fire_link_callback(sb_match)  # NEW: pre-open page
 
         if newly_linked or newly_unlinked:
             logger.info(
@@ -249,6 +261,7 @@ class MatchLinker:
                     self.links[poly_id] = sb_match
                     logger.success(f"[LINK] Immediate link: {home} vs {away} -> SportyBet {sb_match.get('match_id')}")
                     self._notify_link(home, away, sb_match)
+                    self._fire_link_callback(sb_match)  # NEW
 
             return
 
@@ -286,6 +299,7 @@ class MatchLinker:
                 self.links[poly_id] = sb_match
                 logger.success(f"[LINK] Immediate goal-time link: {home} vs {away} -> SportyBet {sb_match.get('match_id')}")
                 self._notify_link(home, away, sb_match)
+                self._fire_link_callback(sb_match)  # NEW
 
         if not sb_match:
             logger.warning(f"⚠️ Goal detected for '{home}' vs '{away}' but no active SportyBet link exists.")
