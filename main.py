@@ -22,7 +22,7 @@ class ArbitrageBot:
         self.alerter = TelegramAlerter()
         self.auth = SportyBetAuth()
 
-        self.sportybet = SportyBetFeed(poll_interval=2.0)
+        self.sportybet = SportyBetFeed(poll_interval=Config.SPORTYBET_POLL_INTERVAL)
         self.sportybet.set_alerter(self.alerter)
 
         self.polymarket = PolymarketFeed(self._noop_callback)
@@ -188,7 +188,6 @@ class ArbitrageBot:
             new_context = await self.browser.new_context(viewport={"width": 412, "height": 915})
             new_page = await new_context.new_page()
 
-            # Go directly to the Live Football list (more reliable)
             await new_page.goto(
                 "https://www.sportybet.com/ng/sport/football/live_list",
                 wait_until="domcontentloaded",
@@ -196,12 +195,10 @@ class ArbitrageBot:
             )
             await asyncio.sleep(3)
 
-            # Scroll to load more matches
             for _ in range(3):
                 await new_page.evaluate("window.scrollBy(0, 1000)")
                 await asyncio.sleep(0.8)
 
-            # Use JavaScript to find and click the match row that contains both teams
             found = await new_page.evaluate(
                 """([home, away]) => {
                     const homeLower = home.toLowerCase();
@@ -229,7 +226,6 @@ class ArbitrageBot:
             )
 
             if not found:
-                # Fallback with shorter names
                 short_home = home.split()[0] if home else ""
                 short_away = away.split()[0] if away else ""
 
@@ -262,7 +258,6 @@ class ArbitrageBot:
 
             await asyncio.sleep(2.5)
 
-            # Try to open Next Goal market
             try:
                 await new_page.click("text=Next Goal", timeout=4000)
                 await asyncio.sleep(1.5)
@@ -280,6 +275,7 @@ class ArbitrageBot:
     async def on_goal(self, goal_data: dict):
         try:
             mid = goal_data["match_id"]
+            detected_at = goal_data.get("detected_at")
 
             if mid not in self.match_pages:
                 logger.warning(f"[PAGE_LOAD_ERROR] No pre-opened page for match {mid} — opening now (slower path)")
@@ -309,10 +305,17 @@ class ArbitrageBot:
                     "away_team": goal_data["away_team"],
                 }
 
+                # NEW: pull the freshest possible SportyBet snapshot right
+                # now, instead of relying on whatever the last scheduled
+                # 1.5s poll happened to fetch. This is the fix for "by the
+                # time it checks, SportyBet has already updated."
+                await self.sportybet.force_refresh()
+
                 result = await self.executor.execute(
                     page, match, goal_data["scoring_team"], goal_data["goal_num"],
                     expected_home_score=goal_data["home_score"],
                     expected_away_score=goal_data["away_score"],
+                    detected_at=detected_at,  # NEW
                 )
 
                 if result == BetResult.SWITCHED:
