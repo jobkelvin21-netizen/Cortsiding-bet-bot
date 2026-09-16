@@ -5,7 +5,7 @@ import time
 import uuid
 from enum import Enum, auto
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict
 from playwright.async_api import Page
 from loguru import logger
 
@@ -28,6 +28,23 @@ class ScoreState(Enum):
     CHANGED = auto()
 
 
+class MatchWatch:
+    """
+    Background state tracked continuously for one pre-opened match page.
+    Holds the most recently known odds for each selection, kept fresh by
+    a background loop — so at goal-time, execute() only needs to CONFIRM
+    the cached values are still valid, not read them from scratch.
+    """
+    def __init__(self, page: Page, home_team: str, away_team: str):
+        self.page = page
+        self.home_team = home_team
+        self.away_team = away_team
+        self.odds_by_team: Dict[str, float] = {}
+        self.task: Optional[asyncio.Task] = None
+        self.running = False
+        self.last_refresh_at: Optional[float] = None
+
+
 class BetExecutor:
     def __init__(self, alerter: TelegramAlerter, account_manager,
                  sportybet_matches_ref: dict, learning=None):
@@ -47,13 +64,65 @@ class BetExecutor:
         self.validation_bet_placed = False
         self.validation_passed = False
 
-        # NEW: race-timing stats
+        # Race-timing stats
         self.race_wins = 0
         self.race_losses = 0
         self.race_gaps_ms = []
 
+        # NEW: background match watchers — keyed by match_id, always
+        # tracking odds in the background so goal-time is confirm-only
+        self.watches: Dict[str, MatchWatch] = {}
+
     # =========================================================================
-    # BALANCE
+    # BACKGROUND WATCH — always-on odds tracking per pre-opened match page
+    # =========================================================================
+
+    def start_watching(self, match_id: str, page: Page, home_team: str, away_team: str):
+        """Call this the moment a match page is pre-opened (on link), so
+        odds tracking starts immediately, ahead of any goal."""
+        if match_id in self.watches:
+            return
+
+        watch = MatchWatch(page, home_team, away_team)
+        watch.running = True
+        watch.task = asyncio.create_task(self._watch_loop(match_id, watch))
+        self.watches[match_id] = watch
+        logger.debug(f"[WATCH] Started background tracking for {home_team} vs {away_team}")
+
+    def stop_watching(self, match_id: str):
+        watch = self.watches.pop(match_id, None)
+        if watch:
+            watch.running = False
+            if watch.task:
+                watch.task.cancel()
+            logger.debug(f"[WATCH] Stopped tracking match_id={match_id}")
+
+    async def _watch_loop(self, match_id: str, watch: MatchWatch):
+        try:
+            while watch.running:
+                try:
+                    home_odds = await self._read_odds_from_click(watch.page, watch.home_team)
+                    away_odds = await self._read_odds_from_click(watch.page, watch.away_team)
+
+                    if home_odds > 0:
+                        watch.odds_by_team[watch.home_team] = home_odds
+                    if away_odds > 0:
+                        watch.odds_by_team[watch.away_team] = away_odds
+
+                    watch.last_refresh_at = time.time()
+
+                except Exception as e:
+                    logger.debug(f"[WATCH] Odds refresh error for {watch.home_team} vs {watch.away_team}: {e}")
+
+                await asyncio.sleep(Config.ODDS_TRACK_INTERVAL)
+        except asyncio.CancelledError:
+            pass
+
+    def get_watch(self, match_id: str) -> Optional[MatchWatch]:
+        return self.watches.get(match_id)
+
+    # =========================================================================
+    # BALANCE — runs all selectors concurrently, never silently stale
     # =========================================================================
 
     async def fetch_balance(self, page: Page) -> Optional[float]:
@@ -65,26 +134,32 @@ class BetExecutor:
             'span:has-text("₦")',
         ]
 
-        for sel in selectors:
+        async def try_selector(sel):
             try:
                 elem = await page.query_selector(sel)
                 if not elem:
-                    continue
+                    return None
                 text = await elem.text_content()
                 if not text:
-                    continue
+                    return None
                 cleaned = text.replace('₦', '').replace('NGN', '').replace(',', '').strip()
                 match = re.search(r'([\d.]+)', cleaned)
                 if match:
-                    bal = float(match.group(1))
-                    self.balance = bal
-                    if self.current_account:
-                        self.account_manager.update_balance(self.current_account['username'], bal)
-                    return bal
+                    return float(match.group(1))
+                return None
             except Exception:
-                continue
+                return None
 
-        logger.error("[BALANCE] Could not read balance")
+        results = await asyncio.gather(*(try_selector(sel) for sel in selectors))
+
+        for bal in results:
+            if bal is not None:
+                self.balance = bal
+                if self.current_account:
+                    self.account_manager.update_balance(self.current_account['username'], bal)
+                return bal
+
+        logger.error("[BALANCE_READ_ERROR] No balance selector succeeded — balance NOT refreshed")
         return None
 
     def calc_stake(self, odds: float) -> float:
@@ -132,32 +207,36 @@ class BetExecutor:
         return False
 
     # =========================================================================
-    # ODDS READER
+    # ODDS READER — narrow selector first, safe (locator-based) construction,
+    # broad fallback only if needed
     # =========================================================================
 
     async def _read_odds_from_click(self, page: Page, selection_text: str) -> float:
+        if not selection_text:
+            return 0.0
+
         try:
             clean_name = re.sub(r'\s+(FC|CF|SC|AFC|United|City)$', '', selection_text, flags=re.IGNORECASE).strip()
             keywords = [w for w in clean_name.split() if len(w) > 2]
 
+            # Locator API used throughout — no raw f-string CSS interpolation
+            # of arbitrary team names, safe against quotes/special characters
             candidates = [
-                f'button:has-text("{selection_text}")',
-                f'[class*="selection"]:has-text("{selection_text}")',
-                f'div:has-text("{selection_text}")',
+                page.get_by_role("button", name=selection_text, exact=False),
+                page.locator('[class*="selection"]').filter(has_text=selection_text),
             ]
 
             if keywords:
-                candidates.append(f'button:has-text("{keywords[0]}")')
-                candidates.append(f'[class*="selection"]:has-text("{keywords[0]}")')
+                candidates.append(page.get_by_role("button", name=keywords[0], exact=False))
+                candidates.append(page.locator('[class*="selection"]').filter(has_text=keywords[0]))
 
-            for sel in candidates:
+            for locator in candidates:
                 try:
-                    locator = page.locator(sel)
                     count = await locator.count()
                     if count == 0:
                         continue
 
-                    full_text = await locator.first.text_content(timeout=2000)
+                    full_text = await locator.first.text_content(timeout=1500)
                     if not full_text:
                         continue
 
@@ -166,94 +245,96 @@ class BetExecutor:
                         odds = float(match.group(1))
                         if 1.01 <= odds <= 500:
                             return odds
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"[ODDS_PARSE] Candidate selector failed for '{selection_text}': {e}")
                     continue
 
+            # Broad fallback, last resort only
             try:
                 locator = page.get_by_text(selection_text, exact=False)
                 if await locator.count() > 0:
-                    full_text = await locator.first.text_content(timeout=1500)
+                    full_text = await locator.first.text_content(timeout=1200)
                     match = re.search(r'(\d+\.\d{1,3})', (full_text or '').replace(',', '.'))
                     if match:
                         odds = float(match.group(1))
                         if 1.01 <= odds <= 500:
                             return odds
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[ODDS_PARSE] Broad fallback failed for '{selection_text}': {e}")
 
-            logger.warning(f"[ODDS] Could not read odds for '{selection_text}'")
             return 0.0
 
         except Exception as e:
-            logger.error(f"[ODDS] Error reading odds: {e}")
+            logger.error(f"[ODDS_PARSE] Error reading odds for '{selection_text}': {e}")
             return 0.0
 
     # =========================================================================
-    # SCORE SAFETY CHECK — now logs full team details, not just IDs
+    # SCORE SAFETY CHECK — DOM-based, reading the pre-opened page directly,
+    # not the REST feed (removes REST-staleness from the hot path entirely)
     # =========================================================================
 
-    def _check_score_state(self, match_id: str, expected_home: int, expected_away: int):
-        sb_match = self.sportybet_matches.get(match_id)
+    async def _read_score_from_page(self, page: Page) -> Optional[tuple]:
+        try:
+            score_elem = await page.query_selector(
+                '[data-testid="match-score"], [class*="match-score"], [class*="score-board"]'
+            )
+            if not score_elem:
+                return None
 
-        if not sb_match:
-            return ScoreState.UNAVAILABLE, None, None
+            text = (await score_elem.text_content() or "").strip()
+            m = re.match(r'^\s*(\d+)\s*[-:]\s*(\d+)\s*$', text)
+            if not m:
+                return None
 
-        current_home = sb_match.get('home_score')
-        current_away = sb_match.get('away_score')
+            return int(m.group(1)), int(m.group(2))
+        except Exception as e:
+            logger.debug(f"[SCORE_SELECTOR_ERROR] DOM score read failed: {e}")
+            return None
 
-        if current_home is None or current_away is None:
-            return ScoreState.INVALID, current_home, current_away
-
-        if current_home == expected_home and current_away == expected_away:
-            return ScoreState.MATCHES, current_home, current_away
-
-        return ScoreState.CHANGED, current_home, current_away
-
-    async def _score_still_matches(self, match_id: str, expected_home: int, expected_away: int,
+    async def _score_still_matches(self, page: Page, match_id: str,
+                                    expected_home: int, expected_away: int,
                                     match_name: str) -> bool:
-        state, current_home, current_away = self._check_score_state(match_id, expected_home, expected_away)
+        current = await self._read_score_from_page(page)
 
-        if state == ScoreState.UNAVAILABLE:
-            logger.warning(f"[SAFETY] {match_name} (match_id={match_id}) not found in SportyBet feed")
+        if current is None:
+            logger.warning(f"[SAFETY] {match_name} (match_id={match_id}) — score element unavailable on page")
             return False
 
-        if state == ScoreState.INVALID:
-            logger.warning(f"[SAFETY] {match_name} (match_id={match_id}) — invalid score data")
-            return False
-
-        if current_home is None or current_away is None:
-            return False
-
+        current_home, current_away = current
         expected_total = expected_home + expected_away
         current_total = current_home + current_away
 
         if current_total < expected_total:
             logger.info(
-                f"[SAFETY] {match_name} — SportyBet lagging ({current_home}-{current_away} "
-                f"vs Polymarket {expected_home}-{expected_away}). Allowing bet."
+                f"[SAFETY] {match_name} — page still shows {current_home}-{current_away} "
+                f"vs expected {expected_home}-{expected_away}. Allowing bet."
             )
             return True
 
-        # CHANGED: match_name (team details) now included in every abort message
         logger.warning(
-            f"⚠️ SAFETY ABORT: {match_name} — SportyBet score is {current_home}-{current_away} "
-            f"(Polymarket {expected_home}-{expected_away}). Market already updated."
+            f"⚠️ SAFETY ABORT: {match_name} — page score is {current_home}-{current_away} "
+            f"(expected {expected_home}-{expected_away}). Market already updated."
         )
         return False
 
     # =========================================================================
-    # MATCH IDENTITY CHECK
+    # MATCH IDENTITY CHECK — targeted header read, not whole-page scan
     # =========================================================================
 
     async def _verify_match_identity(self, page: Page, expected_home: str, expected_away: str) -> bool:
         try:
-            body_text = (await page.evaluate("document.body.innerText") or "").lower()
+            header = await page.query_selector(
+                '[data-testid="match-header"], [class*="match-header"], h1, h2'
+            )
+            if header:
+                header_text = (await header.text_content() or "").lower()
+            else:
+                header_text = (await page.evaluate("document.body.innerText") or "").lower()
 
-            home_ok = any(w.lower() in body_text for w in expected_home.split() if len(w) > 3)
-            away_ok = any(w.lower() in body_text for w in expected_away.split() if len(w) > 3)
+            home_ok = any(w.lower() in header_text for w in expected_home.split() if len(w) > 3)
+            away_ok = any(w.lower() in header_text for w in expected_away.split() if len(w) > 3)
 
             if not (home_ok and away_ok):
-                # CHANGED: consistent team-detail wording
                 logger.warning(f"[IDENTITY] {expected_home} vs {expected_away} — page does not appear to show this match")
                 return False
             return True
@@ -262,85 +343,7 @@ class BetExecutor:
             return False
 
     # =========================================================================
-    # MAIN EXECUTE
-    # =========================================================================
-
-    async def execute(self, page: Page, match: dict, team: str, goal_num: int = 1,
-                      expected_home_score: int = None,
-                      expected_away_score: int = None,
-                      detected_at: float = None) -> BetResult:  # NEW param
-
-        if self.stopped:
-            return BetResult.FAILED
-
-        match_id = match.get('match_id')
-        match_name = f"{match['home_team']} vs {match['away_team']}"
-
-        # Identity check
-        if not await self._verify_match_identity(page, match.get('home_team', ''), match.get('away_team', '')):
-            self._record_race_result(detected_at, won=False, match_name=match_name, reason="identity_mismatch")
-            return BetResult.ABORTED_SAFETY
-
-        # Score safety check
-        if expected_home_score is not None and expected_away_score is not None:
-            if not await self._score_still_matches(match_id, expected_home_score, expected_away_score, match_name):
-                self._record_race_result(detected_at, won=False, match_name=match_name, reason="score_moved")
-                return BetResult.ABORTED_SAFETY
-
-        # We passed all safety checks — this is a "won" race
-        self._record_race_result(detected_at, won=True, match_name=match_name, reason="passed_safety")
-
-        # Read odds
-        odds = await self._read_odds_from_click(page, team)
-        if odds <= 0:
-            logger.error(f"[ODDS] No valid odds found for {team} on {match_name}")
-            return BetResult.FAILED
-
-        self.last_odds_used = odds
-        logger.info(f"Odds confirmed: {team} @ {odds}")
-
-        # Validation bet (first bet only)
-        if not self.validation_bet_placed:
-            self.validation_bet_placed = True
-            success = await self.run_validation_bet(page, match, team, odds, goal_num, match_name)
-            if success:
-                self.validation_passed = True
-                logger.success("✅ Validation passed — full staking now ACTIVE")
-                return BetResult.SUCCESS
-            else:
-                self.stopped = True
-                logger.error("❌ Validation failed — bot stopped")
-                return BetResult.FAILED
-
-        if not self.validation_passed:
-            return BetResult.FAILED
-
-        # Normal betting
-        fresh_balance = await self.fetch_balance(page)
-        if fresh_balance is None:
-            logger.error("[BALANCE] Aborting — could not read balance")
-            return BetResult.FAILED
-
-        stake = self.calc_stake(odds)
-        if stake < 100:
-            logger.warning(f"Stake too low: {stake}")
-            return BetResult.FAILED
-
-        split_count = self.can_split_by_balance(stake)
-        dying = await self.is_dying_minutes(page)
-
-        if self.should_split(odds, dying, split_count):
-            success = await self.split_bet(page, match, team, odds, goal_num, split_count, dying)
-            return BetResult.SUCCESS if success else BetResult.FAILED
-        else:
-            await self.alerter.notify_goal_detected(match_name, team, odds, goal_num)
-            success = await self.place_single_bet(page, match, team, stake, odds, 1, goal_num, total_stack=1)
-            return BetResult.SUCCESS if success else BetResult.FAILED
-
-    # =========================================================================
-    # NEW: race timing — logs the gap between goal-detection and this
-    # safety-check moment, and keeps a running win/loss tally so you can
-    # see your real win rate instead of guessing from individual log lines.
+    # RACE TIMING
     # =========================================================================
 
     def _record_race_result(self, detected_at: Optional[float], won: bool,
@@ -368,6 +371,92 @@ class BetExecutor:
             f"gap={gap_ms:.0f}ms | avg_gap={avg_gap:.0f}ms | "
             f"win_rate={win_rate:.1f}% ({self.race_wins}/{total})"
         )
+
+    # =========================================================================
+    # MAIN EXECUTE — always-confirm design: checks pre-tracked state,
+    # confirms it's still valid at the exact goal moment, then bets.
+    # No fresh odds/score computation happens here unless the watch
+    # cache is missing (fallback path only).
+    # =========================================================================
+
+    async def execute(self, page: Page, match: dict, team: str, goal_num: int = 1,
+                      expected_home_score: int = None,
+                      expected_away_score: int = None,
+                      detected_at: float = None) -> BetResult:
+
+        if self.stopped:
+            return BetResult.FAILED
+
+        match_id = match.get('match_id')
+        match_name = f"{match['home_team']} vs {match['away_team']}"
+
+        # --- CONFIRM #1: identity ---
+        if not await self._verify_match_identity(page, match.get('home_team', ''), match.get('away_team', '')):
+            self._record_race_result(detected_at, won=False, match_name=match_name, reason="identity_mismatch")
+            return BetResult.ABORTED_SAFETY
+
+        # --- CONFIRM #2: score hasn't moved past this goal ---
+        if expected_home_score is not None and expected_away_score is not None:
+            if not await self._score_still_matches(page, match_id, expected_home_score, expected_away_score, match_name):
+                self._record_race_result(detected_at, won=False, match_name=match_name, reason="score_moved")
+                return BetResult.ABORTED_SAFETY
+
+        # Passed both confirmations — this is a won race
+        self._record_race_result(detected_at, won=True, match_name=match_name, reason="confirmed")
+
+        # --- CONFIRM #3: use pre-tracked odds if available, else read fresh (fallback only) ---
+        watch = self.get_watch(match_id)
+        odds = 0.0
+        if watch and team in watch.odds_by_team:
+            odds = watch.odds_by_team[team]
+            logger.debug(f"[CONFIRM] Using pre-tracked odds for {team}: {odds}")
+        else:
+            logger.debug(f"[CONFIRM] No pre-tracked odds for {team} — reading fresh (fallback)")
+            odds = await self._read_odds_from_click(page, team)
+
+        if odds <= 0:
+            logger.error(f"[ODDS] No valid odds found for {team} on {match_name}")
+            return BetResult.FAILED
+
+        self.last_odds_used = odds
+        logger.info(f"Odds confirmed: {team} @ {odds}")
+
+        # Validation bet (first bet only)
+        if not self.validation_bet_placed:
+            self.validation_bet_placed = True
+            success = await self.run_validation_bet(page, match, team, odds, goal_num, match_name)
+            if success:
+                self.validation_passed = True
+                logger.success("✅ Validation passed — full staking now ACTIVE")
+                return BetResult.SUCCESS
+            else:
+                self.stopped = True
+                logger.error("❌ Validation failed — bot stopped")
+                return BetResult.FAILED
+
+        if not self.validation_passed:
+            return BetResult.FAILED
+
+        fresh_balance = await self.fetch_balance(page)
+        if fresh_balance is None:
+            logger.error("[BALANCE] Aborting — could not read balance")
+            return BetResult.FAILED
+
+        stake = self.calc_stake(odds)
+        if stake < 100:
+            logger.warning(f"Stake too low: {stake}")
+            return BetResult.FAILED
+
+        split_count = self.can_split_by_balance(stake)
+        dying = await self.is_dying_minutes(page)
+
+        if self.should_split(odds, dying, split_count):
+            success = await self.split_bet(page, match, team, odds, goal_num, split_count, dying)
+            return BetResult.SUCCESS if success else BetResult.FAILED
+        else:
+            await self.alerter.notify_goal_detected(match_name, team, odds, goal_num)
+            success = await self.place_single_bet(page, match, team, stake, odds, 1, goal_num, total_stack=1)
+            return BetResult.SUCCESS if success else BetResult.FAILED
 
     async def run_validation_bet(self, page: Page, match: dict, team: str, odds: float,
                                  goal_num: int, match_name: str) -> bool:
@@ -425,8 +514,6 @@ class BetExecutor:
                 total_bets += 1
                 total_staked += split_stake
                 self.balance -= split_stake
-                if i < split_count - 1:
-                    await asyncio.sleep(random.uniform(0.5, 1.0))
             else:
                 break
 
@@ -442,19 +529,27 @@ class BetExecutor:
             start_time = time.time()
             match_name = f"{match['home_team']} vs {match['away_team']}"
 
-            if stack_num == 1 and goal_num == 1:
-                await asyncio.sleep(random.uniform(0.3, 0.6))
-                await page.bring_to_front()
+            # Artificial "human-like" delays removed — speed prioritized
+            await page.bring_to_front()
 
             if not skip_market_selection:
                 clicked = False
                 try:
-                    locator = page.get_by_text(team, exact=False)
+                    locator = page.get_by_role("button", name=team, exact=False)
                     if await locator.count() > 0:
-                        await locator.first.click(force=True, timeout=2000)
+                        await locator.first.click(force=True, timeout=1500)
                         clicked = True
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[MARKET_SELECTION] Role-based click failed: {e}")
+
+                if not clicked:
+                    try:
+                        locator = page.get_by_text(team, exact=False)
+                        if await locator.count() > 0:
+                            await locator.first.click(force=True, timeout=1500)
+                            clicked = True
+                    except Exception as e:
+                        logger.debug(f"[MARKET_SELECTION] Text-based click failed: {e}")
 
                 if not clicked:
                     first_word = team.split()[0] if team else ""
@@ -462,13 +557,13 @@ class BetExecutor:
                         try:
                             locator = page.get_by_text(first_word, exact=False)
                             if await locator.count() > 0:
-                                await locator.first.click(force=True, timeout=2000)
+                                await locator.first.click(force=True, timeout=1500)
                                 clicked = True
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"[MARKET_SELECTION] First-word click failed: {e}")
 
                 if not clicked:
-                    logger.warning(f"[MARKET] Could not click selection for '{team}'")
+                    logger.warning(f"[MARKET_SELECTION] Could not click selection for '{team}'")
                     return False
 
             stake_input = await page.query_selector(
@@ -479,14 +574,12 @@ class BetExecutor:
             else:
                 await self.fast.fast_type(page, 'input', str(int(stake)), human_delay=False)
 
-            await asyncio.sleep(random.uniform(0.3, 0.6))
-
             clicked = await self.fast.fast_click(page, 'button:has-text("Accept Changes")', human_delay=False)
             if not clicked:
                 clicked = await self.fast.fast_click(page, 'button:has-text("Place Bet")', human_delay=False)
 
             if not clicked:
-                logger.error("[BET] Submit button not found")
+                logger.error("[CONFIRMATION_TIMEOUT] Submit button not found")
                 await self.alerter.notify_submission_slow(match_name, "Submit button not found", 0)
                 return False
 
@@ -511,7 +604,7 @@ class BetExecutor:
 
             except Exception as e:
                 elapsed = time.time() - start_time
-                logger.error(f"[BET] No confirmation after {elapsed:.1f}s: {e}")
+                logger.error(f"[CONFIRMATION_TIMEOUT] No confirmation after {elapsed:.1f}s: {e}")
                 await self.alerter.notify_submission_slow(match_name, "No confirmation", elapsed)
                 if elapsed > Config.SUBMISSION_TIMEOUT:
                     result = await self.handle_slow(match)
