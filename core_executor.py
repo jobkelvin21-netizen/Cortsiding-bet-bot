@@ -116,71 +116,58 @@ class BetExecutor:
 
         return h1, full
 
-    async def prepare_goal_market(self, page: Page, watch: Optional[MatchWatch] = None) -> str:
+    async def prepare_goal_market(
+        self,
+        page: Page,
+        watch: Optional[MatchWatch] = None
+    ) -> str:
         """
-        Prefer first-half next-goal market if present.
-        Else full-match next-goal market.
-        Numbers are discovered live from the page.
+        On the individual match page, select the All category because
+        the goal markets are contained inside All.
+        Then scan the rendered market text for goal markets.
         """
-        # Goals tab helps reveal markets
+
+        # Goal markets are contained in the "All" category.
         try:
-            tab = page.get_by_text("Goals", exact=True)
-            if await tab.count() > 0:
-                await tab.first.click(timeout=1500)
-                await asyncio.sleep(0.5)
+            all_tab = page.get_by_text("All", exact=True)
+
+            if await all_tab.count() > 0:
+                await all_tab.first.click(timeout=1500)
+                await asyncio.sleep(0.8)
+                logger.debug("[MARKET] All category selected")
+            else:
+                logger.debug("[MARKET] All category not found")
+
+        except Exception as e:
+            logger.debug(f"[MARKET] Could not select All category: {e}")
+
+        # Allow dynamically loaded markets to render.
+        try:
+            await page.wait_for_timeout(500)
         except Exception:
             pass
 
         h1_markets, full_markets = await self._list_goal_markets(page)
 
-        # Priority 1: any visible 1st-half * Goal market
+        # First-half goal markets
         for label in h1_markets:
             if await self._click_market_label(page, label):
                 if watch is not None:
                     watch.active_market = label
-                logger.info(f"[MARKET] Using H1 goal market: {label}")
+
+                logger.info(f"[MARKET] Found H1 goal market: {label}")
                 return label
 
-        # Priority 2: full-match * Goal / Next Goal
+        # Full-match goal markets
         for label in full_markets:
             if await self._click_market_label(page, label):
                 if watch is not None:
                     watch.active_market = label
-                logger.info(f"[MARKET] Using match goal market: {label}")
+
+                logger.info(f"[MARKET] Found match goal market: {label}")
                 return label
 
-        # Last resort: try clicking text patterns via locator without fixed numbers
-        for pattern in (
-            re.compile(r'1st\s*half.*goal', re.I),
-            re.compile(r'first\s*half.*goal', re.I),
-            re.compile(r'\d+(?:st|nd|rd|th)?\s*goal', re.I),
-            re.compile(r'next\s*goal', re.I),
-        ):
-            try:
-                # find elements whose text matches
-                handles = page.locator("div, span, h3, h4, button")
-                count = min(await handles.count(), 120)
-                for i in range(count):
-                    el = handles.nth(i)
-                    try:
-                        t = (await el.text_content(timeout=300) or "").strip()
-                    except Exception:
-                        continue
-                    if t and pattern.search(t) and len(t) < 60:
-                        if "over" in t.lower() or "under" in t.lower():
-                            continue
-                        try:
-                            await el.click(timeout=1000)
-                            if watch is not None:
-                                watch.active_market = t
-                            logger.info(f"[MARKET] Pattern click: {t}")
-                            return t
-                        except Exception:
-                            continue
-            except Exception:
-                continue
-
-        logger.debug("[MARKET] No goal market found on page yet")
+        logger.debug("[MARKET] No goal market found in All category yet")
         return ""
 
     async def _click_market_label(self, page: Page, label: str) -> bool:
