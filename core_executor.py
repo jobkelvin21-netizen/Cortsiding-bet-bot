@@ -37,6 +37,12 @@ class MatchWatch:
 
 
 class BetExecutor:
+    # --- FIX: real confirmed success text patterns ---
+    SUCCESS_PATTERNS = (
+        "Submission Successful",
+        "Bet Successful",
+    )
+
     def __init__(self, alerter: TelegramAlerter, account_manager,
                  sportybet_matches_ref: dict, learning=None):
         self.alerter = alerter
@@ -342,27 +348,53 @@ class BetExecutor:
         except Exception:
             return False
 
-    async def _click_confirm(self, page: Page) -> bool:
-        for name in ("Confirm", "Accept Changes", "Place Bet"):
-            btn = page.get_by_role("button", name=re.compile(name, re.I))
+    # --- FIX: split into two distinct steps instead of one ambiguous "confirm" ---
+    # Step 1: "Place Bet" opens the confirmation dialog but does NOT submit.
+    async def _click_place_bet(self, page: Page) -> bool:
+        btn = page.get_by_role("button", name=re.compile(r"^\s*Place\s*Bet\s*$", re.I))
+        try:
+            if await btn.count() > 0:
+                await btn.first.click(timeout=1200)
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(await self.fast.fast_click(
+                page, 'button:has-text("Place Bet")', timeout=800, human_delay=False
+            ))
+        except Exception:
+            return False
+
+    # Step 2: "Confirm" actually submits. Called separately, at goal-time,
+    # against an already-armed, already-open dialog.
+    async def _click_confirm_dialog(self, page: Page) -> bool:
+        btn = page.get_by_role("button", name=re.compile(r"^\s*Confirm\s*$", re.I))
+        try:
+            if await btn.count() > 0:
+                await btn.first.click(timeout=1200)
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(await self.fast.fast_click(
+                page, 'button:has-text("Confirm")', timeout=800, human_delay=False
+            ))
+        except Exception:
+            return False
+
+    # --- FIX: real success detection using confirmed text patterns ---
+    async def _wait_bet_success(self, page: Page, timeout_ms: int = 8000) -> bool:
+        for text in self.SUCCESS_PATTERNS:
             try:
-                if await btn.count() > 0:
-                    await btn.first.click(timeout=1200)
-                    return True
-            except Exception:
-                continue
-        for sel in (
-            'button:has-text("Confirm")',
-            'button:has-text("Accept Changes")',
-            'button:has-text("Place Bet")',
-        ):
-            try:
-                if await self.fast.fast_click(page, sel, timeout=700, human_delay=False):
-                    return True
+                await page.wait_for_selector(f"text={text}", timeout=timeout_ms // 2)
+                return True
             except Exception:
                 continue
         return False
 
+    # --- FIX: arm flow now stops at "Place Bet" — leaves Confirm dialog open,
+    # does NOT click Confirm. That final click happens separately, exactly
+    # when a real goal event fires, so goal-time work is just one click. ---
     async def _arm_side(self, page: Page, side_label: str, stake: float) -> bool:
         try:
             btn = page.get_by_role("button", name=side_label, exact=False)
@@ -372,7 +404,10 @@ class BetExecutor:
                 return False
             await btn.first.click(force=True, timeout=1200)
             await page.wait_for_timeout(250)
-            return await self._set_stake_input(page, stake)
+            if not await self._set_stake_input(page, stake):
+                return False
+            # Opens the Confirm dialog, does not submit
+            return await self._click_place_bet(page)
         except Exception:
             return False
 
@@ -423,6 +458,9 @@ class BetExecutor:
                         if old is None or abs(old - odds) >= 0.01:
                             changed = True
 
+                    # --- FIX: on odds change — Cancel -> update stake ->
+                    # Place Bet -> Confirm dialog open again (re-arm), do
+                    # NOT click Confirm here. ---
                     if changed and watch.armed_side:
                         await self._dismiss_slip(watch.page)
                         side = watch.armed_side
@@ -438,6 +476,8 @@ class BetExecutor:
         except asyncio.CancelledError:
             pass
 
+    # --- FIX: rebet now uses the real Place Bet -> Confirm two-step,
+    # and real success detection ---
     async def _try_rebet_once(self, page: Page) -> bool:
         rebet = page.get_by_role("button", name=re.compile(r"^\s*Rebet\s*$", re.I))
         if await rebet.count() == 0:
@@ -452,18 +492,15 @@ class BetExecutor:
             return False
         if not await self._set_stake_input(page, stake):
             return False
-        if not await self._click_confirm(page):
+        if not await self._click_place_bet(page):
             return False
-        try:
-            await page.wait_for_selector(
-                'text=Bet Successful, text=Rebet, text=Success, [class*="success"]',
-                timeout=getattr(Config, "CONFIRMATION_TIMEOUT_MS", 8000),
-            )
+        if not await self._click_confirm_dialog(page):
+            return False
+        if await self._wait_bet_success(page, timeout_ms=getattr(Config, "CONFIRMATION_TIMEOUT_MS", 8000)):
             if self.balance:
                 self.balance = max(0.0, self.balance - stake)
             return True
-        except Exception:
-            return False
+        return False
 
     async def _rebet_loop(self, page: Page, match_name: str, team: str, goal_num: int) -> int:
         extra = 0
@@ -609,25 +646,30 @@ class BetExecutor:
             await self.prepare_goal_market(page, self.get_watch(match.get("match_id")))
 
             side = "Home" if team == match.get("home_team") else "Away"
-            if not skip_market_selection:
+            watch = self.get_watch(match.get("match_id"))
+
+            # --- FIX: if this match is already pre-armed from the watch
+            # loop (dialog already open with correct stake), the goal-time
+            # work is JUST clicking Confirm — one action, not the whole
+            # arm sequence again. Only fall back to a fresh arm if it
+            # wasn't pre-armed for some reason. ---
+            already_armed = bool(watch and watch.armed_side == side)
+
+            if not skip_market_selection and not already_armed:
                 if not await self._arm_side(page, side, stake):
                     if not await self._arm_side(page, team, stake):
                         logger.warning(f"[SELECT] could not arm {team}")
                         return False
+                if watch:
+                    watch.armed_side = side
 
-            watch = self.get_watch(match.get("match_id"))
-            if watch:
-                watch.armed_side = side
-
-            if not await self._click_confirm(page):
-                await self.alerter.notify_submission_slow(match_name, "No confirm", 0)
+            # --- FIX: on the real Polymarket goal signal, only click
+            # Confirm — everything else was already done in advance. ---
+            if not await self._click_confirm_dialog(page):
+                await self.alerter.notify_submission_slow(match_name, "No confirm dialog open", 0)
                 return False
 
-            try:
-                await page.wait_for_selector(
-                    'text=Bet Successful, text=Rebet, text=Success, [class*="success"]',
-                    timeout=getattr(Config, "CONFIRMATION_TIMEOUT_MS", 8000),
-                )
+            if await self._wait_bet_success(page, timeout_ms=getattr(Config, "CONFIRMATION_TIMEOUT_MS", 8000)):
                 elapsed = time.time() - start
                 if elapsed > Config.SUBMISSION_TIMEOUT:
                     await self.alerter.notify_submission_slow(match_name, "slow", elapsed)
@@ -636,6 +678,7 @@ class BetExecutor:
 
                 self.consecutive_slow = 0
                 bet_id = f"{match.get('match_id')}_G{goal_num}_S{stack_num}_{uuid.uuid4().hex[:8]}"
+                # --- FIX: Telegram notification only fires AFTER confirmed success ---
                 await self.alerter.notify_bet_placed(
                     match_name, team, stake, odds, bet_id, stack_num, total_stack
                 )
@@ -644,9 +687,9 @@ class BetExecutor:
                 if self.balance:
                     self.balance = max(0.0, self.balance - stake)
                 return True
-            except Exception as e:
+            else:
                 elapsed = time.time() - start
-                await self.alerter.notify_submission_slow(match_name, str(e), elapsed)
+                await self.alerter.notify_submission_slow(match_name, "success text not found", elapsed)
                 if elapsed > Config.SUBMISSION_TIMEOUT:
                     result = await self.handle_slow(match)
                     return result in (BetResult.SUCCESS, BetResult.SWITCHED)
