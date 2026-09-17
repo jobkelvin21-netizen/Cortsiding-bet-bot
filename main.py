@@ -16,11 +16,6 @@ from utils.account_manager import AccountManager
 
 
 class ArbitrageBot:
-    """
-    Only opens pages for matches linked by MatchLinker.
-    Unlink closes page + stops watcher.
-    """
-
     def __init__(self):
         self.account_manager = AccountManager()
         self.alerter = TelegramAlerter()
@@ -64,7 +59,7 @@ class ArbitrageBot:
 
     async def start(self):
         await self.setup()
-        logger.info("BOT STARTING — linker pages only + Playwright markets/score/stake/rebet")
+        logger.info("BOT STARTING — linker pages + Playwright open/details fix")
 
         print("\nSPORTYBET LOGIN")
         phone = input("Phone Number: ")
@@ -127,7 +122,6 @@ class ArbitrageBot:
             self.linker._reconcile_once()
 
     async def on_new_link(self, sb_match: dict):
-        """Only open pages for matches the linker matched."""
         mid = sb_match.get("match_id")
         if not mid or mid in self.match_pages or mid in self._opening_pages:
             return
@@ -189,65 +183,115 @@ class ArbitrageBot:
 
     async def _open_match_page(self, sb_match: dict) -> bool:
         mid = sb_match.get("match_id")
-        home = sb_match.get("home_team", "")
-        away = sb_match.get("away_team", "")
+        home = sb_match.get("home_team", "") or ""
+        away = sb_match.get("away_team", "") or ""
+        home_short = home.split()[0] if home else ""
+        away_short = away.split()[0] if away else ""
 
         for attempt in range(1, 4):
             new_context = None
             try:
-                new_context = await self.browser.new_context(viewport={"width": 412, "height": 915})
+                new_context = await self.browser.new_context(
+                    viewport={"width": 412, "height": 915},
+                    locale="en-NG",
+                )
                 new_page = await new_context.new_page()
-                new_page.set_default_timeout(15000)
+                new_page.set_default_timeout(20000)
+
+                try:
+                    await new_page.bring_to_front()
+                except Exception:
+                    pass
+
+                logger.info(
+                    f"[PAGE_LOAD] attempt {attempt}/3 open live list for "
+                    f"{home} vs {away} id={mid}"
+                )
 
                 await new_page.goto(
                     "https://www.sportybet.com/ng/sport/football/live_list",
                     wait_until="domcontentloaded",
-                    timeout=30000,
+                    timeout=45000,
                 )
-                await asyncio.sleep(1.8)
+                await asyncio.sleep(2.5)
 
-                # Playwright search/click match row
-                clicked = False
-                for token_set in (
-                    [home, away],
-                    [home.split()[0] if home else "", away.split()[0] if away else ""],
+                for sel in (
+                    'button:has-text("Accept")',
+                    'button:has-text("OK")',
+                    'button:has-text("Got it")',
+                    'button:has-text("Close")',
                 ):
-                    h, a = token_set[0], token_set[1]
-                    if not h or not a:
-                        continue
-                    # row that contains both team tokens
-                    row = new_page.locator("div, a, li").filter(has_text=h).filter(has_text=a)
                     try:
-                        if await row.count() > 0:
-                            await row.first.click(timeout=2000)
+                        loc = new_page.locator(sel)
+                        if await loc.count() > 0:
+                            await loc.first.click(timeout=800)
+                    except Exception:
+                        pass
+
+                for _ in range(6):
+                    await new_page.mouse.wheel(0, 1200)
+                    await asyncio.sleep(0.45)
+                await new_page.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(0.4)
+
+                clicked = False
+                for h_tok, a_tok in ((home, away), (home_short, away_short)):
+                    if not h_tok or not a_tok:
+                        continue
+                    try:
+                        row = (
+                            new_page.locator("div, a, li, article")
+                            .filter(has_text=h_tok)
+                            .filter(has_text=a_tok)
+                        )
+                        n = await row.count()
+                        logger.debug(f"[PAGE_LOAD] rows matching '{h_tok}'+'{a_tok}': {n}")
+                        if n > 0:
+                            await row.first.click(timeout=3000)
                             clicked = True
                             break
+                    except Exception as e:
+                        logger.debug(f"[PAGE_LOAD] row click: {e}")
+
+                if not clicked and home_short:
+                    try:
+                        t = new_page.get_by_text(home_short, exact=False)
+                        if await t.count() > 0:
+                            await t.first.click(timeout=2500)
+                            clicked = True
                     except Exception:
-                        continue
+                        pass
 
                 if not clicked:
-                    # scroll and retry once
-                    await new_page.evaluate("window.scrollBy(0, 1500)")
-                    await asyncio.sleep(0.8)
-                    row = new_page.locator("div, a, li").filter(
-                        has_text=home.split()[0] if home else "___"
-                    ).filter(has_text=away.split()[0] if away else "___")
-                    if await row.count() > 0:
-                        await row.first.click(timeout=2000)
-                        clicked = True
-
-                if not clicked:
+                    try:
+                        sample = await new_page.locator("body").inner_text(timeout=3000)
+                        sample = (sample or "")[:500].replace("\n", " | ")
+                        logger.warning(f"[PAGE_LOAD] match not found on list. sample={sample}")
+                    except Exception:
+                        logger.warning("[PAGE_LOAD] match not found on list")
                     await new_context.close()
-                    await asyncio.sleep(0.8)
+                    await asyncio.sleep(1.2)
                     continue
 
+                logger.info("[PAGE_LOAD] clicked match row, waiting details…")
+                await asyncio.sleep(2.0)
+                try:
+                    await new_page.bring_to_front()
+                except Exception:
+                    pass
+
                 ready = await self.executor.wait_match_details_ready(
-                    new_page, home=home, away=away, timeout_s=12.0
+                    new_page, home=home, away=away, timeout_s=18.0
                 )
                 if not ready:
-                    logger.warning(f"[PAGE_LOAD] details not ready {attempt}/3")
+                    try:
+                        logger.warning(
+                            f"[PAGE_LOAD] details not ready {attempt}/3 url={new_page.url}"
+                        )
+                    except Exception:
+                        logger.warning(f"[PAGE_LOAD] details not ready {attempt}/3")
                     await new_context.close()
-                    await asyncio.sleep(0.8)
+                    await asyncio.sleep(1.2)
                     continue
 
                 await self.executor.open_all_tab(new_page)
@@ -258,18 +302,20 @@ class ArbitrageBot:
                 self.executor.start_watching(mid, new_page, home, away)
 
                 logger.success(
-                    f"[PAGE_READY] {home} vs {away} id={mid} market={market or 'pending'} "
+                    f"[PAGE_READY] {home} vs {away} id={mid} "
+                    f"market={market or 'pending'} url={new_page.url} "
                     f"open={len(self.match_pages)}"
                 )
                 return True
+
             except Exception as e:
-                logger.warning(f"[PAGE_LOAD] attempt {attempt}/3: {e}")
+                logger.warning(f"[PAGE_LOAD] attempt {attempt}/3 error: {e}")
                 if new_context is not None:
                     try:
                         await new_context.close()
                     except Exception:
                         pass
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(1.2)
 
         logger.error(f"[PAGE_LOAD_ERROR] {home} vs {away} id={mid}")
         return False
