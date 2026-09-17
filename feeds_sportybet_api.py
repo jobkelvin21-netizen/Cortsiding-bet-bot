@@ -28,9 +28,6 @@ class SportyBetFeed:
         self.last_error_at = None
 
         self.ready_event = asyncio.Event()
-
-        # NEW: prevents overlapping refreshes if goal-time refresh and
-        # scheduled poll happen to fire at the same moment
         self._refresh_lock = asyncio.Lock()
 
     def set_page(self, page):
@@ -55,6 +52,15 @@ class SportyBetFeed:
         return ""
 
     @staticmethod
+    def _full_event_id(event_id_raw, match_id: str) -> str:
+        text = str(event_id_raw or "").strip()
+        if text.startswith("sr:match:"):
+            return text
+        if match_id:
+            return f"sr:match:{match_id}"
+        return text
+
+    @staticmethod
     def _parse_score(value):
         if value is None:
             return 0, 0
@@ -65,6 +71,12 @@ class SportyBetFeed:
         if match:
             return int(match.group(1)), int(match.group(2))
         return 0, 0
+
+    @staticmethod
+    def _slug(text: str) -> str:
+        text = (text or "").strip()
+        text = re.sub(r"[^a-zA-Z0-9]+", "_", text)
+        return text.strip("_") or "Unknown"
 
     def _parse_matches(self, obj) -> dict:
         parsed = {}
@@ -82,7 +94,24 @@ class SportyBetFeed:
             if not isinstance(tournament, dict):
                 continue
 
-            tournament_name = str(tournament.get("name", "")).strip()
+            tournament_name = str(
+                tournament.get("name")
+                or tournament.get("tournamentName")
+                or ""
+            ).strip()
+
+            # Country / category for URL path segment
+            country = str(
+                tournament.get("categoryName")
+                or tournament.get("category")
+                or tournament.get("country")
+                or tournament.get("regionName")
+                or ""
+            ).strip()
+            if not country and tournament_name:
+                # fallback: first word of tournament (often wrong — prefer API fields)
+                country = "World"
+
             events = tournament.get("events", [])
             if not isinstance(events, list):
                 continue
@@ -96,11 +125,23 @@ class SportyBetFeed:
                 if not match_id:
                     continue
 
-                home = str(event.get("homeTeamName", "") or event.get("homeTeam", "")).strip()
-                away = str(event.get("awayTeamName", "") or event.get("awayTeam", "")).strip()
-
+                home = str(
+                    event.get("homeTeamName") or event.get("homeTeam") or ""
+                ).strip()
+                away = str(
+                    event.get("awayTeamName") or event.get("awayTeam") or ""
+                ).strip()
                 if not home or not away:
                     continue
+
+                # Event-level country override if present
+                ev_country = str(
+                    event.get("categoryName")
+                    or event.get("category")
+                    or event.get("country")
+                    or ""
+                ).strip()
+                use_country = ev_country or country or "World"
 
                 score_value = event.get("setScore") or event.get("gameScore") or ""
                 home_score, away_score = self._parse_score(score_value)
@@ -121,14 +162,28 @@ class SportyBetFeed:
                         played_seconds = 0.0
 
                 match_status = str(
-                    event.get("matchStatus") or event.get("period") or event.get("status") or ""
+                    event.get("matchStatus")
+                    or event.get("period")
+                    or event.get("status")
+                    or ""
                 ).strip()
+
+                full_eid = self._full_event_id(event_id_raw, match_id)
+                league_slug = self._slug(tournament_name or "League")
+                country_slug = self._slug(use_country)
+                teams_slug = f"{self._slug(home)}_vs_{self._slug(away)}"
+
+                # Canonical desktop live URL (matches your working browser URL)
+                live_path = f"{country_slug}/{league_slug}/{teams_slug}/{full_eid}"
+                live_url = (
+                    f"https://www.sportybet.com/ng/sport/football/live/{live_path}"
+                )
 
                 match = {
                     "source": "sportybet",
                     "match_id": match_id,
                     "sportradar_id": match_id,
-                    "event_id": event_id_raw,
+                    "event_id": full_eid,
                     "home_team": home,
                     "away_team": away,
                     "home_score": home_score,
@@ -137,6 +192,9 @@ class SportyBetFeed:
                     "match_status": match_status,
                     "played_seconds": played_seconds,
                     "tournament_name": tournament_name,
+                    "league": tournament_name,
+                    "country": use_country,
+                    "live_url": live_url,
                     "timestamp": datetime.now(),
                 }
 
@@ -151,7 +209,9 @@ class SportyBetFeed:
             )
 
             if response.status_code != 200:
-                logger.warning(f"SportyBet factsCenter returned HTTP {response.status_code}")
+                logger.warning(
+                    f"SportyBet factsCenter returned HTTP {response.status_code}"
+                )
                 self.last_error_at = datetime.now()
                 return {}
 
@@ -171,16 +231,8 @@ class SportyBetFeed:
             logger.error(f"SportyBet factsCenter request failed: {e}")
             return {}
 
-    # =========================================================================
-    # NEW: on-demand refresh, called right when a goal is detected — pulls
-    # the freshest possible SportyBet snapshot instead of waiting up to
-    # `poll_interval` seconds for the next scheduled cycle.
-    # =========================================================================
-
     async def force_refresh(self) -> bool:
         if self._refresh_lock.locked():
-            # A refresh is already in flight — just wait for it instead of
-            # firing a duplicate request
             async with self._refresh_lock:
                 return True
 
@@ -199,7 +251,9 @@ class SportyBetFeed:
         self.callback = callback
         self.running = True
 
-        logger.info(f"Starting SportyBet REST polling feed (every {self.poll_interval}s)...")
+        logger.info(
+            f"Starting SportyBet REST polling feed (every {self.poll_interval}s)..."
+        )
 
         consecutive_failures = 0
         first_success = True
@@ -218,34 +272,42 @@ class SportyBetFeed:
                 if not new_matches:
                     consecutive_failures += 1
                     if consecutive_failures == 3:
-                        logger.warning("SportyBet factsCenter returned no matches for 3 consecutive polls.")
+                        logger.warning(
+                            "SportyBet factsCenter returned no matches for 3 consecutive polls."
+                        )
                         if self.alerter:
                             try:
                                 await self.alerter.send(
-                                    "⚠️ SportyBet factsCenter has returned no live match data for 3 consecutive polls."
+                                    "⚠️ SportyBet factsCenter has returned no live match data "
+                                    "for 3 consecutive polls."
                                 )
                             except Exception:
                                 pass
                 else:
                     consecutive_failures = 0
                     if first_success:
-                        logger.success(f"SportyBet: {len(new_matches)} live matches loaded.")
+                        logger.success(
+                            f"SportyBet: {len(new_matches)} live matches loaded."
+                        )
                         first_success = False
                         if self.alerter:
                             try:
                                 await self.alerter.send(
-                                    f"✅ <b>SportyBet feed active</b> — {len(new_matches)} live matches loaded."
+                                    f"✅ <b>SportyBet feed active</b> — "
+                                    f"{len(new_matches)} live matches loaded."
                                 )
                             except Exception:
                                 pass
 
                 if self.callback:
                     try:
-                        await self.callback({
-                            "type": "snapshot",
-                            "count": len(self.matches),
-                            "matches": self.matches,
-                        })
+                        await self.callback(
+                            {
+                                "type": "snapshot",
+                                "count": len(self.matches),
+                                "matches": self.matches,
+                            }
+                        )
                     except Exception as e:
                         logger.debug(f"SportyBet callback error: {e}")
 
