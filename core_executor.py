@@ -34,14 +34,21 @@ class MatchWatch:
         self.running = False
         self.last_refresh_at: Optional[float] = None
         self.last_odds_fingerprint: str = ""
+        # NEW: throttles for the two bugs
+        self.last_market_check_at: float = 0.0
+        self.last_no_market_log_at: float = 0.0
 
 
 class BetExecutor:
-    # --- FIX: real confirmed success text patterns ---
     SUCCESS_PATTERNS = (
         "Submission Successful",
         "Bet Successful",
     )
+
+    # NEW: once a market is locked in, only re-verify it's still present
+    # (cheap, no click) this often — not re-click every 1.5s
+    MARKET_REVALIDATE_INTERVAL = 12.0
+    NO_MARKET_LOG_INTERVAL = 10.0
 
     def __init__(self, alerter: TelegramAlerter, account_manager,
                  sportybet_matches_ref: dict, learning=None):
@@ -68,7 +75,6 @@ class BetExecutor:
         self.max_rebet = int(getattr(Config, "MAX_STACK_PER_GOAL", 3))
         self.rebet_delay = float(getattr(Config, "MIN_STACK_DELAY", 0.8))
 
-    # ----- stake helper -----
     def calc_stake(self, odds: float) -> float:
         if odds <= 1.0 or not self.balance or self.balance <= 0:
             return 0.0
@@ -123,9 +129,7 @@ class BetExecutor:
             await asyncio.sleep(0.5)
 
         try:
-            logger.warning(
-                f"[PAGE_READY_CHECK] timeout url={page.url!r}"
-            )
+            logger.warning(f"[PAGE_READY_CHECK] timeout url={page.url!r}")
         except Exception:
             pass
         return False
@@ -148,9 +152,38 @@ class BetExecutor:
                 continue
         return False
 
+    # ------------------------------------------------------------------
+    # FIXED: prepare_goal_market no longer re-clicks an already-locked-in
+    # market every single call. Once found, it's cached on the watch and
+    # only re-verified (cheap count check, NO click) every
+    # MARKET_REVALIDATE_INTERVAL seconds — this is what was toggling the
+    # accordion open/closed every 1.5s and causing the flickering
+    # found/not-found log spam in your screenshots.
+    # ------------------------------------------------------------------
+
     async def prepare_goal_market(self, page: Page, watch: Optional[MatchWatch] = None) -> str:
         if await self._safe_closed(page):
             return ""
+
+        now = time.time()
+
+        # Already locked in — just confirm it's still there without clicking
+        if watch is not None and watch.active_market:
+            if (now - watch.last_market_check_at) < self.MARKET_REVALIDATE_INTERVAL:
+                return watch.active_market
+
+            watch.last_market_check_at = now
+            try:
+                still_there = page.get_by_text(watch.active_market, exact=False)
+                if await still_there.count() > 0:
+                    return watch.active_market
+                # It genuinely disappeared (e.g. market suspended/relocked
+                # after a goal) — clear cache and fall through to rescan
+                logger.debug(f"[MARKET] Cached market '{watch.active_market}' vanished — rescanning")
+                watch.active_market = ""
+            except Exception:
+                return watch.active_market  # be conservative on a check error
+
         await self.wait_match_details_ready(page, timeout_s=5.0)
         await self.open_all_tab(page)
 
@@ -176,6 +209,7 @@ class BetExecutor:
                         await loc.nth(i).click(timeout=1200)
                         if watch is not None:
                             watch.active_market = label
+                            watch.last_market_check_at = time.time()
                         logger.info(f"[MARKET] {label}")
                         return label
                 except Exception:
@@ -199,8 +233,23 @@ class BetExecutor:
         except Exception:
             pass
 
-        logger.debug("[MARKET] No goal market found yet")
+        # NEW: throttled logging instead of firing every single call
+        if watch is not None:
+            if (now - watch.last_no_market_log_at) > self.NO_MARKET_LOG_INTERVAL:
+                logger.debug("[MARKET] No goal market found yet")
+                watch.last_no_market_log_at = now
+        else:
+            logger.debug("[MARKET] No goal market found yet")
+
         return ""
+
+    # ------------------------------------------------------------------
+    # FIXED: score reading — the unrestricted "grab any two 1-2 digit
+    # numbers on the page" fallback is what produced the bogus "73-97"
+    # score in your screenshot. That fallback is now removed entirely;
+    # if the dedicated score selectors don't find anything, we correctly
+    # report "unavailable" (safe: treated as UNAVAILABLE, not guessed).
+    # ------------------------------------------------------------------
 
     async def _read_score_from_page(self, page: Page) -> Optional[Tuple[int, int]]:
         for sel in (
@@ -216,23 +265,14 @@ class BetExecutor:
                 text = (await loc.first.text_content(timeout=700)) or ""
                 m = re.search(r"(\d+)\s*[-:]\s*(\d+)", text)
                 if m:
-                    return int(m.group(1)), int(m.group(2))
+                    h, a = int(m.group(1)), int(m.group(2))
+                    if 0 <= h <= 20 and 0 <= a <= 20:
+                        return h, a
             except Exception:
                 continue
-        try:
-            nums = page.locator("div, span").filter(has_text=re.compile(r"^\d{1,2}$"))
-            count = min(await nums.count(), 12)
-            values: List[int] = []
-            for i in range(count):
-                t = ((await nums.nth(i).text_content(timeout=250)) or "").strip()
-                if re.fullmatch(r"\d{1,2}", t):
-                    values.append(int(t))
-                if len(values) >= 2:
-                    break
-            if len(values) >= 2 and values[0] <= 20 and values[1] <= 20:
-                return values[0], values[1]
-        except Exception:
-            pass
+        # REMOVED: the unscoped "any two 1-2 digit numbers on the page"
+        # fallback — it was reading arbitrary unrelated numbers (odds,
+        # minutes, market IDs) and reporting them as a real score.
         return None
 
     async def _score_still_matches(
@@ -240,13 +280,13 @@ class BetExecutor:
     ) -> bool:
         current = await self._read_score_from_page(page)
         if current is None:
-            logger.warning(f"[SAFETY] {match_name} score unavailable")
+            logger.warning(f"[SAFETY] {match_name} score unavailable — aborting to be safe")
             return False
         ch, ca = current
         if ch + ca < expected_home + expected_away:
             logger.info(f"[SAFETY] {match_name} page {ch}-{ca} lag — allow")
             return True
-        logger.warning(f"SAFETY ABORT {match_name} page {ch}-{ca}")
+        logger.warning(f"SAFETY ABORT {match_name} page {ch}-{ca} vs expected {expected_home}-{expected_away}")
         return False
 
     async def _verify_match_identity(self, page: Page, expected_home: str, expected_away: str) -> bool:
@@ -348,8 +388,6 @@ class BetExecutor:
         except Exception:
             return False
 
-    # --- FIX: split into two distinct steps instead of one ambiguous "confirm" ---
-    # Step 1: "Place Bet" opens the confirmation dialog but does NOT submit.
     async def _click_place_bet(self, page: Page) -> bool:
         btn = page.get_by_role("button", name=re.compile(r"^\s*Place\s*Bet\s*$", re.I))
         try:
@@ -365,8 +403,6 @@ class BetExecutor:
         except Exception:
             return False
 
-    # Step 2: "Confirm" actually submits. Called separately, at goal-time,
-    # against an already-armed, already-open dialog.
     async def _click_confirm_dialog(self, page: Page) -> bool:
         btn = page.get_by_role("button", name=re.compile(r"^\s*Confirm\s*$", re.I))
         try:
@@ -382,7 +418,6 @@ class BetExecutor:
         except Exception:
             return False
 
-    # --- FIX: real success detection using confirmed text patterns ---
     async def _wait_bet_success(self, page: Page, timeout_ms: int = 8000) -> bool:
         for text in self.SUCCESS_PATTERNS:
             try:
@@ -392,9 +427,6 @@ class BetExecutor:
                 continue
         return False
 
-    # --- FIX: arm flow now stops at "Place Bet" — leaves Confirm dialog open,
-    # does NOT click Confirm. That final click happens separately, exactly
-    # when a real goal event fires, so goal-time work is just one click. ---
     async def _arm_side(self, page: Page, side_label: str, stake: float) -> bool:
         try:
             btn = page.get_by_role("button", name=side_label, exact=False)
@@ -406,7 +438,6 @@ class BetExecutor:
             await page.wait_for_timeout(250)
             if not await self._set_stake_input(page, stake):
                 return False
-            # Opens the Confirm dialog, does not submit
             return await self._click_place_bet(page)
         except Exception:
             return False
@@ -458,9 +489,6 @@ class BetExecutor:
                         if old is None or abs(old - odds) >= 0.01:
                             changed = True
 
-                    # --- FIX: on odds change — Cancel -> update stake ->
-                    # Place Bet -> Confirm dialog open again (re-arm), do
-                    # NOT click Confirm here. ---
                     if changed and watch.armed_side:
                         await self._dismiss_slip(watch.page)
                         side = watch.armed_side
@@ -476,8 +504,6 @@ class BetExecutor:
         except asyncio.CancelledError:
             pass
 
-    # --- FIX: rebet now uses the real Place Bet -> Confirm two-step,
-    # and real success detection ---
     async def _try_rebet_once(self, page: Page) -> bool:
         rebet = page.get_by_role("button", name=re.compile(r"^\s*Rebet\s*$", re.I))
         if await rebet.count() == 0:
@@ -648,11 +674,6 @@ class BetExecutor:
             side = "Home" if team == match.get("home_team") else "Away"
             watch = self.get_watch(match.get("match_id"))
 
-            # --- FIX: if this match is already pre-armed from the watch
-            # loop (dialog already open with correct stake), the goal-time
-            # work is JUST clicking Confirm — one action, not the whole
-            # arm sequence again. Only fall back to a fresh arm if it
-            # wasn't pre-armed for some reason. ---
             already_armed = bool(watch and watch.armed_side == side)
 
             if not skip_market_selection and not already_armed:
@@ -663,8 +684,6 @@ class BetExecutor:
                 if watch:
                     watch.armed_side = side
 
-            # --- FIX: on the real Polymarket goal signal, only click
-            # Confirm — everything else was already done in advance. ---
             if not await self._click_confirm_dialog(page):
                 await self.alerter.notify_submission_slow(match_name, "No confirm dialog open", 0)
                 return False
@@ -678,7 +697,6 @@ class BetExecutor:
 
                 self.consecutive_slow = 0
                 bet_id = f"{match.get('match_id')}_G{goal_num}_S{stack_num}_{uuid.uuid4().hex[:8]}"
-                # --- FIX: Telegram notification only fires AFTER confirmed success ---
                 await self.alerter.notify_bet_placed(
                     match_name, team, stake, odds, bet_id, stack_num, total_stack
                 )
