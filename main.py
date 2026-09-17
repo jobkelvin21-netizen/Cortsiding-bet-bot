@@ -1,4 +1,5 @@
 import asyncio
+import re
 import sys
 import time
 import gc
@@ -181,117 +182,119 @@ class ArbitrageBot:
             except Exception as e:
                 logger.debug(f"[CLEANUP] {e}")
 
+    # =========================================================================
+    # NEW: URL-building helpers (from the fix) — construct direct match URLs
+    # instead of relying only on click-through navigation from the live list
+    # =========================================================================
+
+    def _build_match_urls(self, sb_match: dict) -> list:
+        live = (sb_match.get("live_url") or "").strip()
+        urls = []
+        if live:
+            urls.append(live)
+            if "/ng/sport/" in live:
+                urls.append(live.replace("/ng/sport/", "/ng/m/sport/", 1))
+        mid = sb_match.get("match_id") or sb_match.get("event_id") or ""
+        home = sb_match.get("home_team") or "Home"
+        away = sb_match.get("away_team") or "Away"
+        country = sb_match.get("country") or "World"
+        league = sb_match.get("league") or sb_match.get("tournament_name") or "League"
+        eid = str(sb_match.get("event_id") or mid)
+        if not eid.startswith("sr:match:"):
+            eid = f"sr:match:{self._extract_digits(eid)}"
+        path = (
+            f"{self._slug(country)}/{self._slug(league)}/"
+            f"{self._slug(home)}_vs_{self._slug(away)}/{eid}"
+        )
+        desktop = f"https://www.sportybet.com/ng/sport/football/live/{path}"
+        mobile = (
+            f"https://www.sportybet.com/ng/m/sport/football/live/{path}"
+            f"?liveChannel=1&navigatedFrom=live"
+        )
+        for u in (desktop, mobile):
+            if u not in urls:
+                urls.append(u)
+        return urls
+
+    @staticmethod
+    def _extract_digits(text: str) -> str:
+        m = re.search(r"(\d+)", str(text or ""))
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _slug(text: str) -> str:
+        text = (text or "").strip()
+        text = re.sub(r"[^a-zA-Z0-9]+", "_", text)
+        return text.strip("_") or "Unknown"
+
+    # =========================================================================
+    # REPLACED: _open_match_page now tries direct constructed URLs first
+    # (from _build_match_urls), falling back through each candidate URL,
+    # instead of only click-through navigation from the live list.
+    # =========================================================================
+
     async def _open_match_page(self, sb_match: dict) -> bool:
         mid = sb_match.get("match_id")
-        home = sb_match.get("home_team", "") or ""
-        away = sb_match.get("away_team", "") or ""
-        home_short = home.split()[0] if home else ""
-        away_short = away.split()[0] if away else ""
+
+        feed = {}
+        try:
+            feed = self.sportybet.matches.get(mid) or {}
+        except Exception:
+            pass
+        merged = dict(feed)
+        merged.update({k: v for k, v in (sb_match or {}).items() if v})
+        home = (merged.get("home_team") or "").strip()
+        away = (merged.get("away_team") or "").strip()
+        urls = self._build_match_urls(merged)
 
         for attempt in range(1, 4):
             new_context = None
             try:
                 new_context = await self.browser.new_context(
-                    viewport={"width": 412, "height": 915},
+                    viewport={"width": 1365, "height": 900},
                     locale="en-NG",
                 )
                 new_page = await new_context.new_page()
                 new_page.set_default_timeout(20000)
-
                 try:
                     await new_page.bring_to_front()
                 except Exception:
                     pass
 
-                logger.info(
-                    f"[PAGE_LOAD] attempt {attempt}/3 open live list for "
-                    f"{home} vs {away} id={mid}"
-                )
+                opened = False
+                for url in urls:
+                    logger.info(
+                        f"[PAGE_LOAD] attempt {attempt}/3 {home} vs {away} → {url[:130]}"
+                    )
+                    await new_page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(2.0)
 
-                await new_page.goto(
-                    "https://www.sportybet.com/ng/sport/football/live_list",
-                    wait_until="domcontentloaded",
-                    timeout=45000,
-                )
-                await asyncio.sleep(2.5)
+                    for sel in (
+                        'button:has-text("Accept")',
+                        'button:has-text("OK")',
+                        'button:has-text("Got it")',
+                        'button:has-text("Close")',
+                    ):
+                        try:
+                            loc = new_page.locator(sel)
+                            if await loc.count() > 0:
+                                await loc.first.click(timeout=600)
+                        except Exception:
+                            pass
 
-                for sel in (
-                    'button:has-text("Accept")',
-                    'button:has-text("OK")',
-                    'button:has-text("Got it")',
-                    'button:has-text("Close")',
-                ):
-                    try:
-                        loc = new_page.locator(sel)
-                        if await loc.count() > 0:
-                            await loc.first.click(timeout=800)
-                    except Exception:
-                        pass
+                    ready = await self.executor.wait_match_details_ready(
+                        new_page, home=home, away=away, timeout_s=14.0
+                    )
+                    if ready:
+                        opened = True
+                        break
 
-                for _ in range(6):
-                    await new_page.mouse.wheel(0, 1200)
-                    await asyncio.sleep(0.45)
-                await new_page.evaluate("window.scrollTo(0, 0)")
-                await asyncio.sleep(0.4)
-
-                clicked = False
-                for h_tok, a_tok in ((home, away), (home_short, away_short)):
-                    if not h_tok or not a_tok:
-                        continue
-                    try:
-                        row = (
-                            new_page.locator("div, a, li, article")
-                            .filter(has_text=h_tok)
-                            .filter(has_text=a_tok)
-                        )
-                        n = await row.count()
-                        logger.debug(f"[PAGE_LOAD] rows matching '{h_tok}'+'{a_tok}': {n}")
-                        if n > 0:
-                            await row.first.click(timeout=3000)
-                            clicked = True
-                            break
-                    except Exception as e:
-                        logger.debug(f"[PAGE_LOAD] row click: {e}")
-
-                if not clicked and home_short:
-                    try:
-                        t = new_page.get_by_text(home_short, exact=False)
-                        if await t.count() > 0:
-                            await t.first.click(timeout=2500)
-                            clicked = True
-                    except Exception:
-                        pass
-
-                if not clicked:
-                    try:
-                        sample = await new_page.locator("body").inner_text(timeout=3000)
-                        sample = (sample or "")[:500].replace("\n", " | ")
-                        logger.warning(f"[PAGE_LOAD] match not found on list. sample={sample}")
-                    except Exception:
-                        logger.warning("[PAGE_LOAD] match not found on list")
+                if not opened:
+                    logger.warning(
+                        f"[PAGE_LOAD] details not ready {attempt}/3 url={new_page.url}"
+                    )
                     await new_context.close()
-                    await asyncio.sleep(1.2)
-                    continue
-
-                logger.info("[PAGE_LOAD] clicked match row, waiting details…")
-                await asyncio.sleep(2.0)
-                try:
-                    await new_page.bring_to_front()
-                except Exception:
-                    pass
-
-                ready = await self.executor.wait_match_details_ready(
-                    new_page, home=home, away=away, timeout_s=18.0
-                )
-                if not ready:
-                    try:
-                        logger.warning(
-                            f"[PAGE_LOAD] details not ready {attempt}/3 url={new_page.url}"
-                        )
-                    except Exception:
-                        logger.warning(f"[PAGE_LOAD] details not ready {attempt}/3")
-                    await new_context.close()
-                    await asyncio.sleep(1.2)
+                    await asyncio.sleep(1.0)
                     continue
 
                 await self.executor.open_all_tab(new_page)
@@ -303,8 +306,7 @@ class ArbitrageBot:
 
                 logger.success(
                     f"[PAGE_READY] {home} vs {away} id={mid} "
-                    f"market={market or 'pending'} url={new_page.url} "
-                    f"open={len(self.match_pages)}"
+                    f"market={market or 'pending'} url={new_page.url}"
                 )
                 return True
 
@@ -315,7 +317,7 @@ class ArbitrageBot:
                         await new_context.close()
                     except Exception:
                         pass
-                await asyncio.sleep(1.2)
+                await asyncio.sleep(1.0)
 
         logger.error(f"[PAGE_LOAD_ERROR] {home} vs {away} id={mid}")
         return False
