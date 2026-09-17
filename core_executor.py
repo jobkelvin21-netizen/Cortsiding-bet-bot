@@ -37,18 +37,6 @@ class MatchWatch:
 
 
 class BetExecutor:
-    """
-    Stake helper is calc_stake() in this file.
-
-    Rules:
-    - Playwright locators for tabs, markets, score, confirm, rebet
-    - Prefer 1st-half goal markets, else full-match goal markets
-    - Numbers discovered live (1st/2nd/3rd Goal...) — not hardcoded
-    - Balance read before every bet
-    - Hard-cap profit; if balance too low → all-in (compound)
-    - Success screen Rebet = same market again
-    """
-
     def __init__(self, alerter: TelegramAlerter, account_manager,
                  sportybet_matches_ref: dict, learning=None):
         self.alerter = alerter
@@ -74,25 +62,14 @@ class BetExecutor:
         self.max_rebet = int(getattr(Config, "MAX_STACK_PER_GOAL", 3))
         self.rebet_delay = float(getattr(Config, "MIN_STACK_DELAY", 0.8))
 
-    # =========================================================================
-    # STAKE HELPER (this is the stake file logic)
-    # =========================================================================
-
+    # ----- stake helper -----
     def calc_stake(self, odds: float) -> float:
-        """
-        Hard-cap profit from config.
-        If balance cannot fund that stake → use full balance (compound growth).
-        """
         if odds <= 1.0 or not self.balance or self.balance <= 0:
             return 0.0
         target = float(Config.MAX_PROFIT_PER_BET) / (odds - 1.0)
         if self.balance < target:
             return float(self.balance)
         return float(target)
-
-    # =========================================================================
-    # PLAYWRIGHT HELPERS
-    # =========================================================================
 
     async def _safe_closed(self, page: Page) -> bool:
         try:
@@ -101,19 +78,27 @@ class BetExecutor:
             return True
 
     async def wait_match_details_ready(
-        self, page: Page, home: str = "", away: str = "", timeout_s: float = 12.0
+        self, page: Page, home: str = "", away: str = "", timeout_s: float = 18.0
     ) -> bool:
         if await self._safe_closed(page):
             return False
+
         deadline = time.time() + timeout_s
-        home_tok = home.split()[0] if home else ""
-        away_tok = away.split()[0] if away else ""
+        home_tok = (home.split()[0] if home else "").strip()
+        away_tok = (away.split()[0] if away else "").strip()
+
         while time.time() < deadline:
             try:
-                # Tabs visible?
-                all_tab = page.get_by_text(re.compile(r'^\s*All\s*$'))
-                goals_tab = page.get_by_text(re.compile(r'^\s*Goals\s*$'))
-                has_tabs = (await all_tab.count()) > 0 or (await goals_tab.count()) > 0
+                url = (page.url or "").lower()
+
+                all_tab = page.get_by_text(re.compile(r"^\s*All\s*$"))
+                goals_tab = page.get_by_text(re.compile(r"^\s*Goals\s*$"))
+                main_tab = page.get_by_text(re.compile(r"^\s*Main\s*$"))
+                has_tabs = (
+                    (await all_tab.count()) > 0
+                    or (await goals_tab.count()) > 0
+                    or (await main_tab.count()) > 0
+                )
 
                 has_teams = True
                 if home_tok and away_tok:
@@ -121,20 +106,31 @@ class BetExecutor:
                     a = page.get_by_text(away_tok, exact=False)
                     has_teams = (await h.count()) > 0 and (await a.count()) > 0
 
-                if has_tabs and has_teams:
+                on_list_only = ("live_list" in url) and not has_tabs
+
+                if has_tabs and has_teams and not on_list_only:
                     return True
-            except Exception:
-                pass
-            await asyncio.sleep(0.4)
+                if has_tabs and "live_list" not in url:
+                    return True
+            except Exception as e:
+                logger.debug(f"[PAGE_READY_CHECK] {e}")
+            await asyncio.sleep(0.5)
+
+        try:
+            logger.warning(
+                f"[PAGE_READY_CHECK] timeout url={page.url!r}"
+            )
+        except Exception:
+            pass
         return False
 
     async def open_all_tab(self, page: Page) -> bool:
         if await self._safe_closed(page):
             return False
         candidates = [
-            page.get_by_role("tab", name=re.compile(r'^\s*All\s*$', re.I)),
-            page.get_by_text(re.compile(r'^\s*All\s*$')),
-            page.locator('[role="tab"]').filter(has_text=re.compile(r'^\s*All\s*$', re.I)),
+            page.get_by_role("tab", name=re.compile(r"^\s*All\s*$", re.I)),
+            page.get_by_text(re.compile(r"^\s*All\s*$")),
+            page.locator('[role="tab"]').filter(has_text=re.compile(r"^\s*All\s*$", re.I)),
         ]
         for loc in candidates:
             try:
@@ -147,23 +143,16 @@ class BetExecutor:
         return False
 
     async def prepare_goal_market(self, page: Page, watch: Optional[MatchWatch] = None) -> str:
-        """
-        Individual match page → All tab → dynamic goal market.
-        Prefer 1st-half * Goal, else full-match * Goal / Next Goal.
-        """
         if await self._safe_closed(page):
             return ""
-
         await self.wait_match_details_ready(page, timeout_s=5.0)
         await self.open_all_tab(page)
 
         patterns = [
-            # H1 first
-            re.compile(r'1st\s*Half\s*[-–]?\s*\d*(?:st|nd|rd|th)?\s*Goal', re.I),
-            re.compile(r'First\s*Half\s*[-–]?\s*\d*(?:st|nd|rd|th)?\s*Goal', re.I),
-            # full match next
-            re.compile(r'\d+(?:st|nd|rd|th)?\s*Goal', re.I),
-            re.compile(r'Next\s*Goal', re.I),
+            re.compile(r"1st\s*Half\s*[-–]?\s*\d*(?:st|nd|rd|th)?\s*Goal", re.I),
+            re.compile(r"First\s*Half\s*[-–]?\s*\d*(?:st|nd|rd|th)?\s*Goal", re.I),
+            re.compile(r"\d+(?:st|nd|rd|th)?\s*Goal", re.I),
+            re.compile(r"Next\s*Goal", re.I),
         ]
 
         async def try_patterns() -> str:
@@ -191,11 +180,10 @@ class BetExecutor:
         if found:
             return found
 
-        # Goals tab fallback
         try:
-            goals = page.get_by_role("tab", name=re.compile(r'^\s*Goals\s*$', re.I))
+            goals = page.get_by_role("tab", name=re.compile(r"^\s*Goals\s*$", re.I))
             if await goals.count() == 0:
-                goals = page.get_by_text(re.compile(r'^\s*Goals\s*$', re.I))
+                goals = page.get_by_text(re.compile(r"^\s*Goals\s*$", re.I))
             if await goals.count() > 0:
                 await goals.first.click(timeout=1200)
                 await page.wait_for_timeout(500)
@@ -209,7 +197,6 @@ class BetExecutor:
         return ""
 
     async def _read_score_from_page(self, page: Page) -> Optional[Tuple[int, int]]:
-        """Playwright locator score read (no whole-page evaluate scrape)."""
         for sel in (
             '[data-testid="match-score"]',
             '[class*="match-score"]',
@@ -221,13 +208,11 @@ class BetExecutor:
                 if await loc.count() == 0:
                     continue
                 text = (await loc.first.text_content(timeout=700)) or ""
-                m = re.search(r'(\d+)\s*[-:]\s*(\d+)', text)
+                m = re.search(r"(\d+)\s*[-:]\s*(\d+)", text)
                 if m:
                     return int(m.group(1)), int(m.group(2))
             except Exception:
                 continue
-
-        # Green score boxes: small numeric cells
         try:
             nums = page.locator("div, span").filter(has_text=re.compile(r"^\d{1,2}$"))
             count = min(await nums.count(), 12)
@@ -273,19 +258,18 @@ class BetExecutor:
     async def _read_odds_from_click(self, page: Page, selection_text: str) -> float:
         if not selection_text:
             return 0.0
-        candidates = [
+        for loc in (
             page.get_by_role("button", name=selection_text, exact=False),
             page.locator('[class*="selection"]').filter(has_text=selection_text),
             page.get_by_text(selection_text, exact=False),
-        ]
-        for loc in candidates:
+        ):
             try:
                 if await loc.count() == 0:
                     continue
                 txt = await loc.first.text_content(timeout=700)
                 if not txt:
                     continue
-                m = re.search(r'(\d+\.\d{1,3})', txt.replace(',', '.'))
+                m = re.search(r"(\d+\.\d{1,3})", txt.replace(",", "."))
                 if m:
                     odds = float(m.group(1))
                     if 1.01 <= odds <= 500:
@@ -296,8 +280,8 @@ class BetExecutor:
 
     async def fetch_balance(self, page: Page) -> Optional[float]:
         selectors = [
-            '.user-balance',
-            '.account-balance',
+            ".user-balance",
+            ".account-balance",
             '[data-testid="balance"]',
             '[class*="balance"]',
             'span:has-text("₦")',
@@ -311,8 +295,8 @@ class BetExecutor:
                 if not text:
                     continue
                 m = re.search(
-                    r'([\d.]+)',
-                    text.replace('₦', '').replace('NGN', '').replace(',', ''),
+                    r"([\d.]+)",
+                    text.replace("₦", "").replace("NGN", "").replace(",", ""),
                 )
                 if m:
                     bal = float(m.group(1))
@@ -320,7 +304,7 @@ class BetExecutor:
                     if self.current_account:
                         try:
                             self.account_manager.update_balance(
-                                self.current_account['username'], bal
+                                self.current_account["username"], bal
                             )
                         except Exception:
                             pass
@@ -354,7 +338,7 @@ class BetExecutor:
         except Exception:
             pass
         try:
-            return bool(await self.fast.fast_type(page, 'input', str(int(stake)), human_delay=False))
+            return bool(await self.fast.fast_type(page, "input", str(int(stake)), human_delay=False))
         except Exception:
             return False
 
@@ -367,7 +351,6 @@ class BetExecutor:
                     return True
             except Exception:
                 continue
-        # fallback css
         for sel in (
             'button:has-text("Confirm")',
             'button:has-text("Accept Changes")',
@@ -392,10 +375,6 @@ class BetExecutor:
             return await self._set_stake_input(page, stake)
         except Exception:
             return False
-
-    # =========================================================================
-    # WATCH
-    # =========================================================================
 
     def start_watching(self, match_id: str, page: Page, home_team: str, away_team: str):
         if match_id in self.watches:
@@ -425,15 +404,12 @@ class BetExecutor:
                 try:
                     if await self._safe_closed(watch.page):
                         break
-
                     await self.prepare_goal_market(watch.page, watch)
-
                     if watch.last_refresh_at is None or (time.time() - watch.last_refresh_at) > 8:
                         await self.fetch_balance(watch.page)
 
                     home_odds = await self._read_odds_from_click(watch.page, "Home")
                     away_odds = await self._read_odds_from_click(watch.page, "Away")
-
                     changed = False
                     for team, odds in (
                         (watch.home_team, home_odds),
@@ -454,40 +430,22 @@ class BetExecutor:
                         stake = watch.stake_by_team.get(team, 0.0)
                         if stake > 0:
                             await self._arm_side(watch.page, side, stake)
-                            logger.debug(f"[WATCH] odds moved → restake {side} ₦{stake:.0f}")
 
                     watch.last_refresh_at = time.time()
-                    if changed:
-                        fp = (
-                            f"H@{watch.odds_by_team.get(watch.home_team, 0):.2f} "
-                            f"A@{watch.odds_by_team.get(watch.away_team, 0):.2f}"
-                        )
-                        if fp != watch.last_odds_fingerprint:
-                            watch.last_odds_fingerprint = fp
-                            logger.debug(
-                                f"[WATCH] {watch.home_team} vs {watch.away_team} {fp} "
-                                f"market={watch.active_market}"
-                            )
                 except Exception as e:
                     logger.debug(f"[WATCH] {e}")
                 await asyncio.sleep(self._odds_interval)
         except asyncio.CancelledError:
             pass
 
-    # =========================================================================
-    # REBET (same market via success-screen Rebet button)
-    # =========================================================================
-
     async def _try_rebet_once(self, page: Page) -> bool:
-        rebet = page.get_by_role("button", name=re.compile(r'^\s*Rebet\s*$', re.I))
+        rebet = page.get_by_role("button", name=re.compile(r"^\s*Rebet\s*$", re.I))
         if await rebet.count() == 0:
-            rebet = page.get_by_text(re.compile(r'^\s*Rebet\s*$', re.I))
+            rebet = page.get_by_text(re.compile(r"^\s*Rebet\s*$", re.I))
         if await rebet.count() == 0:
             return False
-
         await rebet.first.click(timeout=1500)
         await page.wait_for_timeout(500)
-
         await self.fetch_balance(page)
         stake = self.calc_stake(self.last_odds_used or 0.0)
         if stake < 10:
@@ -496,7 +454,6 @@ class BetExecutor:
             return False
         if not await self._click_confirm(page):
             return False
-
         try:
             await page.wait_for_selector(
                 'text=Bet Successful, text=Rebet, text=Success, [class*="success"]',
@@ -524,10 +481,6 @@ class BetExecutor:
             )
             logger.success(f"[REBET] #{i + 1} on {match_name}")
         return extra
-
-    # =========================================================================
-    # EXECUTE
-    # =========================================================================
 
     def _record_race_result(self, detected_at, won, match_name, reason):
         if detected_at is None:
@@ -576,7 +529,6 @@ class BetExecutor:
         self._record_race_result(detected_at, True, match_name, "confirmed")
         await self.prepare_goal_market(page, self.get_watch(match_id))
 
-        # ALWAYS balance before bet
         bal = await self.fetch_balance(page)
         if bal is None and (not self.balance or self.balance <= 0):
             logger.error("[BALANCE] cannot read balance")
@@ -645,7 +597,6 @@ class BetExecutor:
                 return False
 
             await self.fetch_balance(page)
-            # clamp to latest balance / hard-cap rule
             stake = self.calc_stake(odds)
             if self.balance and stake > self.balance:
                 stake = float(self.balance)
@@ -688,7 +639,7 @@ class BetExecutor:
                 await self.alerter.notify_bet_placed(
                     match_name, team, stake, odds, bet_id, stack_num, total_stack
                 )
-                with open('bets.log', 'a', encoding='utf-8') as f:
+                with open("bets.log", "a", encoding="utf-8") as f:
                     f.write(f"{datetime.now()}: {match_name}|{team}|₦{stake}|@{odds}|{bet_id}\n")
                 if self.balance:
                     self.balance = max(0.0, self.balance - stake)
@@ -707,11 +658,11 @@ class BetExecutor:
     async def handle_slow(self, match) -> BetResult:
         self.consecutive_slow += 1
         if self.consecutive_slow >= Config.MAX_CONSECUTIVE_SLOW:
-            old_user = self.current_account['username'] if self.current_account else 'unknown'
+            old_user = self.current_account["username"] if self.current_account else "unknown"
             await self.alerter.notify_account_flagged(old_user)
             old, new = self.account_manager.mark_limited()
             if new:
-                await self.alerter.notify_account_switched(old, new['username'])
+                await self.alerter.notify_account_switched(old, new["username"])
                 self.current_account = new
                 self.consecutive_slow = 0
                 return BetResult.SWITCHED
