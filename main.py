@@ -43,6 +43,7 @@ class ArbitrageBot:
         self._processing = {}
         self.browser = None
         self._cleanup_task = None
+        self.playwright = None
 
     async def _noop_callback(self, match):
         pass
@@ -60,7 +61,7 @@ class ArbitrageBot:
 
     async def start(self):
         await self.setup()
-        logger.info("BOT STARTING — page score only + All-tab scroll markets")
+        logger.info("BOT STARTING — Chrome + Over markets + memory score")
 
         print("\nSPORTYBET LOGIN")
         phone = input("Phone Number: ")
@@ -68,10 +69,18 @@ class ArbitrageBot:
 
         from playwright.async_api import async_playwright
 
-        playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(
+        self.playwright = await async_playwright().start()
+
+        # Real installed Chrome (not bundled Chromium)
+        browser = await self.playwright.chromium.launch(
+            channel="chrome",
             headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--start-maximized",
+                "--disable-dev-shm-usage",
+            ],
         )
         self.browser = browser
 
@@ -121,7 +130,7 @@ class ArbitrageBot:
         except Exception as e:
             logger.error(e)
 
-        logger.success("Bot running")
+        logger.success("Bot running — Over markets armed, waiting for links / goals")
         while self.running:
             await asyncio.sleep(1)
 
@@ -307,16 +316,23 @@ class ArbitrageBot:
                     await asyncio.sleep(1.0)
                     continue
 
+                # Open All tab once, then hand to executor watch loop
                 await self.executor.open_all_tab(new_page)
-                market = await self.executor.prepare_goal_market(new_page)
 
+                # Start watching with full match dict so REST score is used
+                # (Over line = total_goals + 0.5, period-aware market)
                 self.match_pages[mid] = new_page
                 self._page_contexts[mid] = new_context
-                self.executor.start_watching(mid, new_page, home, away)
+                self.executor.start_watching(
+                    mid,
+                    new_page,
+                    home,
+                    away,
+                    match=merged,
+                )
 
                 logger.success(
-                    f"[PAGE_READY] {home} vs {away} id={mid} "
-                    f"market={market or 'pending'} url={new_page.url}"
+                    f"[PAGE_READY] {home} vs {away} id={mid} url={new_page.url}"
                 )
                 return True
 
@@ -365,21 +381,24 @@ class ArbitrageBot:
                 result = await self.executor.execute(
                     page,
                     match,
-                    goal_data["scoring_team"],
-                    goal_data["goal_num"],
-                    expected_home_score=goal_data["home_score"],
-                    expected_away_score=goal_data["away_score"],
+                    goal_data.get("scoring_team", ""),
+                    goal_data.get("goal_num", 1),
+                    expected_home_score=goal_data.get("home_score"),
+                    expected_away_score=goal_data.get("away_score"),
                     detected_at=detected_at,
                 )
                 if result == BetResult.SUCCESS:
-                    bet_id = f"{mid}_G{goal_data['goal_num']}_{int(time.time())}"
+                    bet_id = f"{mid}_G{goal_data.get('goal_num', 1)}_{int(time.time())}"
                     stake = (
                         Config.VALIDATION_STAKE
                         if not self.executor.validation_passed
                         else self.executor.calc_stake(self.executor.last_odds_used)
                     )
                     self.cashout.register(
-                        mid, bet_id, stake, f"Goal {goal_data['goal_num']}"
+                        mid,
+                        bet_id,
+                        stake,
+                        f"Over goal {goal_data.get('goal_num', 1)}",
                     )
                     asyncio.create_task(
                         self.cashout.monitor(bet_id, goal_data, page)
