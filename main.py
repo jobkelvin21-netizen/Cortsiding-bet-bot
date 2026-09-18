@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 import sys
 import time
@@ -42,6 +43,7 @@ class ArbitrageBot:
         self.running = False
         self._processing = {}
         self.browser = None
+        self.context = None
         self._cleanup_task = None
         self.playwright = None
 
@@ -71,20 +73,31 @@ class ArbitrageBot:
 
         self.playwright = await async_playwright().start()
 
-        # Real installed Chrome (not bundled Chromium)
-        browser = await self.playwright.chromium.launch(
+        # Bot starts a normal (non-incognito) Chrome window by itself.
+        # no_viewport=True -> page uses the real window size, exactly like
+        # opening Chrome manually. All match pages open as tabs in it.
+        profile_dir = os.path.abspath("chrome_profile")
+        self.context = await self.playwright.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
             channel="chrome",
             headless=False,
+            no_viewport=True,
+            locale="en-NG",
+            ignore_default_args=["--enable-automation"],
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--start-maximized",
                 "--disable-dev-shm-usage",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
+                "--disable-backgrounding-occluded-windows",
             ],
         )
-        self.browser = browser
+        self.browser = self.context.browser  # may be None in persistent mode
 
-        page = await browser.new_page(viewport={"width": 1365, "height": 900})
+        # Reuse the first blank tab Chrome opens instead of leaving it empty
+        page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         await page.goto("https://www.sportybet.com/ng/", wait_until="domcontentloaded")
         await asyncio.sleep(2)
         try:
@@ -107,7 +120,7 @@ class ArbitrageBot:
         await asyncio.sleep(5)
         logger.success("SportyBet login complete")
 
-        self.auth.browser = browser
+        self.auth.browser = self.browser
         self.auth.page = page
         self.executor = BetExecutor(
             self.alerter, self.account_manager, self.sportybet.matches, None
@@ -172,7 +185,8 @@ class ArbitrageBot:
                     await page.close()
             except Exception:
                 pass
-        if ctx is not None:
+        # Shared context is never closed here (only the tab is closed)
+        if ctx is not None and ctx is not self.context:
             try:
                 await ctx.close()
             except Exception:
@@ -265,13 +279,10 @@ class ArbitrageBot:
         urls = self._build_match_urls(merged)
 
         for attempt in range(1, 4):
-            new_context = None
+            new_page = None
             try:
-                new_context = await self.browser.new_context(
-                    viewport={"width": 1365, "height": 900},
-                    locale="en-NG",
-                )
-                new_page = await new_context.new_page()
+                # Open as a normal tab in the same Chrome window (real size)
+                new_page = await self.context.new_page()
                 new_page.set_default_timeout(20000)
                 try:
                     await new_page.bring_to_front()
@@ -312,7 +323,7 @@ class ArbitrageBot:
                     logger.warning(
                         f"[PAGE_LOAD] details not ready {attempt}/3 url={new_page.url}"
                     )
-                    await new_context.close()
+                    await new_page.close()
                     await asyncio.sleep(1.0)
                     continue
 
@@ -322,7 +333,7 @@ class ArbitrageBot:
                 # Start watching with full match dict so REST score is used
                 # (Over line = total_goals + 0.5, period-aware market)
                 self.match_pages[mid] = new_page
-                self._page_contexts[mid] = new_context
+                self._page_contexts[mid] = self.context
                 self.executor.start_watching(
                     mid,
                     new_page,
@@ -338,9 +349,9 @@ class ArbitrageBot:
 
             except Exception as e:
                 logger.warning(f"[PAGE_LOAD] attempt {attempt}/3 error: {e}")
-                if new_context is not None:
+                if new_page is not None:
                     try:
-                        await new_context.close()
+                        await new_page.close()
                     except Exception:
                         pass
                 await asyncio.sleep(1.0)
