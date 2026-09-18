@@ -100,7 +100,7 @@ class BetExecutor:
 
     # ------------------------------------------------------------------
     def calc_stake(self, odds: float) -> float:
-        """Stake so profit \~= MAX_PROFIT_PER_BET (hard cap)."""
+        """Stake so profit equals MAX_PROFIT_PER_BET hard cap."""
         if odds <= 1.0 or not self.balance or self.balance <= 0:
             return 0.0
         target = float(Config.MAX_PROFIT_PER_BET) / (odds - 1.0)
@@ -335,14 +335,11 @@ class BetExecutor:
                 "() => (document.body && document.body.innerText || '').slice(0, 4000)"
             )
             low = (body or "").lower()
-            # Explicit half markers
             if re.search(r"\b2nd\s*half\b|\bsecond\s*half\b|\bht\b|\bhalf\s*time\b", low):
-                # If we see live 2nd half clock patterns
                 if re.search(r"\b(4[6-9]|[5-9]\d)\s*[':]|\b2nd\b", low):
                     return "2H"
             if re.search(r"\b1st\s*half\b|\bfirst\s*half\b", low):
                 return "1H"
-            # Minute on tracker e.g. 11:20 or 67'
             m = re.search(r"\b(\d{1,2})\s*[:']\s*\d{0,2}", low)
             if m:
                 minute = int(m.group(1))
@@ -395,14 +392,12 @@ class BetExecutor:
         )
         await self.open_all_tab(page)
 
-        # Section priority list
         if watch.period == "2H":
             section_order = [
                 ("2H", re.compile(r"2nd\s*Half\s*[-–]?\s*Over/?Under", re.I), f"2nd Half Over {line_s}"),
                 ("FULL", re.compile(r"(?:^|\b)Over/?Under\b", re.I), f"Over {line_s}"),
             ]
         else:
-            # 1H or unknown → try 1st half first
             section_order = [
                 ("1H", re.compile(r"1st\s*Half\s*[-–]?\s*Over/?Under", re.I), f"1st Half Over {line_s}"),
                 ("FULL", re.compile(r"(?:^|\b)Over/?Under\b", re.I), f"Over {line_s}"),
@@ -434,7 +429,7 @@ class BetExecutor:
                     ctx = re.sub(r"\s+", " ", (ctx or "")).strip()
                     low = ctx.lower()
 
-                    # Reject team-specific O/U (video + screenshot)
+                    # Reject team-specific O/U
                     if re.search(
                         r"(?:2nd\s*half\s*[-–]?\s*)?(?:al[-\s]?tai|bukiryah|[a-z]{3,})\s+over/?under",
                         low,
@@ -443,7 +438,6 @@ class BetExecutor:
                             r"(?:1st|2nd)\s*half\s*[-–]?\s*over/?under", low
                         ):
                             continue
-                        # "2nd Half - Al-Tai Over/Under" → reject
                         if re.search(
                             r"(?:1st|2nd)\s*half\s*[-–]\s*[a-z0-9].{0,20}over/?under",
                             low,
@@ -463,7 +457,6 @@ class BetExecutor:
                     if prefer_half == "2H" and not is_2h:
                         continue
                     if prefer_half == "FULL" and not is_full:
-                        # allow short context that only shows Over X.5 under main O/U
                         if is_1h or is_2h:
                             continue
 
@@ -536,7 +529,7 @@ class BetExecutor:
         return ""
 
     async def _clear_betslip_selection(self, page: Page) -> None:
-        """Remove via Cancel/X — never re-tap market (video)."""
+        """Remove via Cancel/X — never re-tap market."""
         for sel in (
             'button:has-text("Cancel")',
             '[class*="betslip"] button:has-text("×")',
@@ -616,7 +609,6 @@ class BetExecutor:
     # ------------------------------------------------------------------
     async def _read_over_odds_from_slip(self, page: Page) -> float:
         txt = await self._betslip_text(page)
-        # Prefer odds near "over"
         m = re.search(r"over[^\d]{0,20}(\d+\.\d{1,3})", txt.replace(",", "."))
         if not m:
             m = re.search(r"(\d+\.\d{1,3})", txt.replace(",", "."))
@@ -795,7 +787,6 @@ class BetExecutor:
         odds = await self._read_over_odds_from_slip(page)
         if odds > 0:
             watch.odds_over = odds
-            # Recompute stake from latest odds so profit stays at hard cap
             stake = self.calc_stake(odds)
             if stake < 10:
                 watch.confirm_armed = False
@@ -918,14 +909,12 @@ class BetExecutor:
 
                         confirm_up = await self._confirm_visible(watch.page)
 
-                        # Even if Confirm is still up, enforce hard cap
                         need_rearm = False
                         if not confirm_up or not watch.confirm_armed:
                             need_rearm = True
                         elif odds_changed:
                             need_rearm = True
                         elif ideal_stake >= 10 and watch.odds_over > 1:
-                            # Confirm visible but stake/odds would exceed hard cap
                             current_stake = await self._read_stake_from_slip(watch.page)
                             if current_stake <= 0:
                                 current_stake = watch.stake_over
@@ -938,7 +927,6 @@ class BetExecutor:
                                 )
                                 need_rearm = True
                             elif abs(current_stake - ideal_stake) / max(ideal_stake, 1) > 0.05:
-                                # Stake drifted >5% from ideal hard-cap stake
                                 need_rearm = True
 
                         if need_rearm and ideal_stake >= 10:
