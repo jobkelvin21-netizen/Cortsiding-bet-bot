@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bet365 InPlay WS — primary fast feed. Fixed callback handling."""
+"""Bet365 InPlay WS — primary fast feed."""
 
 import asyncio
 import os
@@ -91,7 +91,7 @@ class Bet365Feed:
         return self.matches.get(str(match_id))
 
     async def _notify(self, match: dict):
-        """FIXED: Proper async callback notification."""
+        """Notify callback with match data."""
         if self.callback:
             try:
                 await self.callback(dict(match))
@@ -162,10 +162,7 @@ class Bet365Feed:
                     rec["away_score"] = a
                     if old and old != rec["ss"]:
                         score_changed = True
-                        logger.success(
-                            f"[BET365][GOAL] {rec.get('home_team') or mid} "
-                            f"{old}→{rec['ss']}"
-                        )
+                        logger.success(f"[BET365][GOAL] {rec.get('home_team') or mid} {old}→{rec['ss']}")
 
             if "TM" in data:
                 try:
@@ -192,7 +189,7 @@ class Bet365Feed:
             self.matches[mid] = rec
             self._last_message_at = time.time()
 
-            # FIXED: Always notify on any update (not just goals)
+            # Always notify on any update
             if self.callback:
                 asyncio.create_task(self._notify(rec))
 
@@ -200,9 +197,7 @@ class Bet365Feed:
         key = proxy.get("server") if isinstance(proxy, dict) else str(proxy)
         logger.info(f"[BET365] trying proxy={key}")
         got_403 = False
-        profile = os.path.abspath(
-            f"chrome_profile_bet365_{abs(hash(key)) % 10000}"
-        )
+        profile = os.path.abspath(f"chrome_profile_bet365_{abs(hash(key)) % 10000}")
 
         async with async_playwright() as p:
             kwargs = dict(
@@ -255,18 +250,14 @@ class Bet365Feed:
                         if "SS=" in text or "TM=" in text or "EV;" in text:
                             self._parse_frame(text)
                     except Exception as e:
-                        logger.debug(f"[BET365] frame parse error: {e}")
+                        logger.debug(f"[BET365] frame error: {e}")
 
                 ws.on("framereceived", on_frame)
 
             page.on("websocket", on_websocket)
 
             try:
-                resp = await page.goto(
-                    Config.BET365_LIVE_URL,
-                    wait_until="domcontentloaded",
-                    timeout=45000,
-                )
+                resp = await page.goto(Config.BET365_LIVE_URL, wait_until="domcontentloaded", timeout=45000)
                 if (resp and resp.status == 403) or got_403:
                     logger.warning("[BET365] 403 on page load")
                     await context.close()
@@ -304,7 +295,6 @@ class Bet365Feed:
                         await context.close()
                         return False
                     
-                    # Health check
                     idle = time.time() - (self._last_message_at or 0)
                     if idle > 60:
                         logger.warning(f"[BET365] idle {idle:.0f}s - reconnecting")
