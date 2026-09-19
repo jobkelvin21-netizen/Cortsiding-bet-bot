@@ -8,8 +8,9 @@ from loguru import logger
 
 from config import Config
 from auth_sportybet_login import SportyBetAuth
+from feeds.bet365_ws import Bet365Feed
 from feeds.polymarket_ws import PolymarketFeed
-from feeds.sportybet_api import SportyBetFeed
+from feeds.sportybet_socket import SportyBetSocketFeed
 from core.match_linker import MatchLinker
 from core.executor import BetExecutor, BetResult
 from core.cashout import CashOutManager
@@ -23,15 +24,20 @@ class ArbitrageBot:
         self.alerter = TelegramAlerter()
         self.auth = SportyBetAuth()
 
-        self.sportybet = SportyBetFeed(poll_interval=Config.SPORTYBET_POLL_INTERVAL)
+        # PUSH only — no REST
+        self.sportybet = SportyBetSocketFeed()
         self.sportybet.set_alerter(self.alerter)
+
+        self.bet365 = Bet365Feed()
+        self.bet365.set_alerter(self.alerter)
 
         self.polymarket = PolymarketFeed(self._noop_callback)
 
-        self.linker = MatchLinker(self.polymarket, self.sportybet.matches, self.alerter)
+        self.linker = MatchLinker(self.bet365, self.sportybet.matches, self.alerter)
         self.linker.set_goal_callback(self.on_goal)
         self.linker.set_link_callback(self.on_new_link)
         self.linker.set_unlink_callback(self.on_unlink)
+        self.linker.set_slow_callback(self.on_new_link)
 
         self.executor = None
         self.cashout = CashOutManager(self.alerter)
@@ -63,7 +69,7 @@ class ArbitrageBot:
 
     async def start(self):
         await self.setup()
-        logger.info("BOT STARTING — Chrome + Over markets + memory score")
+        logger.info("BOT — Bet365 WS + SportyBet Socket.IO + clock lag")
 
         print("\nSPORTYBET LOGIN")
         phone = input("Phone Number: ")
@@ -72,10 +78,6 @@ class ArbitrageBot:
         from playwright.async_api import async_playwright
 
         self.playwright = await async_playwright().start()
-
-        # Bot starts a normal (non-incognito) Chrome window by itself.
-        # no_viewport=True -> page uses the real window size, exactly like
-        # opening Chrome manually. All match pages open as tabs in it.
         profile_dir = os.path.abspath("chrome_profile")
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=profile_dir,
@@ -94,9 +96,8 @@ class ArbitrageBot:
                 "--disable-backgrounding-occluded-windows",
             ],
         )
-        self.browser = self.context.browser  # may be None in persistent mode
+        self.browser = self.context.browser
 
-        # Reuse the first blank tab Chrome opens instead of leaving it empty
         page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         await page.goto("https://www.sportybet.com/ng/", wait_until="domcontentloaded")
         await asyncio.sleep(2)
@@ -108,17 +109,13 @@ class ArbitrageBot:
         except Exception:
             pass
 
-        await page.wait_for_selector(
-            'input[name="phone"]', state="visible", timeout=15000
-        )
+        await page.wait_for_selector('input[name="phone"]', state="visible", timeout=15000)
         await page.fill('input[name="phone"]', phone)
-        await page.wait_for_selector(
-            'input[name="psd"]', state="visible", timeout=10000
-        )
+        await page.wait_for_selector('input[name="psd"]', state="visible", timeout=10000)
         await page.fill('input[name="psd"]', password)
         await page.click('button[name="logIn"]')
         await asyncio.sleep(5)
-        logger.success("SportyBet login complete")
+        logger.success("SportyBet login OK — all tabs share this session")
 
         self.auth.browser = self.browser
         self.auth.page = page
@@ -132,26 +129,39 @@ class ArbitrageBot:
         await self.alerter.notify_startup(bal)
 
         self.running = True
-        self.polymarket.callback = self.linker.on_polymarket
+
+        # SportyBet Socket.IO on SAME context (push clock/score)
+        await self.sportybet.start(self.on_sportybet_push)
+        await self.sportybet.attach_context(self.context, open_live_list=True)
+
+        # Bet365 primary
+        self.bet365.set_callback(self.linker.on_fast_feed)
+        await self.bet365.start()
+
+        # Polymarket backup only
+        self.polymarket.callback = self._on_poly_backup
         await self.polymarket.start()
-        asyncio.create_task(self.sportybet.start(self.on_sportybet_update))
-        await self.sportybet.wait_until_ready(timeout=15.0)
+
+        await self.sportybet.wait_until_ready(timeout=25.0)
         await self.linker.start()
         self._cleanup_task = asyncio.create_task(self._page_cleanup_loop())
-        try:
-            self.linker._reconcile_once()
-        except Exception as e:
-            logger.error(e)
 
-        logger.success("Bot running — Over markets armed, waiting for links / goals")
+        logger.success("Running — Socket.IO SportyBet + Bet365 clock lag")
         while self.running:
             await asyncio.sleep(1)
 
-    async def on_sportybet_update(self, data):
-        if not isinstance(data, dict) or data.get("type") != "snapshot":
+    async def _on_poly_backup(self, match):
+        if self.bet365.is_healthy():
             return
+        await self.linker.on_fast_feed(match)
+
+    async def on_sportybet_push(self, match: dict):
+        """Optional: force reconcile when SportyBet clock/score moves."""
         if self.linker.running:
-            self.linker._reconcile_once()
+            try:
+                self.linker._reconcile_once()
+            except Exception:
+                pass
 
     async def on_new_link(self, sb_match: dict):
         mid = sb_match.get("match_id")
@@ -172,7 +182,7 @@ class ArbitrageBot:
 
     async def _close_match_page(self, mid: str, reason: str = ""):
         page = self.match_pages.pop(mid, None)
-        ctx = self._page_contexts.pop(mid, None)
+        self._page_contexts.pop(mid, None)
         if self.executor:
             try:
                 self.executor.stop_watching(mid)
@@ -185,16 +195,7 @@ class ArbitrageBot:
                     await page.close()
             except Exception:
                 pass
-        # Shared context is never closed here (only the tab is closed)
-        if ctx is not None and ctx is not self.context:
-            try:
-                await ctx.close()
-            except Exception:
-                pass
-        if page is not None or ctx is not None:
-            logger.info(
-                f"[CLEANUP] closed {mid} ({reason}) open={len(self.match_pages)}"
-            )
+            logger.info(f"[CLEANUP] {mid} ({reason}) open={len(self.match_pages)}")
 
     async def _page_cleanup_loop(self):
         while self.running:
@@ -207,14 +208,11 @@ class ArbitrageBot:
                 }
                 for mid in list(self.match_pages.keys()):
                     page = self.match_pages.get(mid)
-                    dead = False
                     try:
                         dead = page is None or page.is_closed()
                     except Exception:
                         dead = True
-                    if dead or (
-                        mid not in active and mid not in self._opening_pages
-                    ):
+                    if dead or (mid not in active and mid not in self._opening_pages):
                         await self._close_match_page(mid, reason="cleanup")
                 gc.collect()
             except asyncio.CancelledError:
@@ -227,15 +225,11 @@ class ArbitrageBot:
         urls = []
         if live:
             urls.append(live)
-            if "/ng/sport/" in live:
-                urls.append(live.replace("/ng/sport/", "/ng/m/sport/", 1))
-        mid = sb_match.get("match_id") or sb_match.get("event_id") or ""
+        mid = sb_match.get("match_id") or ""
         home = sb_match.get("home_team") or "Home"
         away = sb_match.get("away_team") or "Away"
         country = sb_match.get("country") or "World"
-        league = (
-            sb_match.get("league") or sb_match.get("tournament_name") or "League"
-        )
+        league = sb_match.get("league") or sb_match.get("tournament_name") or "League"
         eid = str(sb_match.get("event_id") or mid)
         if not eid.startswith("sr:match:"):
             eid = f"sr:match:{self._extract_digits(eid)}"
@@ -244,13 +238,8 @@ class ArbitrageBot:
             f"{self._slug(home)}_vs_{self._slug(away)}/{eid}"
         )
         desktop = f"https://www.sportybet.com/ng/sport/football/live/{path}"
-        mobile = (
-            f"https://www.sportybet.com/ng/m/sport/football/live/{path}"
-            f"?liveChannel=1&navigatedFrom=live"
-        )
-        for u in (desktop, mobile):
-            if u not in urls:
-                urls.append(u)
+        if desktop not in urls:
+            urls.append(desktop)
         return urls
 
     @staticmethod
@@ -260,18 +249,12 @@ class ArbitrageBot:
 
     @staticmethod
     def _slug(text: str) -> str:
-        text = (text or "").strip()
-        text = re.sub(r"[^a-zA-Z0-9]+", "_", text)
+        text = re.sub(r"[^a-zA-Z0-9]+", "_", (text or "").strip())
         return text.strip("_") or "Unknown"
 
     async def _open_match_page(self, sb_match: dict) -> bool:
         mid = sb_match.get("match_id")
-
-        feed = {}
-        try:
-            feed = self.sportybet.matches.get(mid) or {}
-        except Exception:
-            pass
+        feed = self.sportybet.matches.get(mid) or {}
         merged = dict(feed)
         merged.update({k: v for k, v in (sb_match or {}).items() if v})
         home = (merged.get("home_team") or "").strip()
@@ -281,8 +264,7 @@ class ArbitrageBot:
         for attempt in range(1, 4):
             new_page = None
             try:
-                # Open as a normal tab in the same Chrome window (real size)
-                new_page = await self.context.new_page()
+                new_page = await self.context.new_page()  # logged-in tab
                 new_page.set_default_timeout(20000)
                 try:
                     await new_page.bring_to_front()
@@ -291,99 +273,63 @@ class ArbitrageBot:
 
                 opened = False
                 for url in urls:
-                    logger.info(
-                        f"[PAGE_LOAD] attempt {attempt}/3 {home} vs {away} → {url[:130]}"
-                    )
-                    await new_page.goto(
-                        url, wait_until="domcontentloaded", timeout=45000
-                    )
-                    await asyncio.sleep(2.0)
-
+                    logger.info(f"[PAGE] {attempt}/3 {home} vs {away}")
+                    await new_page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(1.5)
                     for sel in (
                         'button:has-text("Accept")',
                         'button:has-text("OK")',
                         'button:has-text("Got it")',
-                        'button:has-text("Close")',
                     ):
                         try:
                             loc = new_page.locator(sel)
                             if await loc.count() > 0:
-                                await loc.first.click(timeout=600)
+                                await loc.first.click(timeout=500)
                         except Exception:
                             pass
-
-                    ready = await self.executor.wait_match_details_ready(
-                        new_page, home=home, away=away, timeout_s=14.0
-                    )
-                    if ready:
+                    if await self.executor.wait_match_details_ready(
+                        new_page, home=home, away=away, timeout_s=12.0
+                    ):
                         opened = True
                         break
 
                 if not opened:
-                    logger.warning(
-                        f"[PAGE_LOAD] details not ready {attempt}/3 url={new_page.url}"
-                    )
                     await new_page.close()
-                    await asyncio.sleep(1.0)
                     continue
 
-                # Open All tab once, then hand to executor watch loop
                 await self.executor.open_all_tab(new_page)
-
-                # Start watching with full match dict so REST score is used
-                # (Over line = total_goals + 0.5, period-aware market)
                 self.match_pages[mid] = new_page
                 self._page_contexts[mid] = self.context
-                self.executor.start_watching(
-                    mid,
-                    new_page,
-                    home,
-                    away,
-                    match=merged,
-                )
-
-                logger.success(
-                    f"[PAGE_READY] {home} vs {away} id={mid} url={new_page.url}"
-                )
+                self.executor.start_watching(mid, new_page, home, away, match=merged)
+                logger.success(f"[PAGE_READY] {home} vs {away} (logged in)")
                 return True
-
             except Exception as e:
-                logger.warning(f"[PAGE_LOAD] attempt {attempt}/3 error: {e}")
-                if new_page is not None:
+                logger.warning(f"[PAGE] {e}")
+                if new_page:
                     try:
                         await new_page.close()
                     except Exception:
                         pass
-                await asyncio.sleep(1.0)
-
-        logger.error(f"[PAGE_LOAD_ERROR] {home} vs {away} id={mid}")
         return False
 
     async def on_goal(self, goal_data: dict):
         try:
             mid = goal_data["match_id"]
-            detected_at = goal_data.get("detected_at")
-
             if mid not in self.match_pages:
-                opened = await self._open_match_page(
-                    {
-                        "match_id": mid,
-                        "home_team": goal_data["home_team"],
-                        "away_team": goal_data["away_team"],
-                    }
-                )
-                if not opened:
+                if not await self._open_match_page({
+                    "match_id": mid,
+                    "home_team": goal_data["home_team"],
+                    "away_team": goal_data["away_team"],
+                }):
                     return
-
             if self._processing.get(mid):
                 return
             self._processing[mid] = True
             try:
                 page = self.match_pages.get(mid)
                 if not page or page.is_closed():
-                    await self._close_match_page(mid, reason="missing_on_goal")
+                    await self._close_match_page(mid, reason="dead")
                     return
-
                 match = {
                     "match_id": mid,
                     "home_team": goal_data["home_team"],
@@ -396,7 +342,7 @@ class ArbitrageBot:
                     goal_data.get("goal_num", 1),
                     expected_home_score=goal_data.get("home_score"),
                     expected_away_score=goal_data.get("away_score"),
-                    detected_at=detected_at,
+                    detected_at=goal_data.get("detected_at"),
                 )
                 if result == BetResult.SUCCESS:
                     bet_id = f"{mid}_G{goal_data.get('goal_num', 1)}_{int(time.time())}"
@@ -406,18 +352,13 @@ class ArbitrageBot:
                         else self.executor.calc_stake(self.executor.last_odds_used)
                     )
                     self.cashout.register(
-                        mid,
-                        bet_id,
-                        stake,
-                        f"Over goal {goal_data.get('goal_num', 1)}",
+                        mid, bet_id, stake, f"Over {goal_data.get('goal_num', 1)}"
                     )
-                    asyncio.create_task(
-                        self.cashout.monitor(bet_id, goal_data, page)
-                    )
+                    asyncio.create_task(self.cashout.monitor(bet_id, goal_data, page))
             finally:
                 self._processing[mid] = False
         except Exception as e:
-            logger.error(f"Goal handling error: {e}")
+            logger.error(f"Goal error: {e}")
 
 
 if __name__ == "__main__":
