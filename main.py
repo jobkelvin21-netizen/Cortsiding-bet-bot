@@ -27,6 +27,9 @@ class ArbitrageBot:
         self.alerter = TelegramAlerter()
         self.auth = SportyBetAuth()
 
+        # Test Telegram
+        asyncio.create_task(self._test_telegram())
+
         self.sportybet = SportyBetFeed()
         self.sportybet.set_alerter(self.alerter)
 
@@ -55,6 +58,13 @@ class ArbitrageBot:
         self._cleanup_task = None
         self.playwright = None
 
+    async def _test_telegram(self):
+        try:
+            await self.alerter.send("🤖 <b>Bot starting...</b>\nTelegram alerts active!")
+            logger.success("Telegram test sent")
+        except Exception as e:
+            logger.error(f"Telegram test failed: {e}")
+
     async def _noop_callback(self, match):
         pass
 
@@ -73,7 +83,7 @@ class ArbitrageBot:
     async def start(self):
         await self.setup()
         logger.info("=" * 70)
-        logger.info("BOT STARTING - Bet365 Primary + Seconds-Level Lag Detection")
+        logger.info("BOT STARTING")
         logger.info("=" * 70)
 
         print("\nSPORTYBET LOGIN")
@@ -136,7 +146,7 @@ class ArbitrageBot:
         await self.sportybet.attach_context(self.context, open_live_list=True)
         logger.success("SportyBet started")
 
-        # Start Bet365 with callback
+        # Start Bet365
         logger.info("Starting Bet365...")
         
         async def bet365_callback(match):
@@ -145,9 +155,8 @@ class ArbitrageBot:
             minute = match.get('minute', 0)
             score = match.get('ss', '?-?') or '?-?'
             
-            # Debug: show raw data if teams missing
             if home == '?' or away == '?':
-                logger.debug(f"[BET365_RAW] mid={match.get('match_id')} data={match}")
+                logger.debug(f"[BET365_RAW] mid={match.get('match_id')}")
             
             logger.info(f"[BET365] {home} {score} {away} min={minute}")
             
@@ -164,7 +173,7 @@ class ArbitrageBot:
 
         # Start linker
         await self.linker.start()
-        logger.success("MatchLinker started - hunting for 5+ second lag")
+        logger.success("MatchLinker started")
 
         # Health monitoring
         self._cleanup_task = asyncio.create_task(self._page_cleanup_loop())
@@ -172,10 +181,9 @@ class ArbitrageBot:
 
         logger.success("=" * 70)
         logger.success("ALL SYSTEMS RUNNING")
-        logger.success("Lag detection: Bet365 seconds vs SportyBet seconds")
         logger.success("=" * 70)
         
-        await self.alerter.send("🟢 BOT RUNNING - Seconds-level lag detection")
+        await self.alerter.send("🟢 BOT RUNNING")
 
         while self.running:
             if self.executor and self.executor.stopped:
@@ -334,11 +342,19 @@ class ArbitrageBot:
     async def on_goal(self, goal_data: dict):
         try:
             mid = goal_data["match_id"]
+            home = goal_data.get("home_team", "?")
+            away = goal_data.get("away_team", "?")
+            scoring = goal_data.get("scoring_team", "?")
+            goal_num = goal_data.get("goal_num", 1)
+            
+            # Notify Telegram
+            await self.alerter.notify_goal_detected(f"{home} vs {away}", scoring, 0.0, goal_num)
+            
             if mid not in self.match_pages:
                 if not await self._open_match_page({
                     "match_id": mid,
-                    "home_team": goal_data["home_team"],
-                    "away_team": goal_data["away_team"],
+                    "home_team": home,
+                    "away_team": away,
                 }):
                     await self.alerter.send("⚠️ Goal but page open failed")
                     return
@@ -352,22 +368,22 @@ class ArbitrageBot:
                     return
                 match = {
                     "match_id": mid,
-                    "home_team": goal_data["home_team"],
-                    "away_team": goal_data["away_team"],
+                    "home_team": home,
+                    "away_team": away,
                 }
                 result = await self.executor.execute(
                     page,
                     match,
-                    goal_data.get("scoring_team", ""),
-                    goal_data.get("goal_num", 1),
+                    scoring,
+                    goal_num,
                     expected_home_score=goal_data.get("home_score"),
                     expected_away_score=goal_data.get("away_score"),
                     detected_at=goal_data.get("detected_at"),
                 )
                 if result == BetResult.SUCCESS:
-                    bet_id = f"{mid}_G{goal_data.get('goal_num', 1)}_{int(time.time())}"
+                    bet_id = f"{mid}_G{goal_num}_{int(time.time())}"
                     stake = Config.VALIDATION_STAKE if not self.executor.validation_passed else self.executor.calc_stake(self.executor.last_odds_used)
-                    self.cashout.register(mid, bet_id, stake, f"Over goal {goal_data.get('goal_num', 1)}")
+                    self.cashout.register(mid, bet_id, stake, f"Over goal {goal_num}")
                     asyncio.create_task(self.cashout.monitor(bet_id, goal_data, page))
             finally:
                 self._processing[mid] = False
