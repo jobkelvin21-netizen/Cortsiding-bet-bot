@@ -51,9 +51,9 @@ def match_key(home: str, away: str) -> str:
 
 class MatchLinker:
     """
-    Links Bet365 (primary) / Polymarket (backup) → SportyBet.
-    CONTINUOUS HUNTING: Always looking for best slow match.
-    Switch on HT/FT, resume previous if still slow.
+    Links Bet365 → SportyBet with SECONDS-LEVEL lag detection.
+    Bet365: minute * 60 (estimated seconds)
+    SportyBet: played_seconds (precise)
     """
 
     def __init__(self, fast_feed, sportybet_matches_ref: dict, alerter=None):
@@ -61,15 +61,12 @@ class MatchLinker:
         self.sportybet_matches = sportybet_matches_ref
         self.alerter = alerter
 
-        self.links: Dict[str, dict] = {}  # fast_id -> sb_match
+        self.links: Dict[str, dict] = {}
         
-        # Current slow match (can switch)
+        # Current slow match
         self.slow_match: Optional[dict] = None
         self.slow_fast_id: Optional[str] = None
         self.slow_start_time: Optional[float] = None
-        
-        # Track previous slow matches for potential resumption
-        self.previous_slow_matches: Dict[str, dict] = {}  # fast_id -> match_data
         
         self.last_scores: Dict[str, tuple] = {}
         self.clock_state: Dict[str, dict] = {}
@@ -97,11 +94,40 @@ class MatchLinker:
     def set_slow_callback(self, cb): self.slow_callback = cb
     def set_alerter(self, alerter): self.alerter = alerter
 
+    def _get_b365_seconds(self, fast_match: dict) -> int:
+        """Get Bet365 time in seconds (estimated from minute)."""
+        # Prefer played_seconds if available, otherwise minute * 60
+        seconds = fast_match.get("played_seconds")
+        if seconds is not None:
+            try:
+                return int(seconds)
+            except (ValueError, TypeError):
+                pass
+        
+        minute = fast_match.get("minute")
+        if minute is not None:
+            try:
+                return int(float(minute)) * 60
+            except (ValueError, TypeError):
+                pass
+        
+        return 0
+
+    def _sb_seconds(self, sb: dict) -> int:
+        """Get SportyBet time in seconds (precise)."""
+        try:
+            return int(sb.get("played_seconds") or 0)
+        except (ValueError, TypeError):
+            return 0
+
     def _find_sportybet_match(self, home: str, away: str) -> Optional[dict]:
         """Link by team name."""
         if not self.sportybet_matches:
+            logger.warning("[LINK] No SportyBet matches!")
             return None
             
+        logger.debug(f"[LINK] Looking for: '{home}' vs '{away}'")
+        
         target_key = match_key(home, away)
         th, ta = get_tokens(home), get_tokens(away)
         
@@ -112,6 +138,7 @@ class MatchLinker:
             sb_home = sb.get("home_team", "")
             sb_away = sb.get("away_team", "")
             if match_key(sb_home, sb_away) == target_key:
+                logger.success(f"[LINK] Exact match: {home} vs {away}")
                 return sb
         
         # Fuzzy fallback
@@ -131,40 +158,16 @@ class MatchLinker:
                 best_score, best = score, sb
                 
         if best and best_score >= self.FUZZY_THRESHOLD:
+            logger.success(f"[LINK] Fuzzy match ({best_score:.2f}): {home} vs {away}")
             return best
+            
+        logger.warning(f"[LINK] No match for: {home} vs {away}")
         return None
-
-    def _get_b365_minute(self, fast_match: dict) -> float:
-        """Extract minute from Bet365."""
-        minute = fast_match.get("minute")
-        if minute is not None:
-            try:
-                return float(minute)
-            except (ValueError, TypeError):
-                pass
-        
-        seconds = fast_match.get("played_seconds")
-        if seconds is not None:
-            try:
-                return float(seconds) / 60.0
-            except (ValueError, TypeError):
-                pass
-        
-        return 0.0
-
-    def _sb_minute(self, sb: dict) -> float:
-        """Extract minute from SportyBet."""
-        try:
-            sec = float(sb.get("played_seconds") or 0)
-            return sec / 60.0
-        except (ValueError, TypeError):
-            return 0.0
 
     def _is_match_active(self, match: dict) -> bool:
         """Check if match is active (not HT or FT)."""
         period = str(match.get("period") or match.get("match_status") or "").lower()
         
-        # HT or FT indicators
         if any(x in period for x in ["ht", "half", "break", "finished", "ft", "ended", "full"]):
             return False
         if "45" in period and "half" in period:
@@ -173,18 +176,11 @@ class MatchLinker:
         return True
 
     def _clear_slow_match(self, reason: str):
-        """Clear current slow match and save to history."""
+        """Clear current slow match."""
         if self.slow_match and self.slow_fast_id:
             home = self.slow_match.get("home_team", "?")
             away = self.slow_match.get("away_team", "?")
             logger.warning(f"[SLOW] CLEARED {home} vs {away} - {reason}")
-            
-            # Save to previous matches for potential resumption
-            self.previous_slow_matches[self.slow_fast_id] = {
-                "match": dict(self.slow_match),
-                "cleared_at": time.time(),
-                "reason": reason
-            }
             
             if self.unlink_callback:
                 try:
@@ -198,38 +194,40 @@ class MatchLinker:
 
     def _check_slow(self, fast_id: str, fast_match: dict, sb: dict):
         """
-        Check if match is slow.
-        Can switch to better slow match or resume previous.
+        SECONDS-LEVEL lag detection:
+        - Bet365: estimated seconds (minute * 60)
+        - SportyBet: precise seconds (played_seconds)
+        - Mark slow if Bet365 ahead by SLOW_LAG_SECONDS (default 5s)
         """
-        b365_min = self._get_b365_minute(fast_match)
-        sb_min = self._sb_minute(sb)
+        # Skip if below minimum minute
+        b365_min = fast_match.get("minute", 0)
+        if b365_min < self.SLOW_MIN_MINUTE and fast_id != self.slow_fast_id:
+            return
+
+        # Get times in SECONDS
+        b365_sec = self._get_b365_seconds(fast_match)
+        sb_sec = self._sb_seconds(sb)
+        
+        # Calculate lag in seconds
+        lag_seconds = b365_sec - sb_sec
+        
         now = time.time()
 
         # Check if current slow match went to HT/FT
         if self.slow_fast_id == fast_id and self.slow_match:
             if not self._is_match_active(fast_match):
-                # Current match paused/ended - clear and find new
                 self._clear_slow_match("HT/FT detected")
                 return
-            # Still active - keep tracking
-            pass
 
-        # Skip if below minimum minute (unless it's our current match coming back)
-        if b365_min < self.SLOW_MIN_MINUTE and fast_id != self.slow_fast_id:
-            return
-
-        # Check if Bet365 is AHEAD
-        lag_threshold_min = self.SLOW_LAG_SECONDS / 60.0
-        is_ahead = b365_min > sb_min + lag_threshold_min
-        
-        if is_ahead:
-            # This match is slow
+        # Is Bet365 AHEAD by at least SLOW_LAG_SECONDS?
+        if lag_seconds >= self.SLOW_LAG_SECONDS:
+            # Bet365 is ahead - track duration
             st = self.clock_state.get(fast_id) or {"ahead_since": None}
             
             if st["ahead_since"] is None:
                 st["ahead_since"] = now
                 self.clock_state[fast_id] = st
-                logger.debug(f"[LAG] {fast_id} b365={b365_min:.2f}' sb={sb_min:.2f}' - tracking")
+                logger.debug(f"[LAG] {fast_id} b365={b365_sec}s sb={sb_sec}s lag={lag_seconds}s - STARTED")
             else:
                 elapsed = now - st["ahead_since"]
                 
@@ -237,26 +235,21 @@ class MatchLinker:
                 should_switch = False
                 
                 if self.slow_match is None:
-                    # No current slow match - take this one
                     should_switch = True
                 elif fast_id == self.slow_fast_id:
-                    # Already our match - just update
-                    pass
+                    pass  # Already our match
                 else:
-                    # Different match is slow - check if better
-                    # Switch if this one has been slow longer or has bigger gap
-                    current_gap = 0
-                    if self.slow_fast_id and self.slow_fast_id in self.clock_state:
-                        current_st = self.clock_state.get(self.slow_fast_id, {})
-                        current_gap = time.time() - (current_st.get("ahead_since") or now)
+                    # Different match is slow - switch if better
+                    current_st = self.clock_state.get(self.slow_fast_id, {})
+                    current_elapsed = now - (current_st.get("ahead_since") or now)
                     
-                    if elapsed > current_gap + 5:  # 5 seconds better
-                        logger.info(f"[SLOW] Found better slow match - switching")
+                    if elapsed > current_elapsed + 5:
+                        logger.info("[SLOW] Found better slow match - switching")
                         self._clear_slow_match("found better match")
                         should_switch = True
                 
                 if should_switch and elapsed >= self.SLOW_THRESHOLD_SECONDS:
-                    # NEW SLOW MATCH LOCKED
+                    # NEW SLOW MATCH!
                     self.slow_match = sb
                     self.slow_fast_id = fast_id
                     self.slow_start_time = now
@@ -264,15 +257,11 @@ class MatchLinker:
                     home = fast_match.get("home_team") or sb.get("home_team")
                     away = fast_match.get("away_team") or sb.get("away_team")
                     
-                    # Remove from previous if it was there
-                    if fast_id in self.previous_slow_matches:
-                        del self.previous_slow_matches[fast_id]
-                    
                     logger.success("=" * 60)
                     logger.success(f"[SLOW LOCK] {home} vs {away}")
-                    logger.success(f"  Bet365: {b365_min:.1f} min (AHEAD)")
-                    logger.success(f"  SportyBet: {sb_min:.1f} min")
-                    logger.success(f"  Gap: {(b365_min - sb_min)*60:.0f} seconds")
+                    logger.success(f"  Bet365: {b365_sec}s ({b365_sec//60}:{b365_sec%60:02d})")
+                    logger.success(f"  SportyBet: {sb_sec}s ({sb_sec//60}:{sb_sec%60:02d})")
+                    logger.success(f"  Lag: {lag_seconds} seconds")
                     logger.success(f"  Duration: {elapsed:.1f}s")
                     logger.success("=" * 60)
                     
@@ -323,7 +312,6 @@ class MatchLinker:
                 self._missing_since.pop(fid, None)
                 continue
             
-            # Match disappeared
             now = time.time()
             first = self._missing_since.get(fid)
             if first is None:
@@ -348,14 +336,7 @@ class MatchLinker:
             del self.links[fid]
             self._missing_since.pop(fid, None)
 
-        # Check previous slow matches for resumption
-        for fid, data in list(self.previous_slow_matches.items()):
-            # Clear old history after 15 minutes
-            if time.time() - data.get("cleared_at", 0) > 900:
-                del self.previous_slow_matches[fid]
-                continue
-
-        # Link new matches and check for slow
+        # Link new matches
         for fm in fast_matches:
             fid = str(fm.get("match_id") or "")
             if not fid:
@@ -365,23 +346,19 @@ class MatchLinker:
             if not home or not away:
                 continue
             
-            # Check if match is active
             if not self._is_match_active(fm):
                 continue
             
             existing = self.links.get(fid)
             if existing and existing.get("match_id") in current_sb:
-                # Already linked - check if slow
                 self._check_slow(fid, fm, existing)
                 continue
             
-            # Try to link by name
             sb = self._find_sportybet_match(home, away)
             if sb:
                 self.links[fid] = sb
                 self._missing_since.pop(fid, None)
                 logger.success(f"[LINK] {home} vs {away} → sb:{sb.get('match_id')}")
-                # Now check if slow
                 self._check_slow(fid, fm, sb)
 
     async def _reconcile_loop(self):
@@ -419,13 +396,11 @@ class MatchLinker:
         old_score = self.last_scores.get(fid)
         self.last_scores[fid] = new_score
 
-        # Skip if match not active (HT/FT) - unless it's our current match
         if not self._is_match_active(match):
             if fid == self.slow_fast_id:
                 self._clear_slow_match("HT/FT detected in callback")
             return
 
-        # Process this match
         sb = self.links.get(fid)
         if not sb and home and away:
             sb = self._find_sportybet_match(home, away)
@@ -435,7 +410,7 @@ class MatchLinker:
         if sb:
             self._check_slow(fid, match, sb)
 
-        # Goal detection - only for current slow match
+        # Goal detection - only for slow match
         if fid != self.slow_fast_id:
             return
             
