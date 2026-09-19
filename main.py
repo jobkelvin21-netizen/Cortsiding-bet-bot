@@ -27,8 +27,8 @@ class ArbitrageBot:
         self.alerter = TelegramAlerter()
         self.auth = SportyBetAuth()
 
-        # Test Telegram
-        asyncio.create_task(self._test_telegram())
+        # FIX: Don't create tasks here - no event loop yet
+        self._telegram_test_done = False
 
         self.sportybet = SportyBetFeed()
         self.sportybet.set_alerter(self.alerter)
@@ -59,6 +59,7 @@ class ArbitrageBot:
         self.playwright = None
 
     async def _test_telegram(self):
+        """Test Telegram now that event loop is running."""
         try:
             await self.alerter.send("🤖 <b>Bot starting...</b>\nTelegram alerts active!")
             logger.success("Telegram test sent")
@@ -83,7 +84,7 @@ class ArbitrageBot:
     async def start(self):
         await self.setup()
         logger.info("=" * 70)
-        logger.info("BOT STARTING")
+        logger.info("BOT STARTING - Bet365 Primary + One Slow Game Focus")
         logger.info("=" * 70)
 
         print("\nSPORTYBET LOGIN")
@@ -141,12 +142,17 @@ class ArbitrageBot:
 
         self.running = True
 
+        # FIX: Test Telegram now that event loop is running
+        if not self._telegram_test_done:
+            asyncio.create_task(self._test_telegram())
+            self._telegram_test_done = True
+
         # Start SportyBet
         await self.sportybet.start()
         await self.sportybet.attach_context(self.context, open_live_list=True)
         logger.success("SportyBet started")
 
-        # Start Bet365
+        # Start Bet365 with callback
         logger.info("Starting Bet365...")
         
         async def bet365_callback(match):
@@ -347,7 +353,6 @@ class ArbitrageBot:
             scoring = goal_data.get("scoring_team", "?")
             goal_num = goal_data.get("goal_num", 1)
             
-            # Notify Telegram
             await self.alerter.notify_goal_detected(f"{home} vs {away}", scoring, 0.0, goal_num)
             
             if mid not in self.match_pages:
