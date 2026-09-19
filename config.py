@@ -20,10 +20,10 @@ class Config:
     POLYMARKET_WS_URL = "wss://sports-api.polymarket.com/ws"
     BET365_LIVE_URL = "https://www.bet365.com/#/IP/B1"
 
-    # Clock lag (seconds Bet365 clock must stay ahead of SportyBet)
-    SLOW_THRESHOLD_SECONDS = float(os.getenv("SLOW_THRESHOLD_SECONDS", "5"))
-    # Only treat as slow after this match minute
-    SLOW_MIN_MINUTE = int(os.getenv("SLOW_MIN_MINUTE", "8"))
+    # Clock lag detection (seconds Bet365 clock must be ahead of SportyBet)
+    SLOW_LAG_SECONDS = float(os.getenv("SLOW_LAG_SECONDS", "5"))  # NEW: 5 seconds ahead
+    SLOW_THRESHOLD_SECONDS = float(os.getenv("SLOW_THRESHOLD_SECONDS", "5"))  # For 5 seconds
+    SLOW_MIN_MINUTE = int(os.getenv("SLOW_MIN_MINUTE", "8"))  # Only after 8th minute
 
     VALIDATION_STAKE = float(os.getenv("VALIDATION_STAKE", "10"))
     MAX_STACK_PER_GOAL = int(os.getenv("MAX_STACK_PER_GOAL", "3"))
