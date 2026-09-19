@@ -19,26 +19,15 @@ class TelegramAlerter:
         self.matches_flagged_slow = 0
         self.slow_submissions = 0
 
-        # NEW: simple rate limiter — Telegram allows ~1 msg/sec sustained;
-        # this prevents the 429 "Too Many Requests" flood you hit earlier
+        # Rate limiter
         self._send_lock = asyncio.Lock()
         self._last_send_time = 0.0
-        self._min_interval = 1.2  # seconds between messages
+        self._min_interval = 1.2
 
         self._setup_log_mirror()
 
     def _setup_log_mirror(self):
-        """
-        Mirror important loguru log messages to Telegram.
-
-        CHANGED: only WARNING and above get mirrored automatically now.
-        INFO/DEBUG/SUCCESS stay terminal-only — those fire hundreds of
-        times per subscription batch and were flooding Telegram with
-        429 rate-limit errors. Curated notify_* calls below still cover
-        the important events (bets, cashouts, goals) at INFO-equivalent
-        importance regardless of this filter.
-        """
-
+        """Mirror WARNING+ logs to Telegram."""
         def sink(message):
             record = message.record
             level = record["level"].name
@@ -66,7 +55,7 @@ class TelegramAlerter:
         logger.add(sink, level="WARNING", format="{message}")
 
     async def send(self, message: str, parse_mode: str = "HTML"):
-        # NEW: rate-limit outgoing messages so we never trigger Telegram's 429
+        """Send message to Telegram with rate limiting."""
         async with self._send_lock:
             now = asyncio.get_event_loop().time()
             wait = self._min_interval - (now - self._last_send_time)
@@ -79,7 +68,7 @@ class TelegramAlerter:
                 url = f"{self.base_url}/sendMessage"
                 payload = {
                     "chat_id": self.chat_id,
-                    "text": message[:4000],  # Telegram's hard message length limit
+                    "text": message[:4000],
                     "parse_mode": parse_mode,
                     "disable_web_page_preview": True,
                 }
@@ -101,39 +90,51 @@ class TelegramAlerter:
         minutes, _ = divmod(remainder, 60)
         return f"{hours}h {minutes}m"
 
+    # NEW METHOD: Link notification
+    async def notify_link_found(self, home_team: str, away_team: str, sb_match_id: str):
+        """Notify when match is linked."""
+        msg = (
+            f"🔗 <b>MATCH LINKED</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚽ {home_team} vs {away_team}\n"
+            f"🆔 SportyBet ID: <code>{sb_match_id}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Now monitoring for clock lag..."
+        )
+        await self.send(msg)
+
     async def notify_startup(self, balance: float):
         msg = (
             f"💰 <b>BOT STARTED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Starting balance: <b>₦{balance:,.2f}</b>\n"
-            f"Data sources: Polymarket (live goals) + SportyBet (betting)\n"
-            f"Mode: watching for live goals -> betting Next Goal market\n"
+            f"Data sources: Bet365 (fast) + SportyBet (slow)\n"
+            f"Mode: Detect lag → Arm → Goal → Bet\n"
             f"Started: {self.session_start.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Warnings and errors are mirrored here automatically."
+            f"━━━━━━━━━━━━━━━━━━━━"
         )
         await self.send(msg)
 
     async def notify_slow_match_found(self, home_team: str, away_team: str, gap_seconds: float):
         self.matches_flagged_slow += 1
         msg = (
-            f"🐢 <b>MATCH OPENED FOR BETTING</b>\n"
+            f"🐢 <b>SLOW MATCH DETECTED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚽ {home_team} vs {away_team}\n"
-            f"📊 Now monitoring for next goal...\n"
+            f"⏱ Lag: {gap_seconds:.1f} seconds\n"
+            f"📊 Monitoring for goals...\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Total opened this session: {self.matches_flagged_slow}"
+            f"Total this session: {self.matches_flagged_slow}"
         )
         await self.send(msg)
 
     async def notify_goal_detected(self, match_name: str, team: str, odds: float, goal_num: int):
         msg = (
-            f"⚡ <b>GOAL DETECTED — ACTING NOW</b>\n"
+            f"⚡ <b>GOAL DETECTED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚽ {match_name}\n"
-            f"🎯 Goal #{goal_num} — scored by <b>{team}</b>\n"
-            f"📈 Next Goal odds still showing: <b>@{odds}</b>\n"
-            f"⏳ Submitting bet before SportyBet updates..."
+            f"🎯 Goal #{goal_num} — {team}\n"
+            f"⏳ Placing bet now..."
         )
         await self.send(msg)
 
@@ -150,11 +151,11 @@ class TelegramAlerter:
             f"⚽ {match_name}\n"
             f"🎯 Backing: <b>{team}</b>\n"
             f"💵 Stake: <b>₦{stake:,.2f}</b> @ <b>{odds}</b>\n"
-            f"🏆 Potential win: <b>₦{potential_win:,.2f}</b>\n"
+            f"🏆 Potential: <b>₦{potential_win:,.2f}</b>\n"
             f"📦 {stack_info}\n"
             f"🆔 <code>{bet_id}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Session: {self.total_bets} bets | ₦{self.total_staked:,.0f} staked | Uptime {self._uptime()}"
+            f"Session: {self.total_bets} bets | ₦{self.total_staked:,.0f} staked"
         )
         await self.send(msg)
 
@@ -175,37 +176,32 @@ class TelegramAlerter:
         profit_emoji = "🟢" if profit >= 0 else "🔴"
 
         msg = (
-            f"💸 <b>CASHOUT EXECUTED</b>\n"
+            f"💸 <b>CASHOUT</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📌 {description}\n"
-            f"💵 Original stake: ₦{original_stake:,.2f}\n"
-            f"💰 Cashed out for: <b>₦{cashout_value:,.2f}</b>\n"
-            f"{profit_emoji} Profit: <b>₦{profit:,.2f}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Session cashout profit: ₦{self.total_cashout_profit:,.2f} ({self.total_cashed_out} cashouts)"
+            f"💵 Stake: ₦{original_stake:,.2f}\n"
+            f"💰 Cashed: <b>₦{cashout_value:,.2f}</b>\n"
+            f"{profit_emoji} Profit: <b>₦{profit:,.2f}</b>"
         )
         await self.send(msg)
 
     async def notify_submission_slow(self, match_name: str, reason: str, elapsed_seconds: float):
         self.slow_submissions += 1
         msg = (
-            f"🐌 <b>SLOW SUBMISSION WARNING</b>\n"
+            f"🐌 <b>SLOW SUBMISSION</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚽ {match_name}\n"
-            f"⏱ Took <b>{elapsed_seconds:.1f}s</b> (limit: {Config.SUBMISSION_TIMEOUT}s)\n"
-            f"📝 Reason: {reason}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Slow submissions this session: {self.slow_submissions}"
+            f"⏱ {elapsed_seconds:.1f}s (limit: {Config.SUBMISSION_TIMEOUT}s)\n"
+            f"📝 {reason}"
         )
         await self.send(msg)
 
     async def notify_account_flagged(self, username: str):
         msg = (
-            f"⚠️ <b>ACCOUNT FLAGGED — SLOW SUBMISSION</b>\n"
+            f"⚠️ <b>ACCOUNT FLAGGED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Account: <b>{username}</b>\n"
-            f"Reason: bet submission exceeded {Config.SUBMISSION_TIMEOUT}s repeatedly\n"
-            f"Action: switching accounts if available..."
+            f"Reason: Slow submissions"
         )
         await self.send(msg)
 
@@ -214,8 +210,7 @@ class TelegramAlerter:
             f"🔄 <b>ACCOUNT SWITCHED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"From: {old_username}\n"
-            f"To: <b>{new_username}</b>\n"
-            f"Resuming operations on new account."
+            f"To: <b>{new_username}</b>"
         )
         await self.send(msg)
 
@@ -231,23 +226,16 @@ class TelegramAlerter:
     async def notify_validation_start(self, match_name: str, team: str, odds: float,
                                        goal_num: int, stake: float):
         msg = (
-            f"🔬 <b>VALIDATION BET STARTING</b>\n"
+            f"🔬 <b>VALIDATION BET</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"ONE-TIME real bet at minimal stake to confirm the entire\n"
-            f"pipeline works end-to-end.\n\n"
-            f"⚽ Match: {match_name}\n"
-            f"🎯 Backing: <b>{team}</b>\n"
-            f"⚡ Goal #{goal_num} just detected\n"
-            f"📈 Odds: @{odds}\n"
-            f"💵 Validation stake: <b>₦{stake:,.2f}</b> (real money)\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Success -> full staking activates automatically.\n"
-            f"Failure -> bot stops and reports the exact problem."
+            f"⚽ {match_name}\n"
+            f"🎯 {team} @ {odds}\n"
+            f"💵 ₦{stake:,.2f}"
         )
         await self.send(msg)
 
     async def notify_validation_step(self, step_name: str, detail: str):
-        msg = f"⚙️ <b>Step: {step_name}</b>\n{detail}"
+        msg = f"⚙️ <b>{step_name}</b>\n{detail}"
         await self.send(msg)
 
     async def notify_validation_result(self, success: bool, match_name: str,
@@ -255,41 +243,29 @@ class TelegramAlerter:
                                         error_detail: str = None):
         if success:
             msg = (
-                f"✅ <b>VALIDATION SUCCESSFUL — FULL STAKING NOW ACTIVE</b>\n"
+                f"✅ <b>VALIDATION SUCCESS</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"⚽ {match_name}\n"
-                f"🎯 {team} @ {odds}\n"
-                f"💵 ₦{stake:,.2f} bet placed and confirmed\n\n"
-                f"✅ Detection → Navigation → Market select → Team select →\n"
-                f"Stake entry → Submission → Confirmation — all working.\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎉 Bot will now place real, full-stake bets automatically."
+                f"🎉 Full staking now active!"
             )
         else:
             msg = (
-                f"❌ <b>VALIDATION FAILED — BOT STOPPED</b>\n"
+                f"❌ <b>VALIDATION FAILED</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"⚽ {match_name}\n"
-                f"🎯 {team} @ {odds}\n"
-                f"💵 Attempted: ₦{stake:,.2f}\n\n"
-                f"🔍 <b>Problem:</b> {error_detail}\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"The bot has stopped. Fix the issue above and restart."
+                f"🔍 {error_detail}"
             )
         await self.send(msg)
 
     async def send_daily_report(self):
         msg = (
-            f"📊 <b>SESSION REPORT</b>\n"
+            f"📊 <b>REPORT</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⏱ Uptime: {self._uptime()}\n"
-            f"⚽ Matches opened: {self.matches_flagged_slow}\n"
-            f"🎯 Total bets placed: {self.total_bets}\n"
-            f"💵 Total staked: ₦{self.total_staked:,.2f}\n"
-            f"🐌 Slow submissions: {self.slow_submissions}\n"
-            f"💸 Cashouts executed: {self.total_cashed_out}\n"
-            f"💰 Cashout profit: ₦{self.total_cashout_profit:,.2f}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Bot is still running."
+            f"⚽ Matches: {self.matches_flagged_slow}\n"
+            f"🎯 Bets: {self.total_bets}\n"
+            f"💵 Staked: ₦{self.total_staked:,.2f}\n"
+            f"🐌 Slow: {self.slow_submissions}\n"
+            f"💸 Cashouts: {self.total_cashed_out}"
         )
         await self.send(msg)
