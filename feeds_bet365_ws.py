@@ -135,6 +135,7 @@ class Bet365Feed:
                     "ss": "",
                     "tm": "",
                     "minute": 0,
+                    "played_seconds": 0,  # Estimated from minute
                     "name": "",
                     "updated": 0.0,
                 },
@@ -164,10 +165,12 @@ class Bet365Feed:
                         score_changed = True
                         logger.success(f"[BET365][GOAL] {rec.get('home_team') or mid} {old}→{rec['ss']}")
 
+            # Extract minutes and convert to seconds for precise lag detection
             if "TM" in data:
                 try:
                     rec["tm"] = data["TM"]
                     rec["minute"] = int(float(data["TM"]))
+                    rec["played_seconds"] = rec["minute"] * 60  # Convert to seconds
                 except Exception:
                     pass
             else:
@@ -175,6 +178,7 @@ class Bet365Feed:
                 if m:
                     rec["tm"] = m.group(1)
                     rec["minute"] = int(m.group(1))
+                    rec["played_seconds"] = rec["minute"] * 60
 
             for m in SS_RE.finditer(part):
                 h, a = int(m.group(1)), int(m.group(2))
