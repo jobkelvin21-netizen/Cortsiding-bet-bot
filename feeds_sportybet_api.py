@@ -1,333 +1,360 @@
-import asyncio
-import re
-from datetime import datetime
-from typing import Callable
+#!/usr/bin/env python3
+"""
+SportyBet Socket.IO / page-WS feed (push only).
+Parses \~status topics for score + clock. No REST polling.
+Must attach to the same logged-in Playwright context as main.
+"""
 
-from curl_cffi import requests
+import asyncio
+import base64
+import json
+import re
+import time
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional
+
 from loguru import logger
 
+TOPIC_RE = re.compile(
+    r"sr:match:(\d+)",
+    re.I,
+)
+SCORE_RE = re.compile(r"(\d{1,2})\s*[:\-]\s*(\d{1,2})")
 
-class SportyBetFeed:
-    FACTS_CENTER_URL = (
-        "https://www.sportybet.com/api/ng/"
-        "factsCenter/liveOrPrematchEvents?sportId=sr:sport:1"
-    )
 
-    def __init__(self, poll_interval: float = 1.5):
-        self.matches = {}
+def _b64_decode(s: str) -> str:
+    if not s or not isinstance(s, str):
+        return ""
+    pad = "=" * (-len(s) % 4)
+    try:
+        return base64.b64decode(s + pad).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _parse_played_to_seconds(raw) -> float:
+    if raw is None:
+        return 0.0
+    try:
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        text = str(raw).strip()
+        if ":" in text:
+            parts = text.split(":")
+            if len(parts) == 2:
+                return float(parts[0]) * 60 + float(parts[1])
+        return float(text)
+    except Exception:
+        return 0.0
+
+
+def _extract_json_blobs(text: str) -> List[Any]:
+    """Pull JSON objects/arrays from a Socket.IO frame string."""
+    out = []
+    if not text:
+        return out
+    # Engine.IO / Socket.IO event: 42[...]
+    if text.startswith("42"):
+        try:
+            out.append(json.loads(text[2:]))
+            return out
+        except Exception:
+            pass
+    # fallback: find first [ or {
+    for i, ch in enumerate(text):
+        if ch in "[{":
+            try:
+                out.append(json.loads(text[i:]))
+                break
+            except Exception:
+                continue
+    return out
+
+
+class SportyBetSocketFeed:
+    LIVE_LIST = "https://www.sportybet.com/ng/sport/football/live_list"
+
+    def __init__(self):
+        self.matches: Dict[str, dict] = {}
         self.running = False
-        self.callback = None
+        self.callback: Optional[Callable] = None
         self.alerter = None
-        self.poll_interval = poll_interval
-
-        self.page = None
-        self.phone = None
-        self.password = None
-
-        self.last_success_at = None
-        self.last_error_at = None
-
+        self._page = None
+        self._context = None
+        self.last_message_at: Optional[float] = None
         self.ready_event = asyncio.Event()
-        self._refresh_lock = asyncio.Lock()
-
-    def set_page(self, page):
-        self.page = page
+        self._ws_urls = set()
 
     def set_alerter(self, alerter):
         self.alerter = alerter
 
-    def set_credentials(self, phone: str, password: str):
-        self.phone = phone
-        self.password = password
+    def set_callback(self, callback: Callable):
+        self.callback = callback
 
-    @staticmethod
-    def _extract_id(event_id):
-        text = str(event_id or "")
-        match = re.search(r"sr:match:(\d+)", text)
-        if match:
-            return match.group(1)
-        match = re.search(r"(\d+)", text)
-        if match:
-            return match.group(1)
-        return ""
-
-    @staticmethod
-    def _full_event_id(event_id_raw, match_id: str) -> str:
-        text = str(event_id_raw or "").strip()
-        if text.startswith("sr:match:"):
-            return text
-        if match_id:
-            return f"sr:match:{match_id}"
-        return text
-
-    @staticmethod
-    def _parse_score(value):
-        if value is None:
-            return 0, 0
-        text = str(value).strip()
-        if not text:
-            return 0, 0
-        match = re.match(r"^\s*(\d+)\s*[:\-]\s*(\d+)\s*$", text)
-        if match:
-            return int(match.group(1)), int(match.group(2))
-        return 0, 0
-
-    @staticmethod
-    def _slug(text: str) -> str:
-        text = (text or "").strip()
-        text = re.sub(r"[^a-zA-Z0-9]+", "_", text)
-        return text.strip("_") or "Unknown"
-
-    def _parse_matches(self, obj) -> dict:
-        parsed = {}
-
-        if not isinstance(obj, dict):
-            logger.warning("SportyBet factsCenter response is not a dictionary.")
-            return parsed
-
-        tournaments = obj.get("data", [])
-        if not isinstance(tournaments, list):
-            logger.warning("SportyBet factsCenter 'data' is not a list.")
-            return parsed
-
-        for tournament in tournaments:
-            if not isinstance(tournament, dict):
-                continue
-
-            tournament_name = str(
-                tournament.get("name")
-                or tournament.get("tournamentName")
-                or ""
-            ).strip()
-
-            # Country / category for URL path segment
-            country = str(
-                tournament.get("categoryName")
-                or tournament.get("category")
-                or tournament.get("country")
-                or tournament.get("regionName")
-                or ""
-            ).strip()
-            if not country and tournament_name:
-                # fallback: first word of tournament (often wrong — prefer API fields)
-                country = "World"
-
-            events = tournament.get("events", [])
-            if not isinstance(events, list):
-                continue
-
-            for event in events:
-                if not isinstance(event, dict):
-                    continue
-
-                event_id_raw = event.get("eventId") or event.get("id") or ""
-                match_id = self._extract_id(event_id_raw)
-                if not match_id:
-                    continue
-
-                home = str(
-                    event.get("homeTeamName") or event.get("homeTeam") or ""
-                ).strip()
-                away = str(
-                    event.get("awayTeamName") or event.get("awayTeam") or ""
-                ).strip()
-                if not home or not away:
-                    continue
-
-                # Event-level country override if present
-                ev_country = str(
-                    event.get("categoryName")
-                    or event.get("category")
-                    or event.get("country")
-                    or ""
-                ).strip()
-                use_country = ev_country or country or "World"
-
-                score_value = event.get("setScore") or event.get("gameScore") or ""
-                home_score, away_score = self._parse_score(score_value)
-
-                played_seconds = 0.0
-                played_raw = event.get("playedSeconds")
-                if played_raw is not None:
-                    try:
-                        if isinstance(played_raw, str) and ":" in played_raw:
-                            pieces = played_raw.split(":")
-                            if len(pieces) == 2:
-                                played_seconds = float(pieces[0]) * 60 + float(pieces[1])
-                            else:
-                                played_seconds = float(played_raw)
-                        else:
-                            played_seconds = float(played_raw)
-                    except (TypeError, ValueError):
-                        played_seconds = 0.0
-
-                match_status = str(
-                    event.get("matchStatus")
-                    or event.get("period")
-                    or event.get("status")
-                    or ""
-                ).strip()
-
-                full_eid = self._full_event_id(event_id_raw, match_id)
-                league_slug = self._slug(tournament_name or "League")
-                country_slug = self._slug(use_country)
-                teams_slug = f"{self._slug(home)}_vs_{self._slug(away)}"
-
-                # Canonical desktop live URL (matches your working browser URL)
-                live_path = f"{country_slug}/{league_slug}/{teams_slug}/{full_eid}"
-                live_url = (
-                    f"https://www.sportybet.com/ng/sport/football/live/{live_path}"
-                )
-
-                match = {
-                    "source": "sportybet",
-                    "match_id": match_id,
-                    "sportradar_id": match_id,
-                    "event_id": full_eid,
-                    "home_team": home,
-                    "away_team": away,
-                    "home_score": home_score,
-                    "away_score": away_score,
-                    "period": match_status,
-                    "match_status": match_status,
-                    "played_seconds": played_seconds,
-                    "tournament_name": tournament_name,
-                    "league": tournament_name,
-                    "country": use_country,
-                    "live_url": live_url,
-                    "timestamp": datetime.now(),
-                }
-
-                parsed[match_id] = match
-
-        return parsed
-
-    async def _fetch_once(self) -> dict:
-        try:
-            response = await asyncio.to_thread(
-                requests.get, self.FACTS_CENTER_URL, impersonate="chrome", timeout=10
-            )
-
-            if response.status_code != 200:
-                logger.warning(
-                    f"SportyBet factsCenter returned HTTP {response.status_code}"
-                )
-                self.last_error_at = datetime.now()
-                return {}
-
-            try:
-                data = response.json()
-            except Exception as e:
-                logger.warning(f"SportyBet factsCenter JSON decode failed: {e}")
-                self.last_error_at = datetime.now()
-                return {}
-
-            parsed = self._parse_matches(data)
-            self.last_success_at = datetime.now()
-            return parsed
-
-        except Exception as e:
-            self.last_error_at = datetime.now()
-            logger.error(f"SportyBet factsCenter request failed: {e}")
-            return {}
-
-    async def force_refresh(self) -> bool:
-        if self._refresh_lock.locked():
-            async with self._refresh_lock:
-                return True
-
-        async with self._refresh_lock:
-            new_matches = await self._fetch_once()
-            if new_matches:
-                self.matches.clear()
-                self.matches.update(new_matches)
-                return True
+    def is_healthy(self) -> bool:
+        if self.last_message_at is None:
             return False
+        return (time.time() - self.last_message_at) < 40
 
-    async def start(self, callback: Callable):
-        if self.running:
+    def get_matches(self) -> List[dict]:
+        return list(self.matches.values())
+
+    def get_match(self, match_id: str) -> Optional[dict]:
+        return self.matches.get(str(match_id))
+
+    def _upsert(self, match_id: str, **fields):
+        mid = str(match_id)
+        rec = self.matches.get(mid) or {
+            "source": "sportybet",
+            "match_id": mid,
+            "sportradar_id": mid,
+            "event_id": f"sr:match:{mid}",
+            "home_team": "",
+            "away_team": "",
+            "home_score": 0,
+            "away_score": 0,
+            "played_seconds": 0.0,
+            "minute": 0.0,
+            "period": "",
+            "match_status": "",
+            "tournament_name": "",
+            "league": "",
+            "country": "World",
+            "live_url": "",
+            "timestamp": datetime.now(),
+        }
+        for k, v in fields.items():
+            if v is not None and v != "":
+                rec[k] = v
+        # live URL if we have teams
+        if rec.get("home_team") and rec.get("away_team") and not rec.get("live_url"):
+            h = re.sub(r"[^a-zA-Z0-9]+", "_", rec["home_team"]).strip("_")
+            a = re.sub(r"[^a-zA-Z0-9]+", "_", rec["away_team"]).strip("_")
+            rec["live_url"] = (
+                f"https://www.sportybet.com/ng/sport/football/live/"
+                f"World/League/{h}_vs_{a}/sr:match:{mid}"
+            )
+        rec["timestamp"] = datetime.now()
+        rec["updated"] = time.time()
+        self.matches[mid] = rec
+        self.last_message_at = time.time()
+        if not self.ready_event.is_set() and len(self.matches) > 0:
+            self.ready_event.set()
+        return rec
+
+    def _ingest_status_payload(self, topic: str, payload: Any):
+        m = TOPIC_RE.search(topic or "")
+        if not m:
+            return
+        mid = m.group(1)
+
+        home = away = None
+        h_score = a_score = None
+        played = None
+        period = None
+        status = None
+
+        # payload may be list (decoded body array) or dict
+        if isinstance(payload, list):
+            # common pattern: mixed strings / numbers
+            text_blob = " ".join(str(x) for x in payload)
+            sm = SCORE_RE.search(text_blob)
+            if sm:
+                h_score, a_score = int(sm.group(1)), int(sm.group(2))
+            for item in payload:
+                if isinstance(item, dict):
+                    payload = item
+                    break
+
+        if isinstance(payload, dict):
+            home = (
+                payload.get("FixtureHomeTeamName")
+                or payload.get("homeTeamName")
+                or payload.get("homeTeam")
+                or payload.get("home")
+            )
+            away = (
+                payload.get("FixtureAwayTeamName")
+                or payload.get("awayTeamName")
+                or payload.get("awayTeam")
+                or payload.get("away")
+            )
+            for key in ("eventScore", "setScore", "gameScore", "score", "eventPointScore"):
+                if key in payload and payload[key]:
+                    sm = SCORE_RE.search(str(payload[key]))
+                    if sm:
+                        h_score, a_score = int(sm.group(1)), int(sm.group(2))
+                        break
+            gs = payload.get("eventGameScores")
+            if isinstance(gs, list) and gs:
+                sm = SCORE_RE.search(str(gs[0]))
+                if sm:
+                    h_score, a_score = int(sm.group(1)), int(sm.group(2))
+
+            played = _parse_played_to_seconds(
+                payload.get("eventPlayedTime")
+                or payload.get("playedSeconds")
+                or payload.get("playedTime")
+                or payload.get("matchTime")
+            )
+            period = (
+                payload.get("eventMatchPeriod")
+                or payload.get("period")
+                or payload.get("matchStatus")
+            )
+            status = payload.get("eventMatchStatus") or payload.get("eventStatus")
+
+        fields = {}
+        if home:
+            fields["home_team"] = str(home).strip()
+        if away:
+            fields["away_team"] = str(away).strip()
+        if h_score is not None and a_score is not None:
+            fields["home_score"] = h_score
+            fields["away_score"] = a_score
+        if played is not None and played > 0:
+            fields["played_seconds"] = played
+            fields["minute"] = played / 60.0
+        if period:
+            fields["period"] = str(period)
+            fields["match_status"] = str(period)
+        if status is not None:
+            fields["match_status"] = str(status)
+
+        if not fields:
+            # still register id from topic
+            self._upsert(mid)
             return
 
-        self.callback = callback
-        self.running = True
-
-        logger.info(
-            f"Starting SportyBet REST polling feed (every {self.poll_interval}s)..."
-        )
-
-        consecutive_failures = 0
-        first_success = True
-
-        while self.running:
+        rec = self._upsert(mid, **fields)
+        if self.callback:
             try:
-                async with self._refresh_lock:
-                    new_matches = await self._fetch_once()
+                asyncio.get_running_loop().create_task(self.callback(dict(rec)))
+            except RuntimeError:
+                pass
 
-                    if self.last_success_at is not None:
-                        if not self.ready_event.is_set():
-                            self.ready_event.set()
-                        self.matches.clear()
-                        self.matches.update(new_matches)
-
-                if not new_matches:
-                    consecutive_failures += 1
-                    if consecutive_failures == 3:
-                        logger.warning(
-                            "SportyBet factsCenter returned no matches for 3 consecutive polls."
-                        )
-                        if self.alerter:
-                            try:
-                                await self.alerter.send(
-                                    "⚠️ SportyBet factsCenter has returned no live match data "
-                                    "for 3 consecutive polls."
-                                )
-                            except Exception:
-                                pass
-                else:
-                    consecutive_failures = 0
-                    if first_success:
-                        logger.success(
-                            f"SportyBet: {len(new_matches)} live matches loaded."
-                        )
-                        first_success = False
-                        if self.alerter:
-                            try:
-                                await self.alerter.send(
-                                    f"✅ <b>SportyBet feed active</b> — "
-                                    f"{len(new_matches)} live matches loaded."
-                                )
-                            except Exception:
-                                pass
-
-                if self.callback:
+    def _handle_frame_text(self, text: str):
+        if not text or text in ("2", "3", "40", "41"):
+            return
+        blobs = _extract_json_blobs(text)
+        for blob in blobs:
+            # 42["data", {type, data}]
+            if isinstance(blob, list) and len(blob) >= 2:
+                _event, data = blob[0], blob[1]
+                if not isinstance(data, dict):
+                    continue
+                inner = data.get("data", data)
+                if isinstance(inner, str):
                     try:
-                        await self.callback(
-                            {
-                                "type": "snapshot",
-                                "count": len(self.matches),
-                                "matches": self.matches,
-                            }
-                        )
-                    except Exception as e:
-                        logger.debug(f"SportyBet callback error: {e}")
+                        inner = json.loads(inner)
+                    except Exception:
+                        # maybe pure base64 body
+                        dec = _b64_decode(inner)
+                        if dec:
+                            try:
+                                inner = json.loads(dec)
+                            except Exception:
+                                inner = {"body": inner}
+                if not isinstance(inner, dict):
+                    continue
+                topic = inner.get("topic") or data.get("topic") or ""
+                body = inner.get("body")
+                push = (inner.get("pushType") or "").upper()
 
-                await asyncio.sleep(self.poll_interval)
+                decoded = None
+                if body:
+                    raw = _b64_decode(str(body))
+                    if raw:
+                        try:
+                            decoded = json.loads(raw)
+                        except Exception:
+                            decoded = raw
 
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error(f"SportyBet polling loop error: {e}")
-                await asyncio.sleep(self.poll_interval)
+                if "\~status" in topic or "status" in topic.lower() or push == "GROUP":
+                    self._ingest_status_payload(topic, decoded if decoded is not None else inner)
+                elif TOPIC_RE.search(topic):
+                    # odds or other — still ensure match id exists
+                    m = TOPIC_RE.search(topic)
+                    if m:
+                        self._upsert(m.group(1))
+            elif isinstance(blob, dict):
+                topic = blob.get("topic") or ""
+                if topic:
+                    body = blob.get("body")
+                    decoded = _b64_decode(str(body)) if body else None
+                    try:
+                        decoded = json.loads(decoded) if decoded else blob
+                    except Exception:
+                        decoded = blob
+                    self._ingest_status_payload(topic, decoded)
 
-        logger.info("SportyBet REST polling feed stopped.")
+    async def attach_context(self, context, open_live_list: bool = True):
+        """
+        Use the SAME logged-in browser context as main.
+        Opens one background tab on live_list to keep Socket.IO alive.
+        """
+        self._context = context
+        page = await context.new_page()
+        self._page = page
 
-    def stop(self):
-        self.running = False
-        logger.info("Stopping SportyBet REST polling feed...")
+        def on_websocket(ws):
+            url = ws.url
+            if url not in self._ws_urls:
+                self._ws_urls.add(url)
+                logger.success(f"[SPORTY][WS OPEN] {url}")
 
-    async def wait_until_ready(self, timeout: float = 15.0):
+            def on_frame(ev):
+                try:
+                    payload = getattr(ev, "payload", ev)
+                    if isinstance(payload, (bytes, bytearray)):
+                        text = payload.decode("utf-8", errors="replace")
+                    else:
+                        text = str(payload)
+                    self._handle_frame_text(text)
+                except Exception as e:
+                    logger.debug(f"[SPORTY] frame err: {e}")
+
+            ws.on("framereceived", on_frame)
+
+        page.on("websocket", on_websocket)
+
+        if open_live_list:
+            await page.goto(self.LIVE_LIST, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(2.5)
+            for sel in (
+                'button:has-text("Accept")',
+                'button:has-text("OK")',
+                'button:has-text("Got it")',
+            ):
+                try:
+                    loc = page.locator(sel)
+                    if await loc.count() > 0:
+                        await loc.first.click(timeout=600)
+                except Exception:
+                    pass
+
+        logger.success("[SPORTY] Socket feed attached to logged-in context")
+        if self.alerter:
+            try:
+                await self.alerter.send("✅ <b>SportyBet Socket.IO feed active</b>")
+            except Exception:
+                pass
+
+    async def start(self, callback: Optional[Callable] = None):
+        if callback:
+            self.callback = callback
+        self.running = True
+        # attach_context must be called from main after login
+        logger.info("[SPORTY] Socket feed started (waiting for context attach)")
+
+    async def wait_until_ready(self, timeout: float = 20.0) -> bool:
         try:
             await asyncio.wait_for(self.ready_event.wait(), timeout=timeout)
             return True
         except asyncio.TimeoutError:
+            logger.warning("[SPORTY] no status pushes yet — still running")
             return False
+
+    def stop(self):
+        self.running = False
+        logger.info("[SPORTY] Socket feed stopped")
