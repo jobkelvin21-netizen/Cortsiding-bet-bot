@@ -20,8 +20,8 @@ from loguru import logger
 TOPIC_RE = re.compile(r"sr:match:(\d+)", re.I)
 SCORE_RE = re.compile(r"(\d{1,2})\s*[:\-]\s*(\d{1,2})")
 
-# Avoid any backslash-tilde in source (SyntaxWarning fix)
-STATUS_TAG = "\~" + "status"
+# Fixed: use "~" not "\~"
+STATUS_TAG = "~" + "status"
 
 
 def _b64_decode(s: str) -> str:
@@ -412,7 +412,6 @@ class SportyBetFeed:
                 except Exception:
                     decoded = raw
 
-        # STATUS_TAG = "\~status" built without backslash in source
         if STATUS_TAG in topic or "status" in topic.lower():
             self._ingest_status(topic, decoded if decoded is not None else inner)
         else:
