@@ -1,119 +1,336 @@
+#!/usr/bin/env python3
+"""Bet365 InPlay WS — primary fast feed. Same proxy + parse logic as working test."""
+
 import asyncio
-import json
-import threading
+import os
+import re
 import time
-from typing import Callable, Dict, List
-from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional
+
 from loguru import logger
-import websocket
+from playwright.async_api import async_playwright
+
+from config import Config
+
+PROXY_LIST: List[dict] = [
+    {"server": "http://31.59.20.176:6754", "username": "pzbdjger", "password": "4vfkqiesj5kw"},
+    {"server": "http://45.38.107.97:6014", "username": "pzbdjger", "password": "4vfkqiesj5kw"},
+    {"server": "http://198.105.121.200:6462", "username": "pzbdjger", "password": "4vfkqiesj5kw"},
+    {"server": "http://64.137.96.74:6641", "username": "pzbdjger", "password": "4vfkqiesj5kw"},
+    {"server": "http://198.23.243.226:6361", "username": "pzbdjger", "password": "4vfkqiesj5kw"},
+    {"server": "http://38.154.185.97:6370", "username": "pzbdjger", "password": "4vfkqiesj5kw"},
+    {"server": "http://84.247.60.125:6095", "username": "pzbdjger", "password": "4vfkqiesj5kw"},
+    {"server": "http://142.111.67.146:5611", "username": "pzbdjger", "password": "4vfkqiesj5kw"},
+    {"server": "http://191.96.254.138:6185", "username": "pzbdjger", "password": "4vfkqiesj5kw"},
+    {"server": "http://31.58.9.4:6077", "username": "pzbdjger", "password": "4vfkqiesj5kw"},
+]
+
+
+class ProxyRotator:
+    def __init__(self, proxies: Optional[List[dict]] = None):
+        self.proxies = list(proxies or PROXY_LIST)
+        self.bad_indices = set()
+        self.current_index = 0
+
+    def get_next(self):
+        if not self.proxies:
+            return None
+        attempts = 0
+        while attempts < len(self.proxies):
+            idx = self.current_index % len(self.proxies)
+            self.current_index += 1
+            attempts += 1
+            if idx not in self.bad_indices:
+                return self.proxies[idx]
+        return None
+
+    def mark_bad(self, proxy):
+        if isinstance(proxy, dict):
+            for i, p in enumerate(self.proxies):
+                if p.get("server") == proxy.get("server"):
+                    self.bad_indices.add(i)
+                    logger.warning(f"[BET365][PROXY] bad {proxy.get('server')}")
+                    break
+
+    def reset(self):
+        self.bad_indices.clear()
+
+
+SS_RE = re.compile(r"(?:^|[|;,\s])SS=(\d{1,2})\s*[-:]\s*(\d{1,2})", re.I)
+ID_RE = re.compile(r"(?:^|[|;,\s])(?:ID|FI)=(\d+)", re.I)
+TM_RE = re.compile(r"(?:^|[|;,\s])TM=(\d+)", re.I)
 
 
 class Bet365Feed:
-    """
-    Fast-feed source: Polymarket sports WebSocket. No auth needed, no key,
-    genuinely free. Kept the class/file name for compatibility with
-    main.py — internally this is 100% Polymarket, not Bet365.
-    """
+    """Primary fast feed: scores (SS=) + clock (TM=)."""
 
-    def __init__(self, callback: Callable):
+    def __init__(self, callback: Optional[Callable] = None):
         self.callback = callback
-        self.running = False
         self.matches: Dict[str, dict] = {}
+        self.running = False
+        self.rotator = ProxyRotator()
+        self._last_message_at: Optional[float] = None
         self._loop = None
-        self._ws = None
+        self._task = None
+        self.alerter = None
 
-    def _on_message(self, ws, message):
-        if message == "ping":
-            ws.send("pong")
+    def set_alerter(self, alerter):
+        self.alerter = alerter
+
+    def set_callback(self, callback: Callable):
+        self.callback = callback
+
+    def is_healthy(self) -> bool:
+        if self._last_message_at is None:
+            return False
+        return (time.time() - self._last_message_at) < 45
+
+    def get_matches(self) -> List[dict]:
+        return list(self.matches.values())
+
+    def get_match(self, match_id: str) -> Optional[dict]:
+        return self.matches.get(str(match_id))
+
+    def _parse_frame(self, raw: str):
+        raw = (raw or "").replace("\x01", "").strip()
+        if not raw:
             return
-        try:
-            data = json.loads(message)
-            if not isinstance(data, dict) or 'homeTeam' not in data:
-                return
+        parts = re.split(r"F\|", raw)
+        for part in parts:
+            part = part.strip()
+            if not part or part.startswith("U|") or part.startswith("CONFIG"):
+                continue
+            blocks = part.split(";")
+            data = {}
+            for b in blocks[1:]:
+                if "=" not in b:
+                    continue
+                k, v = b.split("=", 1)
+                data[k.strip().upper()] = v.strip()
 
-            event_type = data.get('eventState', {}).get('type', '')
-            if event_type != 'soccer':
-                return
+            mid = data.get("ID") or data.get("FI")
+            if not mid:
+                m = ID_RE.search(part)
+                if m:
+                    mid = m.group(1)
+            if not mid:
+                continue
 
-            elapsed_seconds = self._parse_elapsed(data.get('elapsed'))
+            rec = self.matches.get(
+                mid,
+                {
+                    "source": "bet365",
+                    "match_id": mid,
+                    "home_team": "",
+                    "away_team": "",
+                    "home_score": 0,
+                    "away_score": 0,
+                    "ss": "",
+                    "tm": "",
+                    "minute": 0,
+                    "name": "",
+                    "updated": 0.0,
+                },
+            )
 
-            match = {
-                'source': 'polymarket',
-                'match_id': f"poly:{data.get('gameId')}",
-                'home_team': data.get('homeTeam', ''),
-                'away_team': data.get('awayTeam', ''),
-                'period': data.get('period', ''),
-                'played_seconds': elapsed_seconds,
-                'live': data.get('live', False),
-                'ended': data.get('ended', False),
-                'league': data.get('leagueAbbreviation', ''),
-                'timestamp': datetime.now(),
-                'home_score': 0,
-                'away_score': 0,
-            }
-            score = data.get('score', '')
-            if '-' in str(score):
+            if "NA" in data:
+                name = data["NA"]
+                rec["name"] = name
+                low = name.lower()
+                if " v " in low or " vs " in low:
+                    sep = " v " if " v " in low else " vs "
+                    bits = re.split(sep, name, flags=re.I, maxsplit=1)
+                    if len(bits) == 2:
+                        rec["home_team"] = bits[0].strip()
+                        rec["away_team"] = bits[1].strip()
+
+            score_changed = False
+            if "SS" in data:
+                m = re.match(r"(\d+)\s*[-:]\s*(\d+)", data["SS"])
+                if m:
+                    h, a = int(m.group(1)), int(m.group(2))
+                    old = rec.get("ss", "")
+                    rec["ss"] = f"{h}-{a}"
+                    rec["home_score"] = h
+                    rec["away_score"] = a
+                    if old and old != rec["ss"]:
+                        score_changed = True
+                        logger.success(
+                            f"[BET365][GOAL?] {rec.get('home_team') or mid} "
+                            f"{old}→{rec['ss']}"
+                        )
+
+            if "TM" in data:
                 try:
-                    h, a = str(score).split('-')
-                    match['home_score'] = int(h)
-                    match['away_score'] = int(a)
+                    rec["tm"] = data["TM"]
+                    rec["minute"] = int(float(data["TM"]))
+                except Exception:
+                    pass
+            else:
+                m = TM_RE.search(part)
+                if m:
+                    rec["tm"] = m.group(1)
+                    rec["minute"] = int(m.group(1))
+
+            for m in SS_RE.finditer(part):
+                h, a = int(m.group(1)), int(m.group(2))
+                ss = f"{h}-{a}"
+                if rec.get("ss") != ss:
+                    rec["ss"] = ss
+                    rec["home_score"] = h
+                    rec["away_score"] = a
+                    score_changed = True
+
+            rec["updated"] = time.time()
+            self.matches[mid] = rec
+            self._last_message_at = time.time()
+
+            if self.callback and self._loop and (score_changed or rec.get("minute")):
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.callback(dict(rec)), self._loop
+                    )
                 except Exception:
                     pass
 
-            self.matches[match['match_id']] = match
-            if self.callback and self._loop:
-                asyncio.run_coroutine_threadsafe(self.callback(match), self._loop)
-
-        except Exception as e:
-            logger.debug(f"Polymarket message error: {e}")
-
-    def _parse_elapsed(self, elapsed_raw):
-        if elapsed_raw is None:
-            return None
-        try:
-            elapsed_str = str(elapsed_raw).strip()
-            if ':' in elapsed_str:
-                parts = [int(p) for p in elapsed_str.split(':')]
-                if len(parts) == 2:
-                    return float(parts[0] * 60 + parts[1])
-            else:
-                return float(elapsed_str) * 60
-        except Exception:
-            return None
-        return None
-
-    def _on_error(self, ws, error):
-        logger.debug(f"Polymarket WS error: {error}")
-
-    def _on_close(self, ws, code, msg):
-        logger.warning("Polymarket WebSocket disconnected — reconnecting in 3s")
-        if self.running:
-            time.sleep(3)
-            self._run()
-
-    def _on_open(self, ws):
-        logger.success("Polymarket sports WebSocket connected! (soccer-only filter active)")
-
-    def _run(self):
-        self._ws = websocket.WebSocketApp(
-            "wss://sports-api.polymarket.com/ws",
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close,
+    async def _run_with_proxy(self, proxy: Any) -> bool:
+        key = proxy.get("server") if isinstance(proxy, dict) else str(proxy)
+        logger.info(f"[BET365] try proxy={key}")
+        got_403 = False
+        profile = os.path.abspath(
+            f"chrome_profile_bet365_{abs(hash(key)) % 10000}"
         )
-        self._ws.run_forever()
+
+        async with async_playwright() as p:
+            kwargs = dict(
+                user_data_dir=profile,
+                channel="chrome",
+                headless=False,
+                no_viewport=True,
+                locale="en-GB",
+                ignore_default_args=["--enable-automation"],
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--start-maximized",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            if proxy:
+                kwargs["proxy"] = proxy
+
+            try:
+                context = await p.chromium.launch_persistent_context(**kwargs)
+            except Exception as e:
+                logger.error(f"[BET365] launch fail: {e}")
+                return False
+
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            def on_response(resp):
+                nonlocal got_403
+                try:
+                    if resp.status == 403:
+                        got_403 = True
+                except Exception:
+                    pass
+
+            page.on("response", on_response)
+
+            def on_websocket(ws):
+                logger.success(f"[BET365][WS OPEN] {ws.url}")
+
+                def on_frame(ev):
+                    try:
+                        payload = getattr(ev, "payload", ev)
+                        text = (
+                            payload.decode("utf-8", errors="ignore")
+                            if isinstance(payload, (bytes, bytearray))
+                            else str(payload)
+                        )
+                        if "SS=" in text or "EV;" in text or "F|" in text or "TM=" in text:
+                            self._parse_frame(text)
+                    except Exception:
+                        pass
+
+                ws.on("framereceived", on_frame)
+
+            page.on("websocket", on_websocket)
+
+            try:
+                resp = await page.goto(
+                    Config.BET365_LIVE_URL,
+                    wait_until="domcontentloaded",
+                    timeout=45000,
+                )
+                if (resp and resp.status == 403) or got_403:
+                    await context.close()
+                    return False
+
+                await asyncio.sleep(3)
+                if got_403:
+                    await context.close()
+                    return False
+
+                for sel in ("text=Football", "text=Soccer", 'a[href*="IP"]'):
+                    try:
+                        loc = page.locator(sel)
+                        if await loc.count() > 0:
+                            await loc.first.click(timeout=2000)
+                            await asyncio.sleep(1.5)
+                            break
+                    except Exception:
+                        pass
+
+                if self.alerter:
+                    try:
+                        await self.alerter.send("✅ <b>Bet365 WS connected</b>")
+                    except Exception:
+                        pass
+
+                logger.success("[BET365] feed live — holding connection")
+                while self.running:
+                    if got_403:
+                        await context.close()
+                        return False
+                    await asyncio.sleep(2)
+                    if not self.is_healthy() and time.time() - (self._last_message_at or 0) > 60:
+                        logger.warning("[BET365] stale — reconnect")
+                        break
+
+                await context.close()
+                return True
+            except Exception as e:
+                logger.error(f"[BET365] error: {e}")
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+                return False
+
+    async def _supervisor(self):
+        while self.running:
+            proxy = self.rotator.get_next()
+            if proxy is None:
+                self.rotator.reset()
+                proxy = self.rotator.get_next()
+            ok = await self._run_with_proxy(proxy)
+            if not self.running:
+                break
+            if not ok and proxy:
+                self.rotator.mark_bad(proxy)
+            await asyncio.sleep(1.0)
 
     async def start(self):
+        if self.running:
+            return
         self.running = True
-        self._loop = asyncio.get_event_loop()
-        threading.Thread(target=self._run, daemon=True).start()
-        logger.success("Fast feed started: Polymarket (soccer only)")
+        self._loop = asyncio.get_running_loop()
+        self._task = asyncio.create_task(self._supervisor())
+        logger.success("[BET365] feed started (primary fast)")
 
     def stop(self):
         self.running = False
-        if self._ws:
-            self._ws.close()
-
-    def get_matches(self) -> List[Dict]:
-        return list(self.matches.values())
+        if self._task:
+            self._task.cancel()
+        logger.info("[BET365] feed stopped")
