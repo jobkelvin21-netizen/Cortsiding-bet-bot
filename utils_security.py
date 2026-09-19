@@ -1,36 +1,63 @@
 import os
-from cryptography.fernet import Fernet
 from pathlib import Path
+from cryptography.fernet import Fernet
 from config import Config
+
+KEY_FILE = Path.home() / ".betbot_fernet.key"
+
 
 class SecurityManager:
     def __init__(self):
-        self.key = Config.ENCRYPTION_KEY.encode() if Config.ENCRYPTION_KEY else Fernet.generate_key()
+        self.key = self._load_or_create_key()
         self.cipher = Fernet(self.key)
-        
+
+    def _load_or_create_key(self) -> bytes:
+        env = (Config.ENCRYPTION_KEY or "").strip()
+        if env and env != "auto":
+            # Accept raw Fernet key string
+            try:
+                if isinstance(env, str):
+                    return env.encode() if not env.startswith("gAAAA") else env.encode()
+            except Exception:
+                pass
+        if KEY_FILE.exists():
+            return KEY_FILE.read_bytes().strip()
+        key = Fernet.generate_key()
+        KEY_FILE.write_bytes(key)
+        try:
+            os.chmod(KEY_FILE, 0o600)
+        except Exception:
+            pass
+        return key
+
     def encrypt_file(self, filepath: str):
-        if not Path(filepath).exists():
+        path = Path(filepath)
+        if not path.exists():
             return
-        with open(filepath, 'rb') as f:
-            data = f.read()
-        encrypted = self.cipher.encrypt(data)
-        with open(filepath + '.enc', 'wb') as f:
-            f.write(encrypted)
-        os.remove(filepath)
-        
+        data = path.read_bytes()
+        path.with_suffix(path.suffix + ".enc").write_bytes(self.cipher.encrypt(data))
+        self.secure_delete(str(path))
+
     def decrypt_file(self, filepath: str):
-        enc_path = filepath + '.enc'
-        if not Path(enc_path).exists():
+        enc = Path(filepath + ".enc")
+        if not enc.exists():
             return None
-        with open(enc_path, 'rb') as f:
-            encrypted = f.read()
-        return self.cipher.decrypt(encrypted)
-        
+        return self.cipher.decrypt(enc.read_bytes())
+
     def secure_delete(self, filepath: str):
-        if not Path(filepath).exists():
+        path = Path(filepath)
+        if not path.exists():
             return
-        with open(filepath, 'ba+') as f:
-            length = f.tell()
-            f.seek(0)
-            f.write(os.urandom(length))
-        os.remove(filepath)
+        try:
+            size = path.stat().st_size
+            with open(path, "ba+") as f:
+                f.seek(0)
+                f.write(os.urandom(size))
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            pass
+        try:
+            path.unlink()
+        except Exception:
+            pass
