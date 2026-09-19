@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bet365 InPlay WS — primary fast feed. Same proxy + parse logic as working test."""
+"""Bet365 InPlay WS — primary fast feed. Fixed callback handling."""
 
 import asyncio
 import os
@@ -70,7 +70,6 @@ class Bet365Feed:
         self.running = False
         self.rotator = ProxyRotator()
         self._last_message_at: Optional[float] = None
-        self._loop = None
         self._task = None
         self.alerter = None
 
@@ -90,6 +89,14 @@ class Bet365Feed:
 
     def get_match(self, match_id: str) -> Optional[dict]:
         return self.matches.get(str(match_id))
+
+    async def _notify(self, match: dict):
+        """FIXED: Proper async callback notification."""
+        if self.callback:
+            try:
+                await self.callback(dict(match))
+            except Exception as e:
+                logger.debug(f"[BET365] callback error: {e}")
 
     def _parse_frame(self, raw: str):
         raw = (raw or "").replace("\x01", "").strip()
@@ -156,7 +163,7 @@ class Bet365Feed:
                     if old and old != rec["ss"]:
                         score_changed = True
                         logger.success(
-                            f"[BET365][GOAL?] {rec.get('home_team') or mid} "
+                            f"[BET365][GOAL] {rec.get('home_team') or mid} "
                             f"{old}→{rec['ss']}"
                         )
 
@@ -185,17 +192,13 @@ class Bet365Feed:
             self.matches[mid] = rec
             self._last_message_at = time.time()
 
-            if self.callback and self._loop and (score_changed or rec.get("minute")):
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        self.callback(dict(rec)), self._loop
-                    )
-                except Exception:
-                    pass
+            # FIXED: Always notify on any update (not just goals)
+            if self.callback:
+                asyncio.create_task(self._notify(rec))
 
     async def _run_with_proxy(self, proxy: Any) -> bool:
         key = proxy.get("server") if isinstance(proxy, dict) else str(proxy)
-        logger.info(f"[BET365] try proxy={key}")
+        logger.info(f"[BET365] trying proxy={key}")
         got_403 = False
         profile = os.path.abspath(
             f"chrome_profile_bet365_{abs(hash(key)) % 10000}"
@@ -232,13 +235,14 @@ class Bet365Feed:
                 try:
                     if resp.status == 403:
                         got_403 = True
+                        logger.warning(f"[BET365] 403 on {resp.url[:80]}")
                 except Exception:
                     pass
 
             page.on("response", on_response)
 
             def on_websocket(ws):
-                logger.success(f"[BET365][WS OPEN] {ws.url}")
+                logger.success(f"[BET365][WS] Connected: {ws.url[:60]}")
 
                 def on_frame(ev):
                     try:
@@ -248,10 +252,10 @@ class Bet365Feed:
                             if isinstance(payload, (bytes, bytearray))
                             else str(payload)
                         )
-                        if "SS=" in text or "EV;" in text or "F|" in text or "TM=" in text:
+                        if "SS=" in text or "TM=" in text or "EV;" in text:
                             self._parse_frame(text)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"[BET365] frame parse error: {e}")
 
                 ws.on("framereceived", on_frame)
 
@@ -264,6 +268,7 @@ class Bet365Feed:
                     timeout=45000,
                 )
                 if (resp and resp.status == 403) or got_403:
+                    logger.warning("[BET365] 403 on page load")
                     await context.close()
                     return False
 
@@ -272,12 +277,14 @@ class Bet365Feed:
                     await context.close()
                     return False
 
+                # Click Football
                 for sel in ("text=Football", "text=Soccer", 'a[href*="IP"]'):
                     try:
                         loc = page.locator(sel)
                         if await loc.count() > 0:
                             await loc.first.click(timeout=2000)
-                            await asyncio.sleep(1.5)
+                            logger.info("[BET365] clicked Football")
+                            await asyncio.sleep(2)
                             break
                     except Exception:
                         pass
@@ -288,18 +295,26 @@ class Bet365Feed:
                     except Exception:
                         pass
 
-                logger.success("[BET365] feed live — holding connection")
+                logger.success("[BET365] feed LIVE - waiting for data...")
+                
+                # Keep connection alive
                 while self.running:
                     if got_403:
+                        logger.warning("[BET365] 403 detected - rotating proxy")
                         await context.close()
                         return False
-                    await asyncio.sleep(2)
-                    if not self.is_healthy() and time.time() - (self._last_message_at or 0) > 60:
-                        logger.warning("[BET365] stale — reconnect")
+                    
+                    # Health check
+                    idle = time.time() - (self._last_message_at or 0)
+                    if idle > 60:
+                        logger.warning(f"[BET365] idle {idle:.0f}s - reconnecting")
                         break
+                    
+                    await asyncio.sleep(2)
 
                 await context.close()
                 return True
+                
             except Exception as e:
                 logger.error(f"[BET365] error: {e}")
                 try:
@@ -309,25 +324,31 @@ class Bet365Feed:
                 return False
 
     async def _supervisor(self):
+        """Rotate proxies on failure."""
         while self.running:
             proxy = self.rotator.get_next()
             if proxy is None:
+                logger.warning("[BET365] all proxies bad - resetting")
                 self.rotator.reset()
                 proxy = self.rotator.get_next()
+            
             ok = await self._run_with_proxy(proxy)
+            
             if not self.running:
                 break
+            
             if not ok and proxy:
                 self.rotator.mark_bad(proxy)
-            await asyncio.sleep(1.0)
+            
+            logger.info("[BET365] reconnecting in 2s...")
+            await asyncio.sleep(2.0)
 
     async def start(self):
         if self.running:
             return
         self.running = True
-        self._loop = asyncio.get_running_loop()
         self._task = asyncio.create_task(self._supervisor())
-        logger.success("[BET365] feed started (primary fast)")
+        logger.success("[BET365] feed started (primary)")
 
     def stop(self):
         self.running = False
