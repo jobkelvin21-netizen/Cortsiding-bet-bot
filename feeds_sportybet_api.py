@@ -257,6 +257,8 @@ class SportyBetFeed:
                     if new_matches:
                         # Merge REST into store (do not wipe socket-only fields blindly)
                         for mid, fields in new_matches.items():
+                            # FIX: Remove match_id from fields to avoid duplicate argument error
+                            fields.pop('match_id', None)
                             self._upsert(mid, **fields)
                         if first:
                             first = False
