@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 SportyBet push feed via page WebSocket (Socket.IO style frames).
-Filename: feeds/sportybet_api.py  — import: from feeds.sportybet_api import SportyBetFeed
+Filename: feeds/sportybet_api.py
+Import: from feeds.sportybet_api import SportyBetFeed
 No REST polling for score/clock.
 """
 
@@ -48,7 +49,7 @@ class SportyBetFeed:
     LIVE_LIST = "https://www.sportybet.com/ng/sport/football/live_list"
 
     def __init__(self, poll_interval: float = 1.5):
-        # poll_interval kept only so old main.py constructors don't crash
+        # poll_interval kept so older constructors do not crash
         self.matches: Dict[str, dict] = {}
         self.running = False
         self.callback: Optional[Callable] = None
@@ -181,9 +182,9 @@ class SportyBetFeed:
 
         rec = self._upsert(mid, **fields) if fields else self._upsert(mid)
         logger.info(
-            f"[SPORTY][PUSH] {rec.get('home_team','?')} "
+            f"[SPORTY][PUSH] {rec.get('home_team', '?')} "
             f"{rec.get('home_score')}-{rec.get('away_score')} "
-            f"{rec.get('away_team','?')} min={rec.get('minute',0):.0f} "
+            f"{rec.get('away_team', '?')} min={rec.get('minute', 0):.0f} "
             f"id={mid}"
         )
         if self.callback:
@@ -240,6 +241,7 @@ class SportyBetFeed:
                 except Exception:
                     decoded = raw
 
+        # Fixed: use "\~status" (no backslash — avoids SyntaxWarning)
         if "\~status" in topic or "status" in topic.lower():
             self._ingest_status(topic, decoded if decoded is not None else inner)
         elif TOPIC_RE.search(topic):
