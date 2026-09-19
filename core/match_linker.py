@@ -50,12 +50,6 @@ def match_key(home: str, away: str) -> str:
 
 
 class MatchLinker:
-    """
-    Links Bet365 → SportyBet with SECONDS-LEVEL lag detection.
-    Bet365: minute * 60 (estimated seconds)
-    SportyBet: played_seconds (precise)
-    """
-
     def __init__(self, fast_feed, sportybet_matches_ref: dict, alerter=None):
         self.fast_feed = fast_feed
         self.sportybet_matches = sportybet_matches_ref
@@ -63,7 +57,6 @@ class MatchLinker:
 
         self.links: Dict[str, dict] = {}
         
-        # Current slow match
         self.slow_match: Optional[dict] = None
         self.slow_fast_id: Optional[str] = None
         self.slow_start_time: Optional[float] = None
@@ -95,8 +88,6 @@ class MatchLinker:
     def set_alerter(self, alerter): self.alerter = alerter
 
     def _get_b365_seconds(self, fast_match: dict) -> int:
-        """Get Bet365 time in seconds (estimated from minute)."""
-        # Prefer played_seconds if available, otherwise minute * 60
         seconds = fast_match.get("played_seconds")
         if seconds is not None:
             try:
@@ -114,14 +105,12 @@ class MatchLinker:
         return 0
 
     def _sb_seconds(self, sb: dict) -> int:
-        """Get SportyBet time in seconds (precise)."""
         try:
             return int(sb.get("played_seconds") or 0)
         except (ValueError, TypeError):
             return 0
 
     def _find_sportybet_match(self, home: str, away: str) -> Optional[dict]:
-        """Link by team name."""
         if not self.sportybet_matches:
             logger.warning("[LINK] No SportyBet matches!")
             return None
@@ -139,6 +128,7 @@ class MatchLinker:
             sb_away = sb.get("away_team", "")
             if match_key(sb_home, sb_away) == target_key:
                 logger.success(f"[LINK] Exact match: {home} vs {away}")
+                self._notify_link(home, away, sb.get('match_id'))
                 return sb
         
         # Fuzzy fallback
@@ -159,13 +149,26 @@ class MatchLinker:
                 
         if best and best_score >= self.FUZZY_THRESHOLD:
             logger.success(f"[LINK] Fuzzy match ({best_score:.2f}): {home} vs {away}")
+            self._notify_link(home, away, best.get('match_id'))
             return best
             
         logger.warning(f"[LINK] No match for: {home} vs {away}")
         return None
 
+    def _notify_link(self, home: str, away: str, match_id: str):
+        """Notify Telegram of successful link."""
+        if self.alerter:
+            try:
+                task = asyncio.create_task(
+                    self.alerter.notify_link_found(home, away, match_id)
+                )
+                task.add_done_callback(
+                    lambda t: logger.error(f"Telegram link error: {t.exception()}") if t.exception() else None
+                )
+            except Exception as e:
+                logger.error(f"Failed to send link notification: {e}")
+
     def _is_match_active(self, match: dict) -> bool:
-        """Check if match is active (not HT or FT)."""
         period = str(match.get("period") or match.get("match_status") or "").lower()
         
         if any(x in period for x in ["ht", "half", "break", "finished", "ft", "ended", "full"]):
@@ -176,11 +179,18 @@ class MatchLinker:
         return True
 
     def _clear_slow_match(self, reason: str):
-        """Clear current slow match."""
         if self.slow_match and self.slow_fast_id:
             home = self.slow_match.get("home_team", "?")
             away = self.slow_match.get("away_team", "?")
             logger.warning(f"[SLOW] CLEARED {home} vs {away} - {reason}")
+            
+            if self.alerter:
+                try:
+                    asyncio.create_task(self.alerter.send(
+                        f"⏹️ <b>Slow match cleared</b>\n{home} vs {away}\nReason: {reason}"
+                    ))
+                except Exception:
+                    pass
             
             if self.unlink_callback:
                 try:
@@ -193,53 +203,39 @@ class MatchLinker:
         self.slow_start_time = None
 
     def _check_slow(self, fast_id: str, fast_match: dict, sb: dict):
-        """
-        SECONDS-LEVEL lag detection:
-        - Bet365: estimated seconds (minute * 60)
-        - SportyBet: precise seconds (played_seconds)
-        - Mark slow if Bet365 ahead by SLOW_LAG_SECONDS (default 5s)
-        """
-        # Skip if below minimum minute
         b365_min = fast_match.get("minute", 0)
         if b365_min < self.SLOW_MIN_MINUTE and fast_id != self.slow_fast_id:
             return
 
-        # Get times in SECONDS
         b365_sec = self._get_b365_seconds(fast_match)
         sb_sec = self._sb_seconds(sb)
         
-        # Calculate lag in seconds
         lag_seconds = b365_sec - sb_sec
         
         now = time.time()
 
-        # Check if current slow match went to HT/FT
         if self.slow_fast_id == fast_id and self.slow_match:
             if not self._is_match_active(fast_match):
                 self._clear_slow_match("HT/FT detected")
                 return
 
-        # Is Bet365 AHEAD by at least SLOW_LAG_SECONDS?
         if lag_seconds >= self.SLOW_LAG_SECONDS:
-            # Bet365 is ahead - track duration
             st = self.clock_state.get(fast_id) or {"ahead_since": None}
             
             if st["ahead_since"] is None:
                 st["ahead_since"] = now
                 self.clock_state[fast_id] = st
-                logger.debug(f"[LAG] {fast_id} b365={b365_sec}s sb={sb_sec}s lag={lag_seconds}s - STARTED")
+                logger.debug(f"[LAG] {fast_id} lag={lag_seconds}s - STARTED")
             else:
                 elapsed = now - st["ahead_since"]
                 
-                # Check if we should switch to this match
                 should_switch = False
                 
                 if self.slow_match is None:
                     should_switch = True
                 elif fast_id == self.slow_fast_id:
-                    pass  # Already our match
+                    pass
                 else:
-                    # Different match is slow - switch if better
                     current_st = self.clock_state.get(self.slow_fast_id, {})
                     current_elapsed = now - (current_st.get("ahead_since") or now)
                     
@@ -249,7 +245,6 @@ class MatchLinker:
                         should_switch = True
                 
                 if should_switch and elapsed >= self.SLOW_THRESHOLD_SECONDS:
-                    # NEW SLOW MATCH!
                     self.slow_match = sb
                     self.slow_fast_id = fast_id
                     self.slow_start_time = now
@@ -262,14 +257,19 @@ class MatchLinker:
                     logger.success(f"  Bet365: {b365_sec}s ({b365_sec//60}:{b365_sec%60:02d})")
                     logger.success(f"  SportyBet: {sb_sec}s ({sb_sec//60}:{sb_sec%60:02d})")
                     logger.success(f"  Lag: {lag_seconds} seconds")
-                    logger.success(f"  Duration: {elapsed:.1f}s")
                     logger.success("=" * 60)
                     
                     if self.alerter:
                         try:
-                            asyncio.create_task(self.alerter.notify_slow_match_found(home, away, elapsed))
-                        except Exception:
-                            pass
+                            task = asyncio.create_task(
+                                self.alerter.notify_slow_match_found(home, away, elapsed)
+                            )
+                            task.add_done_callback(
+                                lambda t: logger.error(f"Telegram slow error: {t.exception()}") if t.exception() else None
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to send slow notification: {e}")
+                    
                     if self.slow_callback:
                         try:
                             asyncio.create_task(self.slow_callback(dict(sb)))
@@ -281,12 +281,10 @@ class MatchLinker:
                         except Exception:
                             pass
         else:
-            # Not ahead - reset timer
             if fast_id in self.clock_state:
                 self.clock_state[fast_id]["ahead_since"] = None
 
     def _reconcile_once(self):
-        """Continuous hunting for slow matches."""
         fast_matches = []
         try:
             fast_matches = self.fast_feed.get_matches()
@@ -302,7 +300,6 @@ class MatchLinker:
             if isinstance(m, dict) and m.get("match_id")
         }
 
-        # Check existing links
         for fid in list(self.links.keys()):
             linked = self.links.get(fid)
             if not linked:
@@ -327,16 +324,9 @@ class MatchLinker:
             if fid == self.slow_fast_id:
                 self._clear_slow_match("match disappeared")
             
-            if self.unlink_callback:
-                try:
-                    asyncio.create_task(self.unlink_callback(linked))
-                except Exception:
-                    pass
-            
             del self.links[fid]
             self._missing_since.pop(fid, None)
 
-        # Link new matches
         for fm in fast_matches:
             fid = str(fm.get("match_id") or "")
             if not fid:
@@ -381,7 +371,6 @@ class MatchLinker:
             self._reconcile_task.cancel()
 
     async def on_fast_feed(self, match: dict):
-        """Process Bet365 update."""
         fid = str(match.get("match_id") or "")
         if not fid:
             return
@@ -410,7 +399,6 @@ class MatchLinker:
         if sb:
             self._check_slow(fid, match, sb)
 
-        # Goal detection - only for slow match
         if fid != self.slow_fast_id:
             return
             
