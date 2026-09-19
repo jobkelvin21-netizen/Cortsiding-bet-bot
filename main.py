@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+"""Main entry - Bet365 primary, one slow game focus."""
+
 import asyncio
 import os
 import re
@@ -27,11 +30,13 @@ class ArbitrageBot:
         self.sportybet = SportyBetFeed()
         self.sportybet.set_alerter(self.alerter)
 
+        # Bet365 as primary fast feed
         self.bet365 = Bet365Feed()
         self.bet365.set_alerter(self.alerter)
 
         self.polymarket = PolymarketFeed(self._noop_callback)
 
+        # Linker - Bet365 is fast feed
         self.linker = MatchLinker(self.bet365, self.sportybet.matches, self.alerter)
         self.linker.set_goal_callback(self.on_goal)
         self.linker.set_link_callback(self.on_new_link)
@@ -69,11 +74,12 @@ class ArbitrageBot:
 
     async def start(self):
         await self.setup()
-        logger.info("BOT STARTING — Bet365 + SportyBet Socket + clock lag")
+        logger.info("=" * 70)
+        logger.info("BOT STARTING - Bet365 Primary + One Slow Game Focus")
+        logger.info("=" * 70)
         await self.alerter.send(
             "🚀 <b>BOT STARTING</b>\n"
-            "Feeds: Bet365 (primary) + SportyBet Socket + Polymarket backup\n"
-            "Mode: clock lag → arm Over → goal confirm"
+            "Mode: Bet365 primary → ONE slow game → Goal → Bet"
         )
 
         print("\nSPORTYBET LOGIN")
@@ -121,7 +127,7 @@ class ArbitrageBot:
         await page.click('button[name="logIn"]')
         await asyncio.sleep(5)
         logger.success("SportyBet login complete")
-        await self.alerter.send("✅ <b>SportyBet logged in</b> — session shared by all tabs")
+        await self.alerter.send("✅ <b>SportyBet logged in</b>")
 
         self.auth.browser = self.browser
         self.auth.page = page
@@ -136,94 +142,75 @@ class ArbitrageBot:
 
         self.running = True
 
-        # SportyBet Socket on same logged-in context
-        await self.sportybet.start(self.on_sportybet_push)
+        # Start SportyBet Socket
+        await self.sportybet.start()
         await self.sportybet.attach_context(self.context, open_live_list=True)
 
-        # Bet365 primary (own browser + proxy — same style as working test)
+        # FIX: Wire Bet365 callback to linker
         self.bet365.set_callback(self.linker.on_fast_feed)
         await self.bet365.start()
 
-        # Polymarket backup
+        # Polymarket backup (only if Bet365 fails)
         self.polymarket.callback = self._on_poly_backup
         await self.polymarket.start()
 
-        ok = await self.sportybet.wait_until_ready(timeout=25.0)
-        if not ok:
-            await self.alerter.send(
-                "⚠️ <b>SportyBet Socket</b> — no match pushes yet. "
-                "Still listening; check live_list tab."
-            )
-
+        # Start linker
         await self.linker.start()
+        
         self._cleanup_task = asyncio.create_task(self._page_cleanup_loop())
         self._health_task = asyncio.create_task(self._health_loop())
 
-        logger.success("Bot running")
+        logger.success("Bot running - waiting for ONE slow game")
         await self.alerter.send(
             "🟢 <b>BOT RUNNING</b>\n"
-            "Waiting for: links → clock lag (SLOW) → Over arm → goal confirm"
+            "Waiting for: ONE slow game → Goal → Bet"
         )
+        
         while self.running:
             if self.executor and self.executor.stopped:
-                logger.error("Executor stopped (slow submissions / flagged)")
-                await self.alerter.send(
-                    "🛑 <b>BOT STOPPED</b>\n"
-                    "Reason: account submit too slow or flagged.\n"
-                    "Check Telegram alerts above and restart after fix."
-                )
+                logger.error("Executor stopped")
                 self.running = False
                 break
             await asyncio.sleep(1)
 
     async def _health_loop(self):
-        """Periodic feed health → Telegram warnings."""
+        """Periodic health check."""
         while self.running:
             try:
                 await asyncio.sleep(60)
                 b365_ok = self.bet365.is_healthy()
                 sb_ok = self.sportybet.is_healthy()
-                if not b365_ok:
-                    logger.warning("Bet365 feed unhealthy")
-                    await self.alerter.send(
-                        "⚠️ <b>Bet365 feed quiet</b> — reconnecting / check proxy"
-                    )
-                if not sb_ok:
-                    logger.warning("SportyBet Socket unhealthy")
-                    await self.alerter.send(
-                        "⚠️ <b>SportyBet Socket quiet</b> — check live_list tab / WS"
-                    )
+                
+                slow_status = "NONE"
+                if self.linker.slow_match:
+                    slow_status = f"{self.linker.slow_match.get('home_team','?')} vs {self.linker.slow_match.get('away_team','?')}"
+                
                 logger.info(
                     f"[HEALTH] bet365={'OK' if b365_ok else 'BAD'} "
                     f"sporty={'OK' if sb_ok else 'BAD'} "
-                    f"links={len(self.linker.links)} "
-                    f"slow={len(getattr(self.linker, 'slow_ids', []))}"
+                    f"slow_match=[{slow_status}]"
                 )
+                
+                if not b365_ok:
+                    await self.alerter.send("⚠️ Bet365 feed quiet")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.debug(f"health: {e}")
 
     async def _on_poly_backup(self, match):
+        """Only use Polymarket if Bet365 is down."""
         if self.bet365.is_healthy():
             return
         await self.linker.on_fast_feed(match)
 
-    async def on_sportybet_push(self, match: dict):
-        if self.linker.running:
-            try:
-                self.linker._reconcile_once()
-            except Exception:
-                pass
-
     async def on_new_link(self, sb_match: dict):
+        """Open page when slow match found."""
         mid = sb_match.get("match_id")
         if not mid or mid in self.match_pages or mid in self._opening_pages:
             return
         if len(self.match_pages) >= getattr(Config, "MAX_PREOPENED_MATCH_PAGES", 8):
-            await self.alerter.send(
-                "⚠️ Max pre-opened match pages reached — skip new link open"
-            )
+            await self.alerter.send("⚠️ Max pages reached")
             return
         self._opening_pages.add(mid)
         try:
@@ -253,30 +240,8 @@ class ArbitrageBot:
                 pass
             logger.info(f"[CLEANUP] closed {mid} ({reason})")
 
-    async def _page_cleanup_loop(self):
-        while self.running:
-            try:
-                await asyncio.sleep(20)
-                active = {
-                    (v or {}).get("match_id")
-                    for v in self.linker.links.values()
-                    if v
-                }
-                for mid in list(self.match_pages.keys()):
-                    page = self.match_pages.get(mid)
-                    try:
-                        dead = page is None or page.is_closed()
-                    except Exception:
-                        dead = True
-                    if dead or (mid not in active and mid not in self._opening_pages):
-                        await self._close_match_page(mid, reason="cleanup")
-                gc.collect()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.debug(f"[CLEANUP] {e}")
-
     def _build_match_urls(self, sb_match: dict) -> list:
+        # ... (same as your code)
         live = (sb_match.get("live_url") or "").strip()
         urls = []
         if live:
@@ -305,6 +270,7 @@ class ArbitrageBot:
         return text.strip("_") or "Unknown"
 
     async def _open_match_page(self, sb_match: dict) -> bool:
+        # ... (same as your code, omitted for brevity)
         mid = sb_match.get("match_id")
         feed = self.sportybet.matches.get(mid) or {}
         merged = dict(feed)
@@ -373,7 +339,22 @@ class ArbitrageBot:
         )
         return False
 
+    async def _page_cleanup_loop(self):
+        while self.running:
+            try:
+                await asyncio.sleep(20)
+                # Only cleanup if slow match is gone
+                if self.linker.slow_match is None:
+                    for mid in list(self.match_pages.keys()):
+                        await self._close_match_page(mid, reason="no slow match")
+                gc.collect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"[CLEANUP] {e}")
+
     async def on_goal(self, goal_data: dict):
+        """Goal on slow match - place bet."""
         try:
             mid = goal_data["match_id"]
             if mid not in self.match_pages:
@@ -382,10 +363,7 @@ class ArbitrageBot:
                     "home_team": goal_data["home_team"],
                     "away_team": goal_data["away_team"],
                 }):
-                    await self.alerter.send(
-                        f"⚠️ Goal but page open failed: "
-                        f"{goal_data.get('home_team')} vs {goal_data.get('away_team')}"
-                    )
+                    await self.alerter.send("⚠️ Goal but page open failed")
                     return
             if self._processing.get(mid):
                 return
@@ -422,16 +400,17 @@ class ArbitrageBot:
                     asyncio.create_task(
                         self.cashout.monitor(bet_id, goal_data, page)
                     )
-                elif result == BetResult.ABORTED_SAFETY:
-                    await self.alerter.send(
-                        f"🛡️ <b>Bet aborted (safety)</b>\n"
-                        f"{goal_data.get('home_team')} vs {goal_data.get('away_team')}"
-                    )
             finally:
                 self._processing[mid] = False
         except Exception as e:
             logger.error(f"Goal handling error: {e}")
             await self.alerter.notify_error(f"Goal handling: {e}")
+
+    def stop(self):
+        self.running = False
+        self.bet365.stop()
+        self.linker.stop()
+        self.sportybet.stop()
 
 
 if __name__ == "__main__":
@@ -439,4 +418,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(bot.start())
     except KeyboardInterrupt:
-        logger.info("Stopping...")
+        bot.stop()
