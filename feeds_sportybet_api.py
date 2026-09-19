@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-SportyBet push feed via page WebSocket (Socket.IO style frames).
-Filename: feeds/sportybet_api.py
+SportyBet hybrid feed:
+  - REST factsCenter → match IDs, teams, live URLs, baseline score/clock
+  - Page Socket.IO  → live score/clock pushes (when available)
 Import: from feeds.sportybet_api import SportyBetFeed
-No REST polling for score/clock.
 """
 
 import asyncio
@@ -14,10 +14,14 @@ import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
+from curl_cffi import requests
 from loguru import logger
 
 TOPIC_RE = re.compile(r"sr:match:(\d+)", re.I)
 SCORE_RE = re.compile(r"(\d{1,2})\s*[:\-]\s*(\d{1,2})")
+
+# Avoid any backslash-tilde in source (SyntaxWarning fix)
+STATUS_TAG = "\~" + "status"
 
 
 def _b64_decode(s: str) -> str:
@@ -45,20 +49,33 @@ def _played_to_seconds(raw) -> float:
         return 0.0
 
 
+def _slug(text: str) -> str:
+    text = re.sub(r"[^a-zA-Z0-9]+", "_", (text or "").strip())
+    return text.strip("_") or "Unknown"
+
+
 class SportyBetFeed:
+    FACTS_CENTER_URL = (
+        "https://www.sportybet.com/api/ng/"
+        "factsCenter/liveOrPrematchEvents?sportId=sr:sport:1"
+    )
     LIVE_LIST = "https://www.sportybet.com/ng/sport/football/live_list"
 
     def __init__(self, poll_interval: float = 1.5):
-        # poll_interval kept so older constructors do not crash
         self.matches: Dict[str, dict] = {}
         self.running = False
         self.callback: Optional[Callable] = None
         self.alerter = None
+        self.poll_interval = float(poll_interval)
+
         self._page = None
         self._context = None
-        self.last_message_at: Optional[float] = None
-        self.ready_event = asyncio.Event()
         self._ws_urls = set()
+
+        self.last_message_at: Optional[float] = None
+        self.last_rest_at: Optional[float] = None
+        self.ready_event = asyncio.Event()
+        self._refresh_lock = asyncio.Lock()
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -67,9 +84,11 @@ class SportyBetFeed:
         self.callback = callback
 
     def is_healthy(self) -> bool:
-        if self.last_message_at is None:
-            return False
-        return (time.time() - self.last_message_at) < 40
+        """Healthy if REST or Socket updated recently."""
+        now = time.time()
+        rest_ok = self.last_rest_at is not None and (now - self.last_rest_at) < 20
+        sock_ok = self.last_message_at is not None and (now - self.last_message_at) < 40
+        return rest_ok or sock_ok
 
     def get_matches(self) -> List[dict]:
         return list(self.matches.values())
@@ -77,7 +96,10 @@ class SportyBetFeed:
     def get_match(self, match_id: str) -> Optional[dict]:
         return self.matches.get(str(match_id))
 
-    def _upsert(self, match_id: str, **fields):
+    # ------------------------------------------------------------------
+    # Shared upsert
+    # ------------------------------------------------------------------
+    def _upsert(self, match_id: str, **fields) -> dict:
         mid = str(match_id)
         rec = self.matches.get(mid) or {
             "source": "sportybet",
@@ -101,21 +123,174 @@ class SportyBetFeed:
         for k, v in fields.items():
             if v is not None and v != "":
                 rec[k] = v
-        if rec.get("home_team") and rec.get("away_team") and not rec.get("live_url"):
-            h = re.sub(r"[^a-zA-Z0-9]+", "_", rec["home_team"]).strip("_")
-            a = re.sub(r"[^a-zA-Z0-9]+", "_", rec["away_team"]).strip("_")
+
+        # Build live URL when we have teams + id
+        if rec.get("home_team") and rec.get("away_team"):
+            country = _slug(rec.get("country") or "World")
+            league = _slug(rec.get("league") or rec.get("tournament_name") or "League")
+            teams = f"{_slug(rec['home_team'])}_vs_{_slug(rec['away_team'])}"
+            eid = rec.get("event_id") or f"sr:match:{mid}"
             rec["live_url"] = (
                 f"https://www.sportybet.com/ng/sport/football/live/"
-                f"World/League/{h}_vs_{a}/sr:match:{mid}"
+                f"{country}/{league}/{teams}/{eid}"
             )
+
         rec["timestamp"] = datetime.now()
         rec["updated"] = time.time()
         self.matches[mid] = rec
-        self.last_message_at = time.time()
         if not self.ready_event.is_set():
             self.ready_event.set()
         return rec
 
+    # ------------------------------------------------------------------
+    # REST — match IDs + live links + baseline clock/score
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_id(event_id) -> str:
+        text = str(event_id or "")
+        m = re.search(r"sr:match:(\d+)", text)
+        if m:
+            return m.group(1)
+        m = re.search(r"(\d+)", text)
+        return m.group(1) if m else ""
+
+    def _parse_rest(self, obj: dict) -> dict:
+        parsed = {}
+        if not isinstance(obj, dict):
+            return parsed
+        tournaments = obj.get("data", [])
+        if not isinstance(tournaments, list):
+            return parsed
+
+        for tournament in tournaments:
+            if not isinstance(tournament, dict):
+                continue
+            tournament_name = str(
+                tournament.get("name") or tournament.get("tournamentName") or ""
+            ).strip()
+            country = str(
+                tournament.get("categoryName")
+                or tournament.get("category")
+                or tournament.get("country")
+                or "World"
+            ).strip() or "World"
+
+            events = tournament.get("events") or []
+            if not isinstance(events, list):
+                continue
+
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                event_id_raw = event.get("eventId") or event.get("id") or ""
+                match_id = self._extract_id(event_id_raw)
+                if not match_id:
+                    continue
+
+                home = str(
+                    event.get("homeTeamName") or event.get("homeTeam") or ""
+                ).strip()
+                away = str(
+                    event.get("awayTeamName") or event.get("awayTeam") or ""
+                ).strip()
+                if not home or not away:
+                    continue
+
+                score_value = event.get("setScore") or event.get("gameScore") or ""
+                h_score, a_score = 0, 0
+                sm = SCORE_RE.search(str(score_value))
+                if sm:
+                    h_score, a_score = int(sm.group(1)), int(sm.group(2))
+
+                played = _played_to_seconds(event.get("playedSeconds"))
+                status = str(
+                    event.get("matchStatus") or event.get("period") or ""
+                ).strip()
+                full_eid = (
+                    event_id_raw
+                    if str(event_id_raw).startswith("sr:match:")
+                    else f"sr:match:{match_id}"
+                )
+
+                parsed[match_id] = {
+                    "match_id": match_id,
+                    "event_id": full_eid,
+                    "home_team": home,
+                    "away_team": away,
+                    "home_score": h_score,
+                    "away_score": a_score,
+                    "played_seconds": played,
+                    "minute": played / 60.0 if played else 0.0,
+                    "period": status,
+                    "match_status": status,
+                    "tournament_name": tournament_name,
+                    "league": tournament_name,
+                    "country": country,
+                }
+        return parsed
+
+    async def _fetch_rest_once(self) -> dict:
+        try:
+            response = await asyncio.to_thread(
+                requests.get,
+                self.FACTS_CENTER_URL,
+                impersonate="chrome",
+                timeout=10,
+            )
+            if response.status_code != 200:
+                logger.warning(f"[SPORTY][REST] HTTP {response.status_code}")
+                return {}
+            data = response.json()
+            parsed = self._parse_rest(data)
+            self.last_rest_at = time.time()
+            return parsed
+        except Exception as e:
+            logger.error(f"[SPORTY][REST] {e}")
+            return {}
+
+    async def _rest_loop(self):
+        first = True
+        while self.running:
+            try:
+                async with self._refresh_lock:
+                    new_matches = await self._fetch_rest_once()
+                    if new_matches:
+                        # Merge REST into store (do not wipe socket-only fields blindly)
+                        for mid, fields in new_matches.items():
+                            self._upsert(mid, **fields)
+                        if first:
+                            first = False
+                            logger.success(
+                                f"[SPORTY][REST] {len(new_matches)} live matches + IDs + URLs"
+                            )
+                            if self.alerter:
+                                try:
+                                    await self.alerter.send(
+                                        f"✅ <b>SportyBet REST</b> — "
+                                        f"{len(new_matches)} matches (IDs + live links)"
+                                    )
+                                except Exception:
+                                    pass
+                if self.callback:
+                    try:
+                        await self.callback(
+                            {
+                                "type": "snapshot",
+                                "count": len(self.matches),
+                                "matches": self.matches,
+                            }
+                        )
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[SPORTY][REST] loop: {e}")
+            await asyncio.sleep(self.poll_interval)
+
+    # ------------------------------------------------------------------
+    # Socket — live pushes (score/clock) when page streams them
+    # ------------------------------------------------------------------
     def _ingest_status(self, topic: str, payload: Any):
         m = TOPIC_RE.search(topic or "")
         if not m:
@@ -181,17 +356,12 @@ class SportyBetFeed:
             fields["match_status"] = str(period)
 
         rec = self._upsert(mid, **fields) if fields else self._upsert(mid)
+        self.last_message_at = time.time()
         logger.info(
-            f"[SPORTY][PUSH] {rec.get('home_team', '?')} "
+            f"[SPORTY][SOCK] {rec.get('home_team', '?')} "
             f"{rec.get('home_score')}-{rec.get('away_score')} "
-            f"{rec.get('away_team', '?')} min={rec.get('minute', 0):.0f} "
-            f"id={mid}"
+            f"{rec.get('away_team', '?')} min={rec.get('minute', 0):.0f} id={mid}"
         )
-        if self.callback:
-            try:
-                asyncio.get_running_loop().create_task(self.callback(dict(rec)))
-            except RuntimeError:
-                pass
 
     def _handle_text(self, text: str):
         if not text or text in ("2", "3", "40", "41"):
@@ -222,15 +392,16 @@ class SportyBetFeed:
                 inner = json.loads(inner)
             except Exception:
                 dec = _b64_decode(inner)
-                if dec:
-                    try:
-                        inner = json.loads(dec)
-                    except Exception:
-                        return
+                if not dec:
+                    return
+                try:
+                    inner = json.loads(dec)
+                except Exception:
+                    return
         if not isinstance(inner, dict):
             return
 
-        topic = inner.get("topic") or payload.get("topic") or ""
+        topic = str(inner.get("topic") or payload.get("topic") or "")
         body = inner.get("body")
         decoded = None
         if body:
@@ -241,16 +412,16 @@ class SportyBetFeed:
                 except Exception:
                     decoded = raw
 
-        # Fixed: use "\~status" (no backslash — avoids SyntaxWarning)
-        if "\~status" in topic or "status" in topic.lower():
+        # STATUS_TAG = "\~status" built without backslash in source
+        if STATUS_TAG in topic or "status" in topic.lower():
             self._ingest_status(topic, decoded if decoded is not None else inner)
-        elif TOPIC_RE.search(topic):
+        else:
             m = TOPIC_RE.search(topic)
             if m:
                 self._upsert(m.group(1))
 
     async def attach_context(self, context, open_live_list: bool = True):
-        """Same logged-in Chrome context as main — one tab holds the socket."""
+        """Attach Socket listener on the same logged-in browser context."""
         self._context = context
         page = await context.new_page()
         self._page = page
@@ -291,26 +462,36 @@ class SportyBetFeed:
                 except Exception:
                     pass
 
-        logger.success("[SPORTY] Socket feed on logged-in context")
+        logger.success("[SPORTY] Socket attached (REST still supplies IDs + URLs)")
         if self.alerter:
             try:
-                await self.alerter.send("✅ <b>SportyBet Socket feed active</b>")
+                await self.alerter.send(
+                    "✅ <b>SportyBet Socket attached</b>\n"
+                    "REST = match IDs + live links\n"
+                    "Socket = live score/clock when pushed"
+                )
             except Exception:
                 pass
 
+    # ------------------------------------------------------------------
     async def start(self, callback: Optional[Callable] = None):
         if callback:
             self.callback = callback
+        if self.running:
+            return
         self.running = True
-        logger.info("[SPORTY] feed started (Socket push — attach_context after login)")
+        asyncio.create_task(self._rest_loop())
+        logger.info(
+            f"[SPORTY] started — REST every {self.poll_interval}s + Socket when attached"
+        )
 
-    async def wait_until_ready(self, timeout: float = 25.0) -> bool:
+    async def wait_until_ready(self, timeout: float = 20.0) -> bool:
         try:
             await asyncio.wait_for(self.ready_event.wait(), timeout=timeout)
             logger.success(f"[SPORTY] ready — {len(self.matches)} matches")
             return True
         except asyncio.TimeoutError:
-            logger.warning("[SPORTY] no pushes yet — still listening")
+            logger.warning("[SPORTY] not ready yet")
             return False
 
     def stop(self):
