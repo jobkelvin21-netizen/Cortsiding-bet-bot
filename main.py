@@ -30,13 +30,11 @@ class ArbitrageBot:
         self.sportybet = SportyBetFeed()
         self.sportybet.set_alerter(self.alerter)
 
-        # Bet365 as primary fast feed
         self.bet365 = Bet365Feed()
         self.bet365.set_alerter(self.alerter)
 
         self.polymarket = PolymarketFeed(self._noop_callback)
 
-        # Linker - Bet365 is fast feed
         self.linker = MatchLinker(self.bet365, self.sportybet.matches, self.alerter)
         self.linker.set_goal_callback(self.on_goal)
         self.linker.set_link_callback(self.on_new_link)
@@ -75,7 +73,7 @@ class ArbitrageBot:
     async def start(self):
         await self.setup()
         logger.info("=" * 70)
-        logger.info("BOT STARTING - Bet365 Primary + One Slow Game Focus")
+        logger.info("BOT STARTING - Bet365 Primary + Seconds-Level Lag Detection")
         logger.info("=" * 70)
 
         print("\nSPORTYBET LOGIN")
@@ -133,27 +131,26 @@ class ArbitrageBot:
 
         self.running = True
 
-        # Start SportyBet Socket
+        # Start SportyBet
         await self.sportybet.start()
         await self.sportybet.attach_context(self.context, open_live_list=True)
         logger.success("SportyBet started")
 
-        # ============================================================
-        # START BET365 WITH CALLBACK
-        # ============================================================
+        # Start Bet365 with callback
         logger.info("Starting Bet365...")
         
-        # CRITICAL: Set callback to see logs AND forward to linker
         async def bet365_callback(match):
-            home = match.get('home_team', '?')
-            away = match.get('away_team', '?')
+            home = match.get('home_team', '?') or '?'
+            away = match.get('away_team', '?') or '?'
             minute = match.get('minute', 0)
-            score = match.get('ss', '?-?')
+            score = match.get('ss', '?-?') or '?-?'
             
-            # Log every update
+            # Debug: show raw data if teams missing
+            if home == '?' or away == '?':
+                logger.debug(f"[BET365_RAW] mid={match.get('match_id')} data={match}")
+            
             logger.info(f"[BET365] {home} {score} {away} min={minute}")
             
-            # Forward to linker
             if self.linker and self.linker.running:
                 await self.linker.on_fast_feed(match)
         
@@ -167,7 +164,7 @@ class ArbitrageBot:
 
         # Start linker
         await self.linker.start()
-        logger.success("MatchLinker started - hunting for slow games")
+        logger.success("MatchLinker started - hunting for 5+ second lag")
 
         # Health monitoring
         self._cleanup_task = asyncio.create_task(self._page_cleanup_loop())
@@ -175,10 +172,10 @@ class ArbitrageBot:
 
         logger.success("=" * 70)
         logger.success("ALL SYSTEMS RUNNING")
-        logger.success("Waiting for: Bet365 data → Link → Slow detection → Goal")
+        logger.success("Lag detection: Bet365 seconds vs SportyBet seconds")
         logger.success("=" * 70)
         
-        await self.alerter.send("🟢 BOT RUNNING - Waiting for slow game")
+        await self.alerter.send("🟢 BOT RUNNING - Seconds-level lag detection")
 
         while self.running:
             if self.executor and self.executor.stopped:
@@ -188,7 +185,6 @@ class ArbitrageBot:
             await asyncio.sleep(1)
 
     async def _monitor_feeds(self):
-        """Monitor both feeds."""
         while self.running:
             await asyncio.sleep(30)
             b365_ok = self.bet365.is_healthy() if self.bet365 else False
@@ -199,20 +195,14 @@ class ArbitrageBot:
                 sm = self.linker.slow_match
                 slow_status = f"{sm.get('home_team','?')} vs {sm.get('away_team','?')}"
             
-            logger.info(
-                f"[HEALTH] Bet365={'✓' if b365_ok else '✗'} "
-                f"SportyBet={'✓' if sb_ok else '✗'} "
-                f"Slow=[{slow_status}]"
-            )
+            logger.info(f"[HEALTH] Bet365={'✓' if b365_ok else '✗'} SportyBet={'✓' if sb_ok else '✗'} Slow=[{slow_status}]")
 
     async def _on_poly_backup(self, match):
-        """Only use Polymarket if Bet365 is down."""
         if self.bet365.is_healthy():
             return
         await self.linker.on_fast_feed(match)
 
     async def on_new_link(self, sb_match: dict):
-        """Open page when slow match found."""
         mid = sb_match.get("match_id")
         if not mid or mid in self.match_pages or mid in self._opening_pages:
             return
@@ -261,10 +251,7 @@ class ArbitrageBot:
         if not eid.startswith("sr:match:"):
             digits = re.search(r"(\d+)", str(eid))
             eid = f"sr:match:{digits.group(1) if digits else mid}"
-        path = (
-            f"{self._slug(country)}/{self._slug(league)}/"
-            f"{self._slug(home)}_vs_{self._slug(away)}/{eid}"
-        )
+        path = f"{self._slug(country)}/{self._slug(league)}/{self._slug(home)}_vs_{self._slug(away)}/{eid}"
         desktop = f"https://www.sportybet.com/ng/sport/football/live/{path}"
         if desktop not in urls:
             urls.append(desktop)
@@ -345,7 +332,6 @@ class ArbitrageBot:
                 logger.debug(f"[CLEANUP] {e}")
 
     async def on_goal(self, goal_data: dict):
-        """Goal on slow match - place bet."""
         try:
             mid = goal_data["match_id"]
             if mid not in self.match_pages:
