@@ -84,22 +84,54 @@ class TelegramAlerter:
         except Exception as e:
             print(f"Telegram send error: {e}")
 
+    async def send_message(self, message: str, parse_mode: str = "HTML"):
+        """Alias for send()."""
+        await self.send(message, parse_mode)
+
     def _uptime(self) -> str:
         delta = datetime.now() - self.session_start
         hours, remainder = divmod(int(delta.total_seconds()), 3600)
         minutes, _ = divmod(remainder, 60)
         return f"{hours}h {minutes}m"
 
-    # NEW METHOD: Link notification
-    async def notify_link_found(self, home_team: str, away_team: str, sb_match_id: str):
-        """Notify when match is linked."""
+    # NEW METHODS FOR MANUAL SLOW GAME
+    async def notify_manual_slow_set(self, teams: str, bet365_id: str):
+        """Notify when manual slow game is set."""
+        self.matches_flagged_slow += 1
         msg = (
-            f"🔗 <b>MATCH LINKED</b>\n"
+            f"🐢 <b>SLOW GAME LOCKED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚽ {home_team} vs {away_team}\n"
-            f"🆔 SportyBet ID: <code>{sb_match_id}</code>\n"
+            f"⚽ {teams}\n"
+            f"🆔 Bet365 ID: <code>{bet365_id}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ Now monitoring for clock lag..."
+            f"✅ Groq will arm market + stake\n"
+            f"✅ Playwright waits on Confirm\n"
+            f"✅ Click Confirm on Bet365 goal"
+        )
+        await self.send(msg)
+
+    async def notify_ht_detected(self, teams: str):
+        """Notify when match goes HT."""
+        msg = (
+            f"⏸ <b>HALF TIME</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚽ {teams}\n\n"
+            f"Send new slow game:\n"
+            f"<code>slow</code>\n"
+            f"<code>SportyBet- URL</code>\n"
+            f"<code>Bet365- ID</code>\n"
+            f"<code>Teams- Team A vs Team B</code>"
+        )
+        await self.send(msg)
+
+    async def notify_match_returned(self, teams: str):
+        """Notify when match returns from HT."""
+        msg = (
+            f"🔄 <b>MATCH BACK FROM HT</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚽ {teams}\n\n"
+            f"Reply <code>yes</code> to switch back\n"
+            f"Reply <code>no</code> to stay on current"
         )
         await self.send(msg)
 
@@ -108,23 +140,9 @@ class TelegramAlerter:
             f"💰 <b>BOT STARTED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Starting balance: <b>₦{balance:,.2f}</b>\n"
-            f"Data sources: Bet365 (fast) + SportyBet (slow)\n"
-            f"Mode: Detect lag → Arm → Goal → Bet\n"
+            f"Mode: Manual slow game\n"
             f"Started: {self.session_start.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"━━━━━━━━━━━━━━━━━━━━"
-        )
-        await self.send(msg)
-
-    async def notify_slow_match_found(self, home_team: str, away_team: str, gap_seconds: float):
-        self.matches_flagged_slow += 1
-        msg = (
-            f"🐢 <b>SLOW MATCH DETECTED</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚽ {home_team} vs {away_team}\n"
-            f"⏱ Lag: {gap_seconds:.1f} seconds\n"
-            f"📊 Monitoring for goals...\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Total this session: {self.matches_flagged_slow}"
         )
         await self.send(msg)
 
@@ -134,7 +152,7 @@ class TelegramAlerter:
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚽ {match_name}\n"
             f"🎯 Goal #{goal_num} — {team}\n"
-            f"⏳ Placing bet now..."
+            f"⏳ Clicking Confirm..."
         )
         await self.send(msg)
 
@@ -223,40 +241,6 @@ class TelegramAlerter:
         )
         await self.send(msg)
 
-    async def notify_validation_start(self, match_name: str, team: str, odds: float,
-                                       goal_num: int, stake: float):
-        msg = (
-            f"🔬 <b>VALIDATION BET</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚽ {match_name}\n"
-            f"🎯 {team} @ {odds}\n"
-            f"💵 ₦{stake:,.2f}"
-        )
-        await self.send(msg)
-
-    async def notify_validation_step(self, step_name: str, detail: str):
-        msg = f"⚙️ <b>{step_name}</b>\n{detail}"
-        await self.send(msg)
-
-    async def notify_validation_result(self, success: bool, match_name: str,
-                                        team: str, stake: float, odds: float,
-                                        error_detail: str = None):
-        if success:
-            msg = (
-                f"✅ <b>VALIDATION SUCCESS</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"⚽ {match_name}\n"
-                f"🎉 Full staking now active!"
-            )
-        else:
-            msg = (
-                f"❌ <b>VALIDATION FAILED</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"⚽ {match_name}\n"
-                f"🔍 {error_detail}"
-            )
-        await self.send(msg)
-
     async def send_daily_report(self):
         msg = (
             f"📊 <b>REPORT</b>\n"
@@ -269,3 +253,116 @@ class TelegramAlerter:
             f"💸 Cashouts: {self.total_cashed_out}"
         )
         await self.send(msg)
+
+
+# Telegram command handler
+class TelegramCommandHandler:
+    def __init__(self, bot, alerter: TelegramAlerter):
+        self.bot = bot
+        self.alerter = alerter
+        self._last_update_id = 0
+        
+    async def start_polling(self):
+        """Poll Telegram for commands."""
+        while True:
+            try:
+                await self._poll_once()
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"[TG POLL] {e}")
+                await asyncio.sleep(5)
+                
+    async def _poll_once(self):
+        import aiohttp
+        
+        url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/getUpdates"
+        params = {"offset": self._last_update_id + 1, "limit": 10}
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+                if not data.get("ok"):
+                    return
+                    
+                for update in data.get("result", []):
+                    self._last_update_id = max(self._last_update_id, update["update_id"])
+                    await self._handle_update(update)
+
+    async def _handle_update(self, update: dict):
+        message = update.get("message", {})
+        text = message.get("text", "").strip()
+        chat_id = message.get("chat", {}).get("id")
+        
+        if str(chat_id) != str(Config.TELEGRAM_CHAT_ID):
+            return
+            
+        if not text:
+            return
+            
+        text_lower = text.lower()
+        
+        # Start command
+        if text_lower == "start":
+            await self.bot.start_bot()
+            return
+            
+        # Stop command
+        if text_lower == "stop":
+            await self.alerter.send("🛑 Stopping bot...")
+            self.bot.stop()
+            return
+            
+        # Login command: login PHONE PASSWORD
+        if text_lower.startswith("login "):
+            parts = text.split(maxsplit=2)
+            if len(parts) >= 3:
+                await self.bot.handle_login(parts[1], parts[2])
+            else:
+                await self.alerter.send("❌ Format: <code>login PHONE PASSWORD</code>")
+            return
+            
+        # Balance command: balance 5000
+        if text_lower.startswith("balance "):
+            try:
+                amount = float(text.split()[1])
+                await self.bot.handle_balance(amount)
+            except (IndexError, ValueError):
+                await self.alerter.send("❌ Format: <code>balance 5000</code>")
+            return
+            
+        # Slow game command (multi-line)
+        if text_lower.startswith("slow"):
+            await self._handle_slow_command(text)
+            return
+            
+        # Yes/No for switch-back
+        if text_lower in ("yes", "no") and self.bot._awaiting_switch_decision:
+            await self.bot.handle_switch_decision(text_lower)
+            return
+            
+    async def _handle_slow_command(self, text: str):
+        """Parse multi-line slow command."""
+        lines = text.strip().split("\n")
+        
+        sporty_url = None
+        bet365_id = None
+        teams = None
+        
+        for line in lines:
+            line = line.strip()
+            if line.lower().startswith("sportybet-"):
+                sporty_url = line.split("-", 1)[1].strip()
+            elif line.lower().startswith("bet365-"):
+                bet365_id = line.split("-", 1)[1].strip()
+            elif line.lower().startswith("teams-"):
+                teams = line.split("-", 1)[1].strip()
+                
+        if not sporty_url or not bet365_id:
+            await self.alerter.send(
+                "❌ Format:\n<code>slow</code>\n<code>SportyBet- URL</code>\n<code>Bet365- ID</code>\n<code>Teams- Team A vs Team B</code>"
+            )
+            return
+            
+        await self.bot.handle_slow_game(sporty_url, bet365_id, teams or "Unknown")
