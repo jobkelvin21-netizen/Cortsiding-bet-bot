@@ -8,3 +8,4 @@ websocket-client
 python-telegram-bot
 websockets
 curl_cffi
+groq
