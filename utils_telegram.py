@@ -117,7 +117,7 @@ class TelegramAlerter:
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚽ {teams}\n\n"
             f"Send new slow game:\n"
-            f"<code>slow</code>\n"
+            f"<code>/slow</code>\n"
             f"<code>SportyBet- URL</code>\n"
             f"<code>Bet365- ID</code>\n"
             f"<code>Teams- Team A vs Team B</code>"
@@ -255,7 +255,8 @@ class TelegramAlerter:
         await self.send(msg)
 
 
-# Telegram command handler
+# ==================== TELEGRAM COMMAND HANDLER ====================
+
 class TelegramCommandHandler:
     def __init__(self, bot, alerter: TelegramAlerter):
         self.bot = bot
@@ -303,37 +304,51 @@ class TelegramCommandHandler:
             
         text_lower = text.lower()
         
-        # Start command
-        if text_lower == "start":
-            await self.bot.start_bot()
+        # Start command (/start or start)
+        if text_lower in ("/start", "start"):
+            await self.alerter.send(
+                "🟢 <b>Bot Started</b>\n\n"
+                "Login methods:\n"
+                "1️⃣ <code>/login PHONE PASSWORD</code>\n"
+                "2️⃣ Run <code>python main.py</code> in terminal\n\n"
+                "Commands:\n"
+                "/login PHONE PASS - Login\n"
+                "/balance AMOUNT - Set balance\n"
+                "/slow - Set slow game\n"
+                "/stop - Stop bot\n"
+                "yes/no - Switch back after HT"
+            )
             return
             
-        # Stop command
-        if text_lower == "stop":
+        # Stop (/stop or stop)
+        if text_lower in ("/stop", "stop"):
             await self.alerter.send("🛑 Stopping bot...")
             self.bot.stop()
             return
             
-        # Login command: login PHONE PASSWORD
-        if text_lower.startswith("login "):
+        # Login (/login PHONE PASSWORD or login PHONE PASSWORD)
+        if text_lower.startswith("/login ") or text_lower.startswith("login "):
             parts = text.split(maxsplit=2)
             if len(parts) >= 3:
-                await self.bot.handle_login(parts[1], parts[2])
+                # Remove / if present
+                phone = parts[1].replace("/", "")
+                password = parts[2]
+                await self.bot.telegram_login(phone, password)
             else:
-                await self.alerter.send("❌ Format: <code>login PHONE PASSWORD</code>")
+                await self.alerter.send("❌ Format: <code>/login 08012345678 mypassword</code>")
             return
             
-        # Balance command: balance 5000
-        if text_lower.startswith("balance "):
+        # Balance (/balance 5000 or balance 5000)
+        if text_lower.startswith("/balance ") or text_lower.startswith("balance "):
             try:
-                amount = float(text.split()[1])
+                amount = float(text.split()[1].replace("/", ""))
                 await self.bot.handle_balance(amount)
             except (IndexError, ValueError):
-                await self.alerter.send("❌ Format: <code>balance 5000</code>")
+                await self.alerter.send("❌ Format: <code>/balance 5000</code>")
             return
             
-        # Slow game command (multi-line)
-        if text_lower.startswith("slow"):
+        # Slow game (/slow or slow)
+        if text_lower.startswith("/slow") or text_lower.startswith("slow"):
             await self._handle_slow_command(text)
             return
             
@@ -361,7 +376,7 @@ class TelegramCommandHandler:
                 
         if not sporty_url or not bet365_id:
             await self.alerter.send(
-                "❌ Format:\n<code>slow</code>\n<code>SportyBet- URL</code>\n<code>Bet365- ID</code>\n<code>Teams- Team A vs Team B</code>"
+                "❌ Format:\n<code>/slow</code>\n<code>SportyBet- URL</code>\n<code>Bet365- ID</code>\n<code>Teams- Team A vs Team B</code>"
             )
             return
             
