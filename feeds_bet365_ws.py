@@ -1,9 +1,11 @@
-"""Bet365 InPlay WS — Chrome with Proton VPN extension only."""
+"""Bet365 InPlay WS — Launch normal Chrome with VPN extension."""
 
 import asyncio
 import os
 import re
 import time
+import subprocess
+import urllib.request
 from typing import Callable, Dict, List, Optional
 
 from loguru import logger
@@ -152,74 +154,49 @@ class Bet365Feed:
             if score_changed and self.callback:
                 asyncio.create_task(self._notify(rec))
 
-    async def _check_vpn_connected(self, page) -> bool:
-        """Check if Proton VPN extension is connected by checking IP."""
+    def _ensure_chrome_running(self):
+        """Launch Chrome like a human double-clicking it."""
         try:
-            await page.goto("https://ipinfo.io/json", timeout=10000)
-            await asyncio.sleep(1)
-            content = await page.evaluate("() => document.body.innerText")
-            # Look for non-local IP (not starting with 10., 172., 192.)
-            import json
-            data = json.loads(content)
-            ip = data.get("ip", "")
-            country = data.get("country", "")
-            logger.info(f"[BET365] Current IP: {ip}, Country: {country}")
-            # If you know your VPN country, check it here
-            return True
-        except Exception as e:
-            logger.warning(f"[BET365] Could not check IP: {e}")
-            return True  # Proceed anyway
-
-    async def _wait_for_vpn_extension(self, page):
-        """Wait for Proton VPN extension to initialize."""
-        logger.info("[BET365] Waiting for Proton VPN extension (5s)...")
-        await asyncio.sleep(5)  # Give extension time to connect
+            # Check if Chrome already running with remote debugging
+            urllib.request.urlopen("http://localhost:9222/json/version", timeout=2)
+            logger.info("[BET365] Chrome already running")
+            return "http://localhost:9222"
+        except:
+            pass
         
-        # Optional: Check IP to confirm VPN is active
-        await self._check_vpn_connected(page)
+        # Launch Chrome normally (like you clicked the icon)
+        cmd = [
+            "google-chrome",
+            "--remote-debugging-port=9222",
+            "--user-data-dir=" + os.path.expanduser("~/.config/google-chrome"),
+            "--no-first-run",
+        ]
         
-        # Navigate back to about:blank before loading Bet365
-        await page.goto("about:blank")
+        logger.info("[BET365] Launching Chrome...")
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(4)  # Wait for Chrome to open
+        
+        return "http://localhost:9222"
 
     async def _run_session(self) -> bool:
-        """Chrome session with Proton VPN extension (browser VPN only)."""
-        logger.info("[BET365] starting session (Chrome + Proton VPN extension)")
+        """Connect to normal Chrome browser."""
+        logger.info("[BET365] starting session...")
         got_403 = False
-        
-        # IMPORTANT: Use the same profile where Proton VPN extension is installed
-        profile = os.path.abspath("chrome_profile_bet365")
 
         async with async_playwright() as p:
-            kwargs = dict(
-                user_data_dir=profile,  # This loads your Chrome profile with extensions
-                channel="chrome",
-                headless=False,  # MUST be False for extensions to work
-                no_viewport=True,
-                locale="en-GB",
-                ignore_default_args=["--enable-automation"],
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--start-maximized",
-                    "--disable-dev-shm-usage",
-                    # Allow extensions to load
-                    "--disable-extensions-except=",
-                    "--load-extension=",
-                ],
-            )
-
+            # Launch/connect to normal Chrome
+            cdp_url = self._ensure_chrome_running()
+            
             try:
-                context = await p.chromium.launch_persistent_context(**kwargs)
+                browser = await p.chromium.connect_over_cdp(cdp_url)
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
             except Exception as e:
-                logger.error(f"[BET365] launch fail: {e}")
+                logger.error(f"[BET365] connect failed: {e}")
                 return False
 
             self._context = context
             page = context.pages[0] if context.pages else await context.new_page()
             self._page = page
-
-            # Wait for VPN extension to connect
-            await self._wait_for_vpn_extension(page)
 
             def on_response(resp):
                 nonlocal got_403
@@ -260,9 +237,7 @@ class Bet365Feed:
                     timeout=45000,
                 )
                 if (resp and resp.status == 403) or got_403:
-                    logger.warning("[BET365] 403 on load — is Proton VPN extension connected?")
-                    logger.warning("[BET365] Manually check the extension icon in Chrome toolbar")
-                    await context.close()
+                    logger.warning("[BET365] 403 — VPN not connected?")
                     return False
 
                 await asyncio.sleep(2)
@@ -276,12 +251,11 @@ class Bet365Feed:
                     except Exception:
                         pass
 
-                logger.success("[BET365] WS live (Chrome + Proton VPN extension)")
+                logger.success("[BET365] WS live")
 
                 while self.running:
                     if got_403:
                         logger.warning("[BET365] 403 during session")
-                        await context.close()
                         return False
                     idle = time.time() - (self._last_message_at or time.time())
                     if self._last_message_at and idle > 90:
@@ -289,14 +263,9 @@ class Bet365Feed:
                         break
                     await asyncio.sleep(2)
 
-                await context.close()
                 return True
             except Exception as e:
-                logger.error(f"[BET365] {e}")
-                try:
-                    await context.close()
-                except Exception:
-                    pass
+                logger.error(f"[BET365] error: {e}")
                 return False
 
     async def _supervisor(self):
@@ -305,8 +274,7 @@ class Bet365Feed:
             if not self.running:
                 break
             if not ok:
-                logger.warning("[BET365] session failed — retry in 5s")
-                logger.warning("[BET365] Make sure Proton VPN extension is connected!")
+                logger.warning("[BET365] failed — retry in 5s")
             else:
                 logger.info("[BET365] reconnecting in 3s...")
             await asyncio.sleep(5.0 if not ok else 3.0)
@@ -316,7 +284,7 @@ class Bet365Feed:
             return
         self.running = True
         self._task = asyncio.create_task(self._supervisor())
-        logger.success("[BET365] started (Chrome + Proton VPN extension)")
+        logger.success("[BET365] started")
 
     def stop(self):
         self.running = False
