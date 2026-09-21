@@ -1,4 +1,4 @@
-"""Bet365 InPlay WS — Launch normal Chrome with VPN extension."""
+"""Bet365 InPlay WS — Auto-launch Chrome with VPN."""
 
 import asyncio
 import os
@@ -154,44 +154,56 @@ class Bet365Feed:
             if score_changed and self.callback:
                 asyncio.create_task(self._notify(rec))
 
-    def _ensure_chrome_running(self):
-        """Launch Chrome like a human double-clicking it."""
+    def _launch_chrome(self):
+        """Launch Chrome and wait until it's ready."""
+        # Check if Chrome already running with debugging
         try:
-            # Check if Chrome already running with remote debugging
             urllib.request.urlopen("http://localhost:9222/json/version", timeout=2)
             logger.info("[BET365] Chrome already running")
-            return "http://localhost:9222"
+            return
         except:
             pass
         
-        # Launch Chrome normally (like you clicked the icon)
-        cmd = [
+        # Launch Chrome
+        logger.info("[BET365] Launching Chrome...")
+        subprocess.Popen([
             "google-chrome",
             "--remote-debugging-port=9222",
             "--user-data-dir=" + os.path.expanduser("~/.config/google-chrome"),
             "--no-first-run",
-        ]
+            "--start-maximized",
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        logger.info("[BET365] Launching Chrome...")
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(4)  # Wait for Chrome to open
+        # Wait for Chrome to fully start (keep trying for 30 seconds)
+        logger.info("[BET365] Waiting for Chrome to start...")
+        for i in range(30):
+            try:
+                urllib.request.urlopen("http://localhost:9222/json/version", timeout=1)
+                logger.info("[BET365] Chrome is ready!")
+                logger.info("[BET365] === CONNECT YOUR VPN NOW ===")
+                logger.info("[BET365] Waiting 15 seconds for VPN...")
+                time.sleep(15)
+                return
+            except:
+                time.sleep(1)
         
-        return "http://localhost:9222"
+        logger.error("[BET365] Chrome failed to start")
 
     async def _run_session(self) -> bool:
-        """Connect to normal Chrome browser."""
+        """Connect to Chrome browser."""
         logger.info("[BET365] starting session...")
         got_403 = False
 
+        # Launch Chrome first (outside async)
+        self._launch_chrome()
+        
         async with async_playwright() as p:
-            # Launch/connect to normal Chrome
-            cdp_url = self._ensure_chrome_running()
-            
             try:
-                browser = await p.chromium.connect_over_cdp(cdp_url)
+                # Connect to the Chrome we just opened
+                browser = await p.chromium.connect_over_cdp("http://localhost:9222")
                 context = browser.contexts[0] if browser.contexts else await browser.new_context()
             except Exception as e:
-                logger.error(f"[BET365] connect failed: {e}")
+                logger.error(f"[BET365] failed to connect: {e}")
                 return False
 
             self._context = context
@@ -237,7 +249,7 @@ class Bet365Feed:
                     timeout=45000,
                 )
                 if (resp and resp.status == 403) or got_403:
-                    logger.warning("[BET365] 403 — VPN not connected?")
+                    logger.warning("[BET365] 403 on load — VPN not connected?")
                     return False
 
                 await asyncio.sleep(2)
@@ -251,7 +263,7 @@ class Bet365Feed:
                     except Exception:
                         pass
 
-                logger.success("[BET365] WS live")
+                logger.success("[BET365] WS live (VPN connected)")
 
                 while self.running:
                     if got_403:
@@ -274,7 +286,7 @@ class Bet365Feed:
             if not self.running:
                 break
             if not ok:
-                logger.warning("[BET365] failed — retry in 5s")
+                logger.warning("[BET365] session failed — retry in 5s")
             else:
                 logger.info("[BET365] reconnecting in 3s...")
             await asyncio.sleep(5.0 if not ok else 3.0)
