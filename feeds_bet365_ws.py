@@ -1,4 +1,4 @@
-"""Bet365 InPlay WS — Simple Chrome with VPN."""
+"""Bet365 InPlay WS — Chrome with VPN extension."""
 
 import asyncio
 import os
@@ -156,19 +156,24 @@ class Bet365Feed:
         """Launch Chrome with your existing profile (VPN included)."""
         logger.info("[BET365] Launching Chrome with your profile...")
         got_403 = False
-        
-        # Use your actual Chrome profile where VPN extension is installed
+
         profile = os.path.expanduser("~/.config/google-chrome")
 
         async with async_playwright() as p:
             try:
-                # Launch Chrome with your existing profile
                 context = await p.chromium.launch_persistent_context(
                     user_data_dir=profile,
                     channel="chrome",
                     headless=False,
                     no_viewport=True,
                     locale="en-GB",
+                    # FIX: tell Playwright NOT to auto-disable extensions —
+                    # without this, your VPN extension gets silently disabled
+                    # even though it's installed in this exact profile.
+                    ignore_default_args=[
+                        "--disable-extensions",
+                        "--disable-component-extensions-with-background-pages",
+                    ],
                     args=[
                         "--disable-blink-features=AutomationControlled",
                         "--no-sandbox",
@@ -178,7 +183,16 @@ class Bet365Feed:
                 )
             except Exception as e:
                 logger.error(f"[BET365] Launch failed: {e}")
-                logger.error("[BET365] Close Chrome completely and try again")
+                # FIX: this specific error almost always means your real
+                # Chrome (with the profile already open) is still running.
+                # Chrome locks the profile directory — only one process can
+                # use it at a time.
+                logger.error(
+                    "[BET365] If this says 'profile in use' or similar — "
+                    "close your normal Chrome browser COMPLETELY first "
+                    "(check it's not just minimized — quit it entirely), "
+                    "then run the bot again."
+                )
                 return False
 
             self._context = context
