@@ -1,4 +1,4 @@
-"""Bet365 InPlay WS — goals + page for AI ticker screenshots."""
+"""Bet365 InPlay WS only — score/clock by match_id. No page scrape."""
 
 import asyncio
 import os
@@ -58,7 +58,7 @@ class ProxyRotator:
 SS_RE = re.compile(r"(?:^|[|;,\s])SS=(\d{1,2})\s*[-:]\s*(\d{1,2})", re.I)
 ID_RE = re.compile(r"(?:^|[|;,\s])(?:ID|FI)=(\d+)", re.I)
 TM_RE = re.compile(r"(?:^|[|;,\s])TM=(\d+)", re.I)
-OV_ID_RE = re.compile(r"OV\d+-(\d+)_\d+_\d+U")
+OV_ID_RE = re.compile(r"OV\d+-(\d+)_\d+_\d+U?", re.I)
 
 
 class Bet365Feed:
@@ -71,8 +71,7 @@ class Bet365Feed:
         self._task = None
         self.alerter = None
         self._ws_url: Optional[str] = None
-        self._page = None  # for AI screenshots
-        self._scraped_teams: Dict[str, dict] = {}
+        self._page = None
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -114,8 +113,6 @@ class Bet365Feed:
         raw = (raw or "").replace("\x01", "").strip()
         if not raw:
             return
-        if "SS=" in raw or "NA=" in raw:
-            logger.debug(f"[BET365 RAW] {raw[:200]}...")
 
         parts = re.split(r"F\|", raw)
         for part in parts:
@@ -131,11 +128,10 @@ class Bet365Feed:
                 k, v = b.split("=", 1)
                 data[k.strip().upper()] = v.strip()
 
-            mid = data.get("ID") or data.get("FI")
-            if not mid:
-                mid = self._extract_id(part)
+            mid = data.get("ID") or data.get("FI") or self._extract_id(part)
             if not mid:
                 continue
+            mid = str(mid)
 
             rec = self.matches.get(
                 mid,
@@ -150,33 +146,9 @@ class Bet365Feed:
                     "tm": "",
                     "minute": 0,
                     "played_seconds": 0,
-                    "name": "",
                     "updated": 0.0,
                 },
             )
-
-            if mid in self._scraped_teams and not rec.get("home_team"):
-                scraped = self._scraped_teams[mid]
-                rec["home_team"] = scraped.get("home_team", "")
-                rec["away_team"] = scraped.get("away_team", "")
-
-            if "NA" in data:
-                name = data["NA"]
-                rec["name"] = name
-                low = name.lower()
-                if " v " in low or " vs " in low:
-                    sep = " v " if " v " in low else " vs "
-                    bits = re.split(sep, name, flags=re.I, maxsplit=1)
-                    if len(bits) == 2:
-                        rec["home_team"] = bits[0].strip()
-                        rec["away_team"] = bits[1].strip()
-                        self._scraped_teams[mid] = {
-                            "home_team": rec["home_team"],
-                            "away_team": rec["away_team"],
-                        }
-                        logger.info(
-                            f"[BET365 TEAMS] {rec['home_team']} vs {rec['away_team']} (ID={mid})"
-                        )
 
             score_changed = False
             if "SS" in data:
@@ -189,9 +161,7 @@ class Bet365Feed:
                     rec["away_score"] = a
                     if old and old != rec["ss"]:
                         score_changed = True
-                        logger.success(
-                            f"[BET365][GOAL] {rec.get('home_team') or mid} {old}→{rec['ss']}"
-                        )
+                        logger.success(f"[BET365][GOAL] id={mid} {old}→{rec['ss']}")
 
             if "TM" in data:
                 try:
@@ -211,104 +181,20 @@ class Bet365Feed:
                 h, a = int(m.group(1)), int(m.group(2))
                 ss = f"{h}-{a}"
                 if rec.get("ss") != ss:
+                    old = rec.get("ss", "")
                     rec["ss"] = ss
                     rec["home_score"] = h
                     rec["away_score"] = a
-                    score_changed = True
+                    if old:
+                        score_changed = True
+                        logger.success(f"[BET365][GOAL] id={mid} {old}→{ss}")
 
             rec["updated"] = time.time()
             self.matches[mid] = rec
             self._last_message_at = time.time()
 
-            if rec.get("home_team") and rec.get("ss"):
-                logger.info(
-                    f"[BET365] {rec['home_team']} {rec['ss']} {rec['away_team']} min={rec.get('tm')}"
-                )
-
-            if self.callback and (rec.get("home_team") or score_changed):
+            if score_changed and self.callback:
                 asyncio.create_task(self._notify(rec))
-
-    async def _scrape_live_matches(self, page) -> Dict[str, dict]:
-        teams_map = {}
-        try:
-            logger.info("[BET365] Scraping team names from page...")
-            await asyncio.sleep(3)
-            for i in range(5):
-                await page.evaluate(f"window.scrollBy(0, {500 + i * 100})")
-                await asyncio.sleep(0.5)
-            await asyncio.sleep(2)
-
-            selectors = [
-                '[data-automation-id*="event"]',
-                '[data-automation-id*="match"]',
-                '[class*="EventWrapper"]',
-                '[class*="Fixture"]',
-                ".src-StandardFixture",
-                ".src-EventWrapper",
-            ]
-
-            for selector in selectors:
-                try:
-                    elements = await page.locator(selector).all()
-                    logger.debug(f"[BET365 SCRAPE] Found {len(elements)} with {selector}")
-                    for el in elements:
-                        try:
-                            attrs = await el.evaluate(
-                                "el => Object.fromEntries(Object.entries(el.dataset))"
-                            )
-                            event_id = (
-                                attrs.get("eventid")
-                                or attrs.get("eventId")
-                                or attrs.get("automationId")
-                                or ""
-                            )
-                            if event_id:
-                                m = re.search(r"(\d{6,})", str(event_id))
-                                if m:
-                                    event_id = m.group(1)
-                            if not event_id:
-                                onclick = await el.get_attribute("onclick") or ""
-                                m = re.search(r"(\d{6,})", onclick)
-                                if m:
-                                    event_id = m.group(1)
-                            if not event_id:
-                                continue
-                            text = await el.inner_text()
-                            lines = [l.strip() for l in text.split("\n") if l.strip()]
-                            for line in lines:
-                                line_lower = line.lower()
-                                if " v " in line_lower or " vs " in line_lower:
-                                    sep = " v " if " v " in line_lower else " vs "
-                                    parts = line.split(sep, 1)
-                                    if len(parts) == 2:
-                                        home, away = parts[0].strip(), parts[1].strip()
-                                        if len(home) > 2 and len(away) > 2 and home != away:
-                                            teams_map[event_id] = {
-                                                "home_team": home,
-                                                "away_team": away,
-                                            }
-                                            logger.info(
-                                                f"[BET365 SCRAPE] {event_id}: {home} v {away}"
-                                            )
-                                            break
-                        except Exception as e:
-                            logger.debug(f"[BET365 SCRAPE] element error: {e}")
-                    if teams_map:
-                        break
-                except Exception as e:
-                    logger.debug(f"[BET365 SCRAPE] selector {selector} failed: {e}")
-
-            logger.success(f"[BET365 SCRAPE] {len(teams_map)} matches with team names")
-            if self.alerter:
-                try:
-                    await self.alerter.send(
-                        f"✅ Bet365 scraped {len(teams_map)} team names"
-                    )
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.error(f"[BET365 SCRAPE] error: {e}")
-        return teams_map
 
     async def _run_with_proxy(self, proxy: Any) -> bool:
         key = proxy.get("server") if isinstance(proxy, dict) else str(proxy)
@@ -341,14 +227,13 @@ class Bet365Feed:
                 return False
 
             page = context.pages[0] if context.pages else await context.new_page()
-            self._page = page  # <-- AI screenshots
+            self._page = page
 
             def on_response(resp):
                 nonlocal got_403
                 try:
                     if resp.status == 403:
                         got_403 = True
-                        logger.warning(f"[BET365] 403 on {resp.url[:80]}")
                 except Exception:
                     pass
 
@@ -356,7 +241,7 @@ class Bet365Feed:
 
             def on_websocket(ws):
                 self._ws_url = ws.url
-                logger.success(f"[BET365][WS] Connected: {ws.url[:60]}")
+                logger.success(f"[BET365][WS] {ws.url[:70]}")
 
                 def on_frame(ev):
                     try:
@@ -366,10 +251,10 @@ class Bet365Feed:
                             if isinstance(payload, (bytes, bytearray))
                             else str(payload)
                         )
-                        if "SS=" in text or "TM=" in text or "EV;" in text:
+                        if "SS=" in text or "TM=" in text or "ID=" in text or "FI=" in text:
                             self._parse_frame(text)
                     except Exception as e:
-                        logger.debug(f"[BET365] frame error: {e}")
+                        logger.debug(f"[BET365] frame: {e}")
 
                 ws.on("framereceived", on_frame)
 
@@ -380,65 +265,36 @@ class Bet365Feed:
                     Config.BET365_LIVE_URL, wait_until="domcontentloaded", timeout=45000
                 )
                 if (resp and resp.status == 403) or got_403:
-                    logger.warning("[BET365] 403 on page load")
                     await context.close()
                     return False
 
-                await asyncio.sleep(3)
-                if got_403:
-                    await context.close()
-                    return False
-
-                for sel in ("text=Football", "text=Soccer", 'a[href*="IP"]'):
+                await asyncio.sleep(2)
+                for sel in ("text=Football", "text=Soccer"):
                     try:
                         loc = page.locator(sel)
                         if await loc.count() > 0:
                             await loc.first.click(timeout=2000)
-                            logger.info("[BET365] clicked Football")
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(1.5)
                             break
                     except Exception:
                         pass
 
-                self._scraped_teams = await self._scrape_live_matches(page)
-                for mid, teams in self._scraped_teams.items():
-                    if mid not in self.matches:
-                        self.matches[mid] = {
-                            "source": "bet365",
-                            "match_id": mid,
-                            "home_team": teams["home_team"],
-                            "away_team": teams["away_team"],
-                            "home_score": 0,
-                            "away_score": 0,
-                            "ss": "",
-                            "tm": "",
-                            "minute": 0,
-                            "played_seconds": 0,
-                            "updated": time.time(),
-                        }
-                    else:
-                        self.matches[mid]["home_team"] = teams["home_team"]
-                        self.matches[mid]["away_team"] = teams["away_team"]
-
-                logger.success(
-                    f"[BET365] feed LIVE with {len(self._scraped_teams)} scraped teams"
-                )
+                logger.success("[BET365] WS live (no scrape)")
 
                 while self.running:
                     if got_403:
-                        logger.warning("[BET365] 403 — rotating proxy")
                         await context.close()
                         return False
                     idle = time.time() - (self._last_message_at or 0)
                     if idle > 60:
-                        logger.warning(f"[BET365] idle {idle:.0f}s — reconnecting")
+                        logger.warning(f"[BET365] idle {idle:.0f}s")
                         break
                     await asyncio.sleep(2)
 
                 await context.close()
                 return True
             except Exception as e:
-                logger.error(f"[BET365] error: {e}")
+                logger.error(f"[BET365] {e}")
                 try:
                     await context.close()
                 except Exception:
@@ -449,7 +305,6 @@ class Bet365Feed:
         while self.running:
             proxy = self.rotator.get_next()
             if proxy is None:
-                logger.warning("[BET365] all proxies bad — resetting")
                 self.rotator.reset()
                 proxy = self.rotator.get_next()
             ok = await self._run_with_proxy(proxy)
@@ -457,7 +312,6 @@ class Bet365Feed:
                 break
             if not ok and proxy:
                 self.rotator.mark_bad(proxy)
-            logger.info("[BET365] reconnecting in 2s...")
             await asyncio.sleep(2.0)
 
     async def start(self):
@@ -465,10 +319,9 @@ class Bet365Feed:
             return
         self.running = True
         self._task = asyncio.create_task(self._supervisor())
-        logger.success("[BET365] feed started (primary)")
+        logger.success("[BET365] started")
 
     def stop(self):
         self.running = False
         if self._task:
             self._task.cancel()
-        logger.info("[BET365] feed stopped")
