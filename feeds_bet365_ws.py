@@ -1,9 +1,9 @@
-"""Bet365 InPlay WS — Connect to your open Chrome."""
+"""Bet365 InPlay WS — Simple Chrome with VPN."""
 
 import asyncio
+import os
 import re
 import time
-import urllib.request
 from typing import Callable, Dict, List, Optional
 
 from loguru import logger
@@ -11,7 +11,6 @@ from playwright.async_api import async_playwright
 
 from config import Config
 
-# ALL ORIGINAL REGEX PATTERNS PRESERVED
 SS_RE = re.compile(r"(?:^|[|;,\s])SS=(\d{1,2})\s*[-:]\s*(\d{1,2})", re.I)
 ID_RE = re.compile(r"(?:^|[|;,\s])(?:ID|FI)=(\d+)", re.I)
 TM_RE = re.compile(r"(?:^|[|;,\s])TM=(\d+)", re.I)
@@ -30,7 +29,6 @@ class Bet365Feed:
         self._page = None
         self._context = None
 
-    # ALL ORIGINAL METHODS PRESERVED
     def set_alerter(self, alerter):
         self.alerter = alerter
 
@@ -67,7 +65,6 @@ class Bet365Feed:
             return m.group(1)
         return None
 
-    # COMPLETE ORIGINAL _parse_frame METHOD - NOTHING REMOVED
     def _parse_frame(self, raw: str):
         raw = (raw or "").replace("\x01", "").strip()
         if not raw:
@@ -155,26 +152,33 @@ class Bet365Feed:
             if score_changed and self.callback:
                 asyncio.create_task(self._notify(rec))
 
-    # ONLY THIS METHOD CHANGED - to connect to existing Chrome
     async def _run_session(self) -> bool:
-        """Connect to your already-open Chrome."""
-        logger.info("[BET365] Connecting to Chrome...")
+        """Launch Chrome with your existing profile (VPN included)."""
+        logger.info("[BET365] Launching Chrome with your profile...")
         got_403 = False
-
-        # Check Chrome is running with debugging
-        try:
-            urllib.request.urlopen("http://localhost:9222/json/version", timeout=2)
-        except:
-            logger.error("[BET365] Chrome not running with debugging port")
-            logger.error("[BET365] Run: google-chrome --remote-debugging-port=9222")
-            return False
+        
+        # Use your actual Chrome profile where VPN extension is installed
+        profile = os.path.expanduser("~/.config/google-chrome")
 
         async with async_playwright() as p:
             try:
-                browser = await p.chromium.connect_over_cdp("http://localhost:9222")
-                context = browser.contexts[0] if browser.contexts else await browser.new_context()
+                # Launch Chrome with your existing profile
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=profile,
+                    channel="chrome",
+                    headless=False,
+                    no_viewport=True,
+                    locale="en-GB",
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--start-maximized",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
             except Exception as e:
-                logger.error(f"[BET365] Failed to connect: {e}")
+                logger.error(f"[BET365] Launch failed: {e}")
+                logger.error("[BET365] Close Chrome completely and try again")
                 return False
 
             self._context = context
@@ -214,34 +218,33 @@ class Bet365Feed:
             page.on("websocket", on_websocket)
 
             try:
-                # Navigate to Bet365 if not already there
-                current_url = page.url
-                if "bet365" not in current_url:
-                    resp = await page.goto(
-                        Config.BET365_LIVE_URL,
-                        wait_until="domcontentloaded",
-                        timeout=45000,
-                    )
-                    if (resp and resp.status == 403) or got_403:
-                        logger.warning("[BET365] 403 error")
-                        return False
+                resp = await page.goto(
+                    Config.BET365_LIVE_URL,
+                    wait_until="domcontentloaded",
+                    timeout=45000,
+                )
+                if (resp and resp.status == 403) or got_403:
+                    logger.warning("[BET365] 403 — VPN not connected?")
+                    await context.close()
+                    return False
 
-                    await asyncio.sleep(2)
-                    for sel in ("text=Football", "text=Soccer"):
-                        try:
-                            loc = page.locator(sel)
-                            if await loc.count() > 0:
-                                await loc.first.click(timeout=2000)
-                                await asyncio.sleep(1.5)
-                                break
-                        except Exception:
-                            pass
+                await asyncio.sleep(2)
+                for sel in ("text=Football", "text=Soccer"):
+                    try:
+                        loc = page.locator(sel)
+                        if await loc.count() > 0:
+                            await loc.first.click(timeout=2000)
+                            await asyncio.sleep(1.5)
+                            break
+                    except Exception:
+                        pass
 
-                logger.success("[BET365] WS live")
+                logger.success("[BET365] WS live (VPN active)")
 
                 while self.running:
                     if got_403:
                         logger.warning("[BET365] 403 during session")
+                        await context.close()
                         return False
                     idle = time.time() - (self._last_message_at or time.time())
                     if self._last_message_at and idle > 90:
@@ -249,12 +252,16 @@ class Bet365Feed:
                         break
                     await asyncio.sleep(2)
 
+                await context.close()
                 return True
             except Exception as e:
                 logger.error(f"[BET365] error: {e}")
+                try:
+                    await context.close()
+                except:
+                    pass
                 return False
 
-    # ALL ORIGINAL METHODS PRESERVED
     async def _supervisor(self):
         while self.running:
             ok = await self._run_session()
