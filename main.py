@@ -31,7 +31,8 @@ class ArbitrageBot:
     def __init__(self):
         self.account_manager = AccountManager()
         self.alerter = TelegramAlerter()
-        self.bet365 = Bet365Feed()
+        # Pass context later after login
+        self.bet365 = Bet365Feed(existing_context=None)
         self.bet365.set_alerter(self.alerter)
         self.executor = None
         self.match_pages = {}
@@ -45,7 +46,6 @@ class ArbitrageBot:
         self._current_total_goals = 0
         self._rearming = False
         self._logged_in = False
-        # True only after a successful Confirm on the last goal (so cashout makes sense)
         self._has_open_bet = False
 
     async def terminal_login(self):
@@ -67,13 +67,19 @@ class ArbitrageBot:
         from playwright.async_api import async_playwright
 
         self.playwright = await async_playwright().start()
+        # FIX: Use your Chrome profile with VPN extension
         self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=os.path.abspath("chrome_profile"),
+            user_data_dir=os.path.expanduser("~/.config/google-chrome"),
             channel="chrome",
             headless=False,
             no_viewport=True,
             locale="en-NG",
-            ignore_default_args=["--enable-automation"],
+            # FIX: Keep VPN extension enabled
+            ignore_default_args=[
+                "--enable-automation",
+                "--disable-extensions",
+                "--disable-component-extensions-with-background-pages",
+            ],
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -81,6 +87,11 @@ class ArbitrageBot:
                 "--disable-dev-shm-usage",
             ],
         )
+        
+        # FIX: Pass context to Bet365 so it uses same browser
+        self.bet365._context = self.context
+        self.bet365._owns_context = False
+        
         page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         await page.goto("https://www.sportybet.com/ng/", wait_until="domcontentloaded")
         await asyncio.sleep(2)
@@ -133,7 +144,7 @@ class ArbitrageBot:
                 self._current_total_goals = total
                 return
 
-            # GOAL CANCELLED / DISALLOWED — score went down
+            # GOAL CANCELLED / DISALLOWED
             if total < self._current_total_goals:
                 logger.warning(
                     f"[DISALLOWED] score {self._last_score} → {new_score} "
@@ -147,7 +158,7 @@ class ArbitrageBot:
                     )
                 return
 
-            # NORMAL GOAL — score went up
+            # NORMAL GOAL
             if total > self._current_total_goals:
                 home = self._manual_slow_match.get("home", "")
                 away = self._manual_slow_match.get("away", "")
@@ -162,7 +173,6 @@ class ArbitrageBot:
         logger.success("Bet365 up — send /slow on @Kelves_bot")
 
     async def _handle_disallowed(self, home_score: int, away_score: int, total_goals: int):
-        """Cashout only — goal was cancelled."""
         if not self._manual_slow_match:
             return
         mid = self._manual_slow_match.get("match_id")
@@ -188,7 +198,6 @@ class ArbitrageBot:
             )
             self._has_open_bet = False
 
-            # Re-arm Over for corrected score
             await self.alerter.send(f"🔄 Re-arm Over {total_goals + 0.5} after cancel…")
             self.executor.stop_watching(mid)
             await asyncio.sleep(1.5)
