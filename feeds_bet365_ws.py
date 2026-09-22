@@ -27,8 +27,8 @@ class Bet365Feed:
         self.alerter = None
         self._ws_url: Optional[str] = None
         self._page = None
-        self._context = existing_context  # Use context from main.py
-        self._owns_context = existing_context is None  # Only close if we created it
+        self._context = existing_context  # CHANGED: Use context from main.py
+        self._owns_context = False  # CHANGED: Track if we created it
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -158,7 +158,7 @@ class Bet365Feed:
         logger.info("[BET365] Opening Bet365 in new tab...")
         got_403 = False
 
-        # Use existing context from main.py, or launch new if none
+        # CHANGED: Use existing context from main.py, or launch new if none
         if self._context is None:
             async with async_playwright() as p:
                 self._context = await p.chromium.launch_persistent_context(
@@ -278,9 +278,10 @@ class Bet365Feed:
         self.running = False
         if self._task:
             self._task.cancel()
-        # Only close context if we created it
+        # CHANGED: Only close context if we created it
         if self._owns_context and self._context:
             try:
+                import asyncio
                 asyncio.get_event_loop().run_until_complete(self._context.close())
             except:
                 pass
