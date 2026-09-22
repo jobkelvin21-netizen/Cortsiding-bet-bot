@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manual slow via Telegram → Groq arm → Confirm on goal; cashout only if goal cancelled."""
+"""Manual /slow → full stake (no validation) → Confirm on Bet365 WS goal."""
 
 import asyncio
 import os
@@ -60,23 +60,19 @@ class ArbitrageBot:
     async def telegram_login(self, phone: str, password: str):
         await self.alerter.send("🔐 Logging in...")
         await self._do_login(phone, password)
-        await self.alerter.send("✅ Login OK — send <code>/balance 5000</code>")
+        await self.alerter.send("✅ Login OK — send balance then /slow")
 
     async def _do_login(self, phone: str, password: str):
         from playwright.async_api import async_playwright
 
         self.playwright = await async_playwright().start()
         self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=os.path.expanduser("~/.config/google-chrome"),  # CHANGED: Your profile with VPN
+            user_data_dir=os.path.abspath("chrome_profile"),
             channel="chrome",
             headless=False,
             no_viewport=True,
             locale="en-NG",
-            ignore_default_args=[  # CHANGED: Keep VPN extension enabled
-                "--enable-automation",
-                "--disable-extensions",
-                "--disable-component-extensions-with-background-pages",
-            ],
+            ignore_default_args=["--enable-automation"],
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
@@ -84,13 +80,12 @@ class ArbitrageBot:
                 "--disable-dev-shm-usage",
             ],
         )
-        # CHANGED: Pass context to Bet365
-        self.bet365._context = self.context
-        self.bet365._owns_context = False
-        
-        # YOUR ORIGINAL LOGIN CODE - UNCHANGED
         page = self.context.pages[0] if self.context.pages else await self.context.new_page()
-        await page.goto("https://www.sportybet.com/ng/", wait_until="domcontentloaded")
+        await page.goto(
+            "https://www.sportybet.com/ng/",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
         await asyncio.sleep(2)
         try:
             await page.click('button:has-text("Log In"), a:has-text("Log In")', timeout=5000)
@@ -107,6 +102,9 @@ class ArbitrageBot:
         self.executor = BetExecutor(self.alerter, self.account_manager, {}, None)
         self.executor.balance = balance
         self.executor.current_account = self.account_manager.get_active()
+        # No validation / test mode — full profit immediately
+        self.executor.validation_bet_placed = True
+        self.executor.validation_passed = True
         self._logged_in = True
         await self.alerter.notify_startup(balance)
         await self._start_feeds()
@@ -142,16 +140,11 @@ class ArbitrageBot:
                 return
 
             if total < self._current_total_goals:
-                logger.warning(
-                    f"[DISALLOWED] score {self._last_score} → {new_score} "
-                    f"(total {self._current_total_goals} → {total})"
-                )
+                logger.warning(f"[DISALLOWED] {self._last_score} → {new_score}")
                 self._last_score = new_score
                 self._current_total_goals = total
                 if self._has_open_bet:
-                    asyncio.create_task(
-                        self._handle_disallowed(h, a, total)
-                    )
+                    asyncio.create_task(self._handle_disallowed(h, a, total))
                 return
 
             if total > self._current_total_goals:
@@ -165,7 +158,7 @@ class ArbitrageBot:
 
         self.bet365.set_callback(bet365_callback)
         await self.bet365.start()
-        logger.success("Bet365 up — send /slow on @Kelves_bot")
+        logger.success("Bet365 CDP up — send /slow when ready")
 
     async def _handle_disallowed(self, home_score: int, away_score: int, total_goals: int):
         if not self._manual_slow_match:
@@ -186,14 +179,17 @@ class ArbitrageBot:
 
             await self.alerter.send(
                 f"🚫 <b>GOAL CANCELLED</b>\n⚽ {teams}\n"
-                f"Score now {home_score}-{away_score}\n💸 Cashing out…"
+                f"Score {home_score}-{away_score}\n💸 Cashing out…"
             )
-            ok = await self.executor.cashout_disallowed(
-                page, description=f"{teams} goal cancelled → {home_score}-{away_score}"
-            )
+            if hasattr(self.executor, "cashout_disallowed"):
+                ok = await self.executor.cashout_disallowed(
+                    page, description=f"{teams} cancelled → {home_score}-{away_score}"
+                )
+            else:
+                ok = False
             self._has_open_bet = False
 
-            await self.alerter.send(f"🔄 Re-arm Over {total_goals + 0.5} after cancel…")
+            await self.alerter.send(f"🔄 Re-arm Over {total_goals + 0.5}…")
             self.executor.stop_watching(mid)
             await asyncio.sleep(1.5)
             self.executor.start_watching(
@@ -214,10 +210,10 @@ class ArbitrageBot:
             watch = self.executor.get_watch(mid)
             armed = await self.executor.ai_arm_from_plan(page, None, watch)
             await self.alerter.send(
-                f"✅ Re-armed after cancel" if armed else "⚠️ Re-arm failed after cancel"
+                "✅ Re-armed after cancel" if armed else "⚠️ Re-arm failed"
             )
             if not ok:
-                await self.alerter.send("⚠️ Cashout may have failed — check My Bets")
+                await self.alerter.send("⚠️ Cashout check My Bets")
         finally:
             self._processing[mid] = False
             self._rearming = False
@@ -327,7 +323,7 @@ class ArbitrageBot:
         await self.alerter.notify_manual_slow_set(teams, b365)
         ok = await self._open_and_arm(self._manual_slow_match)
         await self.alerter.send(
-            f"✅ Armed — waiting goal id={b365}" if ok else "❌ Open/arm failed"
+            f"✅ Armed FULL stake — waiting goal id={b365}" if ok else "❌ Open/arm failed"
         )
 
     async def _open_and_arm(self, slow: dict) -> bool:
