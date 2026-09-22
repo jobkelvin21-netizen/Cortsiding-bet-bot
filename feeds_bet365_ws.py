@@ -1,22 +1,57 @@
-"""Bet365 WS via CDP (your Chrome + Proton). Alert on errors. Fast reconnect."""
+"""Bet365 WS via CDP — push football FI+name to Telegram; goals by FI."""
 
 import asyncio
 import re
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 from loguru import logger
 from playwright.async_api import async_playwright
 
 from config import Config
 
-SS_RE = re.compile(r"(?:^|[|;,\s])SS=(\d{1,2})\s*[-:]\s*(\d{1,2})", re.I)
-ID_RE = re.compile(r"(?:^|[|;,\s])(?:ID|FI)=(\d+)", re.I)
-TM_RE = re.compile(r"(?:^|[|;,\s])TM=(\d+)", re.I)
-OV_ID_RE = re.compile(r"OV\d+-(\d+)_\d+_\d+U?", re.I)
-
 CDP_URL = "http://127.0.0.1:9222"
 WS_IDLE_SECS = 90
+
+SS_RE = re.compile(r"(?:^|[|;,\s])SS=(\d{1,2})\s*[-:]\s*(\d{1,2})", re.I)
+FI_RE = re.compile(r"(?:^|[|;,\s])FI=(\d{6,})", re.I)
+ID_RE = re.compile(r"(?:^|[|;,\s])ID=(\d{6,})", re.I)
+NA_RE = re.compile(r"(?:^|[|;,\s])NA=([^|;]+)", re.I)
+TM_RE = re.compile(r"(?:^|[|;,\s])TM=(\d+)", re.I)
+OV_RE = re.compile(r"OV(\d{6,})C\d+", re.I)
+
+# Skip obvious non-football noise
+_SKIP = re.compile(
+    r"terrorist|counter-terror|darts|snooker|tennis|table tennis|"
+    r"volleyball|basketball|hockey|baseball|esport|cs:?go|valorant|"
+    r"league of legends|dota|ufc|boxing|mma|cricket|rugby",
+    re.I,
+)
+
+
+def _looks_football(na: str, ss: str = "") -> bool:
+    na = (na or "").strip()
+    if not na or not re.search(r"\s+v(?:s)?\.?\s+|\s+@\s+", na, re.I):
+        return False
+    if _SKIP.search(na):
+        return False
+    if ss:
+        try:
+            h, a = map(int, ss.replace(":", "-").split("-"))
+            if h > 15 or a > 15:  # unlikely football
+                return False
+        except Exception:
+            pass
+    return True
+
+
+def _split_teams(na: str):
+    na = (na or "").strip()
+    for sep in (r"\s+vs\.?\s+", r"\s+v\.?\s+", r"\s+@\s+"):
+        parts = re.split(sep, na, maxsplit=1, flags=re.I)
+        if len(parts) == 2:
+            return parts[0].strip(), parts[1].strip()
+    return na, ""
 
 
 class Bet365Feed:
@@ -27,11 +62,12 @@ class Bet365Feed:
         self._last_message_at: Optional[float] = None
         self._task = None
         self.alerter = None
-        self._ws_url: Optional[str] = None
+        self._ws_url = None
         self._page = None
         self._browser = None
         self._playwright = None
         self._last_alert_at = 0.0
+        self._announced: Set[str] = set()  # FI already sent to Telegram
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -39,7 +75,7 @@ class Bet365Feed:
     def set_callback(self, callback: Callable):
         self.callback = callback
 
-    async def _alert(self, text: str, min_gap: float = 30.0):
+    async def _alert(self, text: str, min_gap: float = 25.0):
         now = time.time()
         if now - self._last_alert_at < min_gap:
             return
@@ -69,39 +105,73 @@ class Bet365Feed:
             except Exception as e:
                 logger.debug(f"[BET365] callback: {e}")
 
-    def _extract_id(self, part: str) -> Optional[str]:
-        m = ID_RE.search(part)
-        if m:
-            return m.group(1)
-        m = OV_ID_RE.search(part)
-        if m:
-            return m.group(1)
-        m = re.search(r"\b(\d{7,})\b", part)
-        if m:
-            return m.group(1)
-        return None
+    async def _announce_match(self, fi: str, name: str, ss: str):
+        if fi in self._announced:
+            return
+        if not _looks_football(name, ss):
+            return
+        self._announced.add(fi)
+        msg = (
+            f"⚽ <b>FOOTBALL</b>\n"
+            f"🆔 FI=<code>{fi}</code>\n"
+            f"📋 {name}\n"
+            f"SS={ss or '?'}"
+        )
+        logger.info(f"[BET365] announce FI={fi} {name}")
+        if self.alerter:
+            try:
+                await self.alerter.send(msg)
+            except Exception:
+                pass
 
     def _parse_frame(self, raw: str):
         raw = (raw or "").replace("\x01", "").strip()
         if not raw:
             return
-        parts = re.split(r"F\|", raw)
+
+        parts = re.split(r"[|\x08]", raw)
+        cur_fi = None
+        cur_na = None
+        cur_ss = None
+        cur_tm = None
+
         for part in parts:
             part = part.strip()
-            if not part or part.startswith("U|") or part.startswith("CONFIG"):
+            if not part:
                 continue
-            blocks = part.split(";")
-            data = {}
-            for b in blocks[1:]:
-                if "=" not in b:
-                    continue
-                k, v = b.split("=", 1)
-                data[k.strip().upper()] = v.strip()
 
-            mid = data.get("ID") or data.get("FI") or self._extract_id(part)
-            if not mid:
+            m = NA_RE.search(part)
+            if m:
+                na = m.group(1).strip()
+                if re.search(r"\bv\b|\bvs\b|@", na, re.I) or " v " in na.lower():
+                    cur_na = na
+
+            m = FI_RE.search(part)
+            if m:
+                cur_fi = m.group(1)
+            else:
+                m = ID_RE.search(part)
+                if m and re.fullmatch(r"\d{6,}", m.group(1)):
+                    cur_fi = m.group(1)
+                else:
+                    m = OV_RE.search(part)
+                    if m:
+                        cur_fi = m.group(1)
+
+            m = SS_RE.search(part)
+            if m:
+                cur_ss = f"{int(m.group(1))}-{int(m.group(2))}"
+
+            m = TM_RE.search(part)
+            if m:
+                cur_tm = m.group(1)
+
+            if not cur_fi:
                 continue
-            mid = str(mid)
+            if not (cur_na or cur_ss):
+                continue
+
+            mid = str(cur_fi)
             rec = self.matches.get(
                 mid,
                 {
@@ -109,56 +179,60 @@ class Bet365Feed:
                     "match_id": mid,
                     "home_team": "",
                     "away_team": "",
+                    "name": "",
                     "home_score": 0,
                     "away_score": 0,
                     "ss": "",
                     "tm": "",
                     "minute": 0,
-                    "played_seconds": 0,
                     "updated": 0.0,
                 },
             )
+
+            if cur_na:
+                h, a = _split_teams(cur_na)
+                rec["name"] = cur_na
+                if h:
+                    rec["home_team"] = h
+                if a:
+                    rec["away_team"] = a
+                # Announce football once when we first get a name
+                asyncio.create_task(
+                    self._announce_match(mid, cur_na, cur_ss or rec.get("ss") or "")
+                )
+
             score_changed = False
-            if "SS" in data:
-                m = re.match(r"(\d+)\s*[-:]\s*(\d+)", data["SS"])
-                if m:
-                    h, a = int(m.group(1)), int(m.group(2))
-                    old = rec.get("ss", "")
-                    rec["ss"] = f"{h}-{a}"
-                    rec["home_score"] = h
-                    rec["away_score"] = a
-                    if old and old != rec["ss"]:
-                        score_changed = True
-                        logger.success(f"[BET365][GOAL] id={mid} {old}→{rec['ss']}")
-            if "TM" in data:
+            if cur_ss:
+                old = rec.get("ss") or ""
                 try:
-                    rec["tm"] = data["TM"]
-                    rec["minute"] = int(float(data["TM"]))
-                    rec["played_seconds"] = rec["minute"] * 60
+                    h, a = map(int, cur_ss.split("-"))
+                except Exception:
+                    h = a = 0
+                rec["ss"] = cur_ss
+                rec["home_score"] = h
+                rec["away_score"] = a
+                if old and old != cur_ss:
+                    score_changed = True
+                    logger.success(
+                        f"[BET365][GOAL] FI={mid} {old}→{cur_ss} {rec.get('name') or ''}"
+                    )
+
+            if cur_tm:
+                try:
+                    rec["tm"] = cur_tm
+                    rec["minute"] = int(float(cur_tm))
                 except Exception:
                     pass
-            else:
-                m = TM_RE.search(part)
-                if m:
-                    rec["tm"] = m.group(1)
-                    rec["minute"] = int(m.group(1))
-                    rec["played_seconds"] = rec["minute"] * 60
-            for m in SS_RE.finditer(part):
-                h, a = int(m.group(1)), int(m.group(2))
-                ss = f"{h}-{a}"
-                if rec.get("ss") != ss:
-                    old = rec.get("ss", "")
-                    rec["ss"] = ss
-                    rec["home_score"] = h
-                    rec["away_score"] = a
-                    if old:
-                        score_changed = True
-                        logger.success(f"[BET365][GOAL] id={mid} {old}→{ss}")
+
             rec["updated"] = time.time()
             self.matches[mid] = rec
             self._last_message_at = time.time()
+
             if score_changed and self.callback:
                 asyncio.create_task(self._notify(rec))
+
+            cur_ss = None
+            cur_na = None
 
     async def _run_session(self) -> bool:
         logger.info(f"[BET365] CDP {CDP_URL}")
@@ -169,16 +243,14 @@ class Bet365Feed:
         except Exception as e:
             await self._alert(
                 "⚠️ <b>Bet365 CDP offline</b>\n"
-                "Start Chrome:\n"
                 "<code>google-chrome --remote-debugging-port=9222 "
-                '--user-data-dir="$HOME/chrome-bot-debug"</code>\n'
-                f"{e}"
+                '--user-data-dir="$HOME/chrome-bot-debug"</code>'
             )
             return False
 
         try:
             if not self._browser.contexts:
-                await self._alert("⚠️ Bet365 CDP: no browser context")
+                await self._alert("⚠️ Bet365 CDP: no context")
                 return False
             context = self._browser.contexts[0]
             page = await context.new_page()
@@ -206,7 +278,7 @@ class Bet365Feed:
                             if isinstance(payload, (bytes, bytearray))
                             else str(payload)
                         )
-                        if "SS=" in text or "TM=" in text or "ID=" in text or "FI=" in text:
+                        if any(x in text for x in ("NA=", "FI=", "SS=", "OV", "ID=")):
                             self._parse_frame(text)
                     except Exception as e:
                         logger.debug(f"[BET365] frame: {e}")
@@ -218,10 +290,7 @@ class Bet365Feed:
             url = getattr(Config, "BET365_LIVE_URL", "https://www.bet365.com/#/IP/B1")
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             if (resp and resp.status == 403) or got_403:
-                await self._alert(
-                    "⚠️ <b>Bet365 403 / IP flagged</b>\n"
-                    "Change Proton VPN location, refresh Bet365, bot will retry."
-                )
+                await self._alert("⚠️ <b>Bet365 403</b> — change Proton location")
                 return False
 
             await asyncio.sleep(2)
@@ -238,27 +307,23 @@ class Bet365Feed:
             logger.success("[BET365] WS live")
             if self.alerter:
                 try:
-                    await self.alerter.send("✅ Bet365 WS connected")
+                    await self.alerter.send("✅ Bet365 WS connected — football FI list → Telegram")
                 except Exception:
                     pass
 
             while self.running:
                 if got_403:
-                    await self._alert(
-                        "⚠️ <b>Bet365 403 mid-session</b>\nChange Proton location."
-                    )
+                    await self._alert("⚠️ Bet365 403 — change VPN")
                     return False
                 if self._last_message_at:
                     idle = time.time() - self._last_message_at
                     if idle > WS_IDLE_SECS:
-                        await self._alert(
-                            f"⚠️ <b>Bet365 WS silent {int(idle)}s</b>\nReconnecting…"
-                        )
+                        await self._alert(f"⚠️ Bet365 silent {int(idle)}s — reconnect")
                         return False
                 await asyncio.sleep(2)
             return True
         except Exception as e:
-            await self._alert(f"⚠️ Bet365 session error: {e}")
+            await self._alert(f"⚠️ Bet365 session: {e}")
             return False
         finally:
             try:
