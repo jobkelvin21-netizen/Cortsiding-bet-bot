@@ -1,4 +1,4 @@
-"""Bet365 InPlay WS — Chrome with VPN extension."""
+"""Bet365 InPlay WS — Use existing Chrome from main.py."""
 
 import asyncio
 import os
@@ -7,7 +7,7 @@ import time
 from typing import Callable, Dict, List, Optional
 
 from loguru import logger
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, BrowserContext
 
 from config import Config
 
@@ -18,7 +18,7 @@ OV_ID_RE = re.compile(r"OV\d+-(\d+)_\d+_\d+U?", re.I)
 
 
 class Bet365Feed:
-    def __init__(self, callback: Optional[Callable] = None):
+    def __init__(self, callback: Optional[Callable] = None, existing_context: Optional[BrowserContext] = None):
         self.callback = callback
         self.matches: Dict[str, dict] = {}
         self.running = False
@@ -27,7 +27,8 @@ class Bet365Feed:
         self.alerter = None
         self._ws_url: Optional[str] = None
         self._page = None
-        self._context = None
+        self._context = existing_context  # Use context from main.py
+        self._owns_context = existing_context is None  # Only close if we created it
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -153,24 +154,21 @@ class Bet365Feed:
                 asyncio.create_task(self._notify(rec))
 
     async def _run_session(self) -> bool:
-        """Launch Chrome with your existing profile (VPN included)."""
-        logger.info("[BET365] Launching Chrome with your profile...")
+        """Open Bet365 in new tab using existing Chrome."""
+        logger.info("[BET365] Opening Bet365 in new tab...")
         got_403 = False
 
-        profile = os.path.expanduser("~/.config/google-chrome")
-
-        async with async_playwright() as p:
-            try:
-                context = await p.chromium.launch_persistent_context(
-                    user_data_dir=profile,
+        # Use existing context from main.py, or launch new if none
+        if self._context is None:
+            async with async_playwright() as p:
+                self._context = await p.chromium.launch_persistent_context(
+                    user_data_dir=os.path.expanduser("~/.config/google-chrome"),
                     channel="chrome",
                     headless=False,
                     no_viewport=True,
                     locale="en-GB",
-                    # FIX: tell Playwright NOT to auto-disable extensions —
-                    # without this, your VPN extension gets silently disabled
-                    # even though it's installed in this exact profile.
                     ignore_default_args=[
+                        "--enable-automation",
                         "--disable-extensions",
                         "--disable-component-extensions-with-background-pages",
                     ],
@@ -181,100 +179,82 @@ class Bet365Feed:
                         "--disable-dev-shm-usage",
                     ],
                 )
-            except Exception as e:
-                logger.error(f"[BET365] Launch failed: {e}")
-                # FIX: this specific error almost always means your real
-                # Chrome (with the profile already open) is still running.
-                # Chrome locks the profile directory — only one process can
-                # use it at a time.
-                logger.error(
-                    "[BET365] If this says 'profile in use' or similar — "
-                    "close your normal Chrome browser COMPLETELY first "
-                    "(check it's not just minimized — quit it entirely), "
-                    "then run the bot again."
-                )
+                self._owns_context = True
+        else:
+            logger.info("[BET365] Using existing Chrome from SportyBet")
+
+        # Open new tab for Bet365
+        self._page = await self._context.new_page()
+
+        def on_response(resp):
+            nonlocal got_403
+            try:
+                if resp.status == 403:
+                    got_403 = True
+                    logger.warning(f"[BET365] 403 {resp.url[:80]}")
+            except Exception:
+                pass
+
+        self._page.on("response", on_response)
+
+        def on_websocket(ws):
+            self._ws_url = ws.url
+            logger.success(f"[BET365][WS] {ws.url[:70]}")
+
+            def on_frame(ev):
+                try:
+                    payload = getattr(ev, "payload", ev)
+                    text = (
+                        payload.decode("utf-8", errors="ignore")
+                        if isinstance(payload, (bytes, bytearray))
+                        else str(payload)
+                    )
+                    if "SS=" in text or "TM=" in text or "ID=" in text or "FI=" in text:
+                        self._parse_frame(text)
+                except Exception as e:
+                    logger.debug(f"[BET365] frame: {e}")
+
+            ws.on("framereceived", on_frame)
+
+        self._page.on("websocket", on_websocket)
+
+        try:
+            resp = await self._page.goto(
+                Config.BET365_LIVE_URL,
+                wait_until="domcontentloaded",
+                timeout=45000,
+            )
+            if (resp and resp.status == 403) or got_403:
+                logger.warning("[BET365] 403 — VPN not connected?")
                 return False
 
-            self._context = context
-            page = context.pages[0] if context.pages else await context.new_page()
-            self._page = page
-
-            def on_response(resp):
-                nonlocal got_403
+            await asyncio.sleep(2)
+            for sel in ("text=Football", "text=Soccer"):
                 try:
-                    if resp.status == 403:
-                        got_403 = True
-                        logger.warning(f"[BET365] 403 {resp.url[:80]}")
+                    loc = self._page.locator(sel)
+                    if await loc.count() > 0:
+                        await loc.first.click(timeout=2000)
+                        await asyncio.sleep(1.5)
+                        break
                 except Exception:
                     pass
 
-            page.on("response", on_response)
+            logger.success("[BET365] WS live (VPN active)")
 
-            def on_websocket(ws):
-                self._ws_url = ws.url
-                logger.success(f"[BET365][WS] {ws.url[:70]}")
-
-                def on_frame(ev):
-                    try:
-                        payload = getattr(ev, "payload", ev)
-                        text = (
-                            payload.decode("utf-8", errors="ignore")
-                            if isinstance(payload, (bytes, bytearray))
-                            else str(payload)
-                        )
-                        if "SS=" in text or "TM=" in text or "ID=" in text or "FI=" in text:
-                            self._parse_frame(text)
-                    except Exception as e:
-                        logger.debug(f"[BET365] frame: {e}")
-
-                ws.on("framereceived", on_frame)
-
-            page.on("websocket", on_websocket)
-
-            try:
-                resp = await page.goto(
-                    Config.BET365_LIVE_URL,
-                    wait_until="domcontentloaded",
-                    timeout=45000,
-                )
-                if (resp and resp.status == 403) or got_403:
-                    logger.warning("[BET365] 403 — VPN not connected?")
-                    await context.close()
+            while self.running:
+                if got_403:
+                    logger.warning("[BET365] 403 during session")
                     return False
-
+                idle = time.time() - (self._last_message_at or time.time())
+                if self._last_message_at and idle > 90:
+                    logger.warning(f"[BET365] idle {idle:.0f}s — reconnect")
+                    break
                 await asyncio.sleep(2)
-                for sel in ("text=Football", "text=Soccer"):
-                    try:
-                        loc = page.locator(sel)
-                        if await loc.count() > 0:
-                            await loc.first.click(timeout=2000)
-                            await asyncio.sleep(1.5)
-                            break
-                    except Exception:
-                        pass
 
-                logger.success("[BET365] WS live (VPN active)")
-
-                while self.running:
-                    if got_403:
-                        logger.warning("[BET365] 403 during session")
-                        await context.close()
-                        return False
-                    idle = time.time() - (self._last_message_at or time.time())
-                    if self._last_message_at and idle > 90:
-                        logger.warning(f"[BET365] idle {idle:.0f}s — reconnect")
-                        break
-                    await asyncio.sleep(2)
-
-                await context.close()
-                return True
-            except Exception as e:
-                logger.error(f"[BET365] error: {e}")
-                try:
-                    await context.close()
-                except:
-                    pass
-                return False
+            return True
+        except Exception as e:
+            logger.error(f"[BET365] error: {e}")
+            return False
 
     async def _supervisor(self):
         while self.running:
@@ -298,4 +278,10 @@ class Bet365Feed:
         self.running = False
         if self._task:
             self._task.cancel()
+        # Only close context if we created it
+        if self._owns_context and self._context:
+            try:
+                asyncio.get_event_loop().run_until_complete(self._context.close())
+            except:
+                pass
         logger.info("[BET365] stopped")
