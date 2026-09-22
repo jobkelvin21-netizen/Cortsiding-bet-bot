@@ -132,10 +132,15 @@ class TelegramCommandHandler:
         params = {"offset": self._last_update_id + 1, "limit": 10, "timeout": 20}
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params) as resp:
+                # DEBUG LOGGING
+                logger.info(f"TG POLL STATUS: {resp.status}")
                 if resp.status != 200:
+                    logger.error(f"TG POLL FAILED: {resp.status}")
                     return
                 data = await resp.json()
+                logger.info(f"TG DATA OK: {data.get('ok')}, RESULTS: {len(data.get('result', []))}")
                 if not data.get("ok"):
+                    logger.error(f"TG ERROR: {data}")
                     return
                 for update in data.get("result", []):
                     self._last_update_id = max(
@@ -144,11 +149,23 @@ class TelegramCommandHandler:
                     await self._handle_update(update)
 
     async def _handle_update(self, update: dict):
+        # DEBUG LOGGING
+        logger.info(f"RAW UPDATE: {update}")
+        
         message = update.get("message") or {}
         text = (message.get("text") or "").strip()
         chat_id = message.get("chat", {}).get("id")
+        
+        # DEBUG LOGGING
+        logger.info(f"CHAT_ID: {chat_id}, TEXT: {text}")
+        logger.info(f"CONFIG CHAT_ID: {Config.TELEGRAM_CHAT_ID}")
+        
         if str(chat_id) != str(Config.TELEGRAM_CHAT_ID) or not text:
+            logger.info("CHAT_ID MISMATCH - IGNORING")
             return
+        
+        logger.info(f"PROCESSING COMMAND: {text}")  # DEBUG
+        
         low = text.lower().strip()
 
         if low in ("/start", "start", "/help", "help"):
@@ -162,10 +179,12 @@ class TelegramCommandHandler:
             return
 
         if low in ("/stop", "stop", "/stopbot", "stopbot", "stop bot"):
+            logger.info("STOP COMMAND RECEIVED")  # DEBUG
             await self.bot.stop_bot()
             return
 
         if low in ("/startbot", "startbot", "start bot"):
+            logger.info("STARTBOT COMMAND RECEIVED")  # DEBUG
             await self.bot.start_bot()
             return
 
