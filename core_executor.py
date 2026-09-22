@@ -280,6 +280,8 @@ class BetExecutor:
         except Exception:
             text = ""
 
+        logger.info(f"[AI ARM] page text sample: {text[:500]}")
+
         period = _normalize_period(period, text)
         if watch:
             watch.period = period
