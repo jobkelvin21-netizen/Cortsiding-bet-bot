@@ -1,4 +1,4 @@
-"""Bet365 WS — attach to your Chrome (Proton extension) via CDP. No own browser."""
+"""Bet365 WS via CDP (your Chrome + Proton). Alert on errors. Fast reconnect."""
 
 import asyncio
 import re
@@ -16,6 +16,7 @@ TM_RE = re.compile(r"(?:^|[|;,\s])TM=(\d+)", re.I)
 OV_ID_RE = re.compile(r"OV\d+-(\d+)_\d+_\d+U?", re.I)
 
 CDP_URL = "http://127.0.0.1:9222"
+WS_IDLE_SECS = 90
 
 
 class Bet365Feed:
@@ -30,12 +31,25 @@ class Bet365Feed:
         self._page = None
         self._browser = None
         self._playwright = None
+        self._last_alert_at = 0.0
 
     def set_alerter(self, alerter):
         self.alerter = alerter
 
     def set_callback(self, callback: Callable):
         self.callback = callback
+
+    async def _alert(self, text: str, min_gap: float = 30.0):
+        now = time.time()
+        if now - self._last_alert_at < min_gap:
+            return
+        self._last_alert_at = now
+        logger.warning(text)
+        if self.alerter:
+            try:
+                await self.alerter.send(text)
+            except Exception:
+                pass
 
     def is_healthy(self) -> bool:
         if self._last_message_at is None:
@@ -53,7 +67,7 @@ class Bet365Feed:
             try:
                 await self.callback(dict(match))
             except Exception as e:
-                logger.debug(f"[BET365] callback error: {e}")
+                logger.debug(f"[BET365] callback: {e}")
 
     def _extract_id(self, part: str) -> Optional[str]:
         m = ID_RE.search(part)
@@ -71,13 +85,11 @@ class Bet365Feed:
         raw = (raw or "").replace("\x01", "").strip()
         if not raw:
             return
-
         parts = re.split(r"F\|", raw)
         for part in parts:
             part = part.strip()
             if not part or part.startswith("U|") or part.startswith("CONFIG"):
                 continue
-
             blocks = part.split(";")
             data = {}
             for b in blocks[1:]:
@@ -90,7 +102,6 @@ class Bet365Feed:
             if not mid:
                 continue
             mid = str(mid)
-
             rec = self.matches.get(
                 mid,
                 {
@@ -107,7 +118,6 @@ class Bet365Feed:
                     "updated": 0.0,
                 },
             )
-
             score_changed = False
             if "SS" in data:
                 m = re.match(r"(\d+)\s*[-:]\s*(\d+)", data["SS"])
@@ -120,7 +130,6 @@ class Bet365Feed:
                     if old and old != rec["ss"]:
                         score_changed = True
                         logger.success(f"[BET365][GOAL] id={mid} {old}→{rec['ss']}")
-
             if "TM" in data:
                 try:
                     rec["tm"] = data["TM"]
@@ -134,7 +143,6 @@ class Bet365Feed:
                     rec["tm"] = m.group(1)
                     rec["minute"] = int(m.group(1))
                     rec["played_seconds"] = rec["minute"] * 60
-
             for m in SS_RE.finditer(part):
                 h, a = int(m.group(1)), int(m.group(2))
                 ss = f"{h}-{a}"
@@ -146,32 +154,31 @@ class Bet365Feed:
                     if old:
                         score_changed = True
                         logger.success(f"[BET365][GOAL] id={mid} {old}→{ss}")
-
             rec["updated"] = time.time()
             self.matches[mid] = rec
             self._last_message_at = time.time()
-
             if score_changed and self.callback:
                 asyncio.create_task(self._notify(rec))
 
     async def _run_session(self) -> bool:
-        logger.info(f"[BET365] connecting CDP {CDP_URL}")
+        logger.info(f"[BET365] CDP {CDP_URL}")
         got_403 = False
-
         try:
             self._playwright = await async_playwright().start()
             self._browser = await self._playwright.chromium.connect_over_cdp(CDP_URL)
         except Exception as e:
-            logger.error(
-                f"[BET365] CDP connect failed: {e}\n"
-                "Start Chrome first:\n"
-                '  google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/chrome-bot-debug"'
+            await self._alert(
+                "⚠️ <b>Bet365 CDP offline</b>\n"
+                "Start Chrome:\n"
+                "<code>google-chrome --remote-debugging-port=9222 "
+                '--user-data-dir="$HOME/chrome-bot-debug"</code>\n'
+                f"{e}"
             )
             return False
 
         try:
             if not self._browser.contexts:
-                logger.error("[BET365] no browser context on CDP")
+                await self._alert("⚠️ Bet365 CDP: no browser context")
                 return False
             context = self._browser.contexts[0]
             page = await context.new_page()
@@ -182,7 +189,6 @@ class Bet365Feed:
                 try:
                     if resp.status == 403:
                         got_403 = True
-                        logger.warning(f"[BET365] 403 {resp.url[:80]}")
                 except Exception:
                     pass
 
@@ -212,7 +218,10 @@ class Bet365Feed:
             url = getattr(Config, "BET365_LIVE_URL", "https://www.bet365.com/#/IP/B1")
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             if (resp and resp.status == 403) or got_403:
-                logger.warning("[BET365] 403 — is Proton extension connected?")
+                await self._alert(
+                    "⚠️ <b>Bet365 403 / IP flagged</b>\n"
+                    "Change Proton VPN location, refresh Bet365, bot will retry."
+                )
                 return False
 
             await asyncio.sleep(2)
@@ -226,19 +235,30 @@ class Bet365Feed:
                 except Exception:
                     pass
 
-            logger.success("[BET365] WS live via your Chrome + Proton")
+            logger.success("[BET365] WS live")
+            if self.alerter:
+                try:
+                    await self.alerter.send("✅ Bet365 WS connected")
+                except Exception:
+                    pass
 
             while self.running:
                 if got_403:
+                    await self._alert(
+                        "⚠️ <b>Bet365 403 mid-session</b>\nChange Proton location."
+                    )
                     return False
-                idle = time.time() - (self._last_message_at or time.time())
-                if self._last_message_at and idle > 90:
-                    logger.warning(f"[BET365] idle {idle:.0f}s — reconnect")
-                    break
+                if self._last_message_at:
+                    idle = time.time() - self._last_message_at
+                    if idle > WS_IDLE_SECS:
+                        await self._alert(
+                            f"⚠️ <b>Bet365 WS silent {int(idle)}s</b>\nReconnecting…"
+                        )
+                        return False
                 await asyncio.sleep(2)
             return True
         except Exception as e:
-            logger.error(f"[BET365] session: {e}")
+            await self._alert(f"⚠️ Bet365 session error: {e}")
             return False
         finally:
             try:
@@ -260,19 +280,16 @@ class Bet365Feed:
             ok = await self._run_session()
             if not self.running:
                 break
-            wait = 5.0 if not ok else 3.0
-            logger.info(f"[BET365] retry in {wait}s")
-            await asyncio.sleep(wait)
+            await asyncio.sleep(4.0 if not ok else 2.0)
 
     async def start(self):
         if self.running:
             return
         self.running = True
         self._task = asyncio.create_task(self._supervisor())
-        logger.success("[BET365] started (CDP → your Chrome)")
+        logger.success("[BET365] started")
 
     def stop(self):
         self.running = False
         if self._task:
             self._task.cancel()
-        logger.info("[BET365] stopped")
