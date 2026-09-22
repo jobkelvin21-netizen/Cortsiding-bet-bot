@@ -31,8 +31,7 @@ class ArbitrageBot:
     def __init__(self):
         self.account_manager = AccountManager()
         self.alerter = TelegramAlerter()
-        # Pass context later after login
-        self.bet365 = Bet365Feed(existing_context=None)
+        self.bet365 = Bet365Feed()
         self.bet365.set_alerter(self.alerter)
         self.executor = None
         self.match_pages = {}
@@ -67,15 +66,13 @@ class ArbitrageBot:
         from playwright.async_api import async_playwright
 
         self.playwright = await async_playwright().start()
-        # FIX: Use your Chrome profile with VPN extension
         self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=os.path.expanduser("~/.config/google-chrome"),
+            user_data_dir=os.path.expanduser("~/.config/google-chrome"),  # CHANGED: Your profile with VPN
             channel="chrome",
             headless=False,
             no_viewport=True,
             locale="en-NG",
-            # FIX: Keep VPN extension enabled
-            ignore_default_args=[
+            ignore_default_args=[  # CHANGED: Keep VPN extension enabled
                 "--enable-automation",
                 "--disable-extensions",
                 "--disable-component-extensions-with-background-pages",
@@ -87,11 +84,11 @@ class ArbitrageBot:
                 "--disable-dev-shm-usage",
             ],
         )
-        
-        # FIX: Pass context to Bet365 so it uses same browser
+        # CHANGED: Pass context to Bet365
         self.bet365._context = self.context
         self.bet365._owns_context = False
         
+        # YOUR ORIGINAL LOGIN CODE - UNCHANGED
         page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         await page.goto("https://www.sportybet.com/ng/", wait_until="domcontentloaded")
         await asyncio.sleep(2)
@@ -144,7 +141,6 @@ class ArbitrageBot:
                 self._current_total_goals = total
                 return
 
-            # GOAL CANCELLED / DISALLOWED
             if total < self._current_total_goals:
                 logger.warning(
                     f"[DISALLOWED] score {self._last_score} → {new_score} "
@@ -158,7 +154,6 @@ class ArbitrageBot:
                     )
                 return
 
-            # NORMAL GOAL
             if total > self._current_total_goals:
                 home = self._manual_slow_match.get("home", "")
                 away = self._manual_slow_match.get("away", "")
