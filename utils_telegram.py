@@ -10,7 +10,7 @@ from loguru import logger
 
 from config import Config
 from feeds.bet365_ws import Bet365Feed
-from core.executor import BetExecutor
+
 from utils.telegram import TelegramAlerter, TelegramCommandHandler
 from utils.account_manager import AccountManager
 
