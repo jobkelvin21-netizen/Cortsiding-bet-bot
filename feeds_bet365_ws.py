@@ -28,17 +28,11 @@ _ESPORTS_HINTS = re.compile(
     r"volta\b|battle\b|fifa\s*\d|pes\s*\d",
     re.I,
 )
-# Real football teams almost never carry a parenthetical gamer tag.
 _GAMER_TAG_RE = re.compile(r"\([^)]{1,25}\)")
-
-# Individual-athlete sports (tennis, table tennis, darts, snooker, badminton)
-# almost always name players as "Surname I." on each side — football teams
-# never look like this.
 _INDIVIDUAL_SPORT_NAME_RE = re.compile(
     r"^[A-Z][a-zA-Z'\-]+\s+[A-Z]\.?\s*(?:vs\.?|v\.?)\s*[A-Z][a-zA-Z'\-]+\s+[A-Z]\.?$",
     re.I,
 )
-# Explicit non-football sport keywords that occasionally show up in the name.
 _NON_FOOTBALL_KEYWORDS = re.compile(
     r"\btennis\b|\bvolleyball\b|\bbasketball\b|\btable\s*tennis\b|\bhandball\b|"
     r"\bdarts\b|\bsnooker\b|\bbadminton\b|\bice\s*hockey\b|\brugby\b|\bcricket\b|"
@@ -103,9 +97,6 @@ class Bet365Feed:
         return self.matches.get(str(match_id))
 
     async def _ask_groq_is_football(self, name: str) -> bool:
-        """Only called for ambiguous names that pass the fast regex filters.
-        Fails CLOSED (returns False) if Groq is unavailable or errors, so a
-        broken AI call never leaks non-football matches through again."""
         try:
             from core.groq_ai import _client_or_none
 
@@ -189,10 +180,6 @@ class Bet365Feed:
                 pass
 
     async def _catchup_loop(self):
-        """Periodically re-scan everything currently tracked and send any
-        football match that hasn't been announced yet — covers matches
-        that were already live before the bot connected, or any that
-        didn't get announced the first time a frame for them arrived."""
         while self._want_run:
             try:
                 await asyncio.sleep(CATCHUP_INTERVAL_SECS)
@@ -321,26 +308,31 @@ class Bet365Feed:
 
     async def _run_session(self) -> bool:
         if not self._want_run:
+            logger.info("[BET365] session skipped: _want_run is False")
             return False
         got_403 = False
         try:
             self._playwright = await async_playwright().start()
             self._browser = await self._playwright.chromium.connect_over_cdp(CDP_URL)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[BET365] EXIT: CDP connect failed: {e}")
             if self._want_run:
                 await self._tg("⚠️ Bet365 CDP offline")
             return False
         try:
             if not self._browser.contexts:
+                logger.warning("[BET365] EXIT: browser has no contexts (no tabs/profile open)")
                 return False
             page = await self._browser.contexts[0].new_page()
             self._page = page
+            logger.info(f"[BET365] opened new tab (context has {len(self._browser.contexts[0].pages)} pages now)")
 
             def on_response(resp):
                 nonlocal got_403
                 try:
                     if resp.status == 403:
                         got_403 = True
+                        logger.debug(f"[BET365] 403 seen on subresource: {resp.url}")
                 except Exception:
                     pass
 
@@ -368,28 +360,38 @@ class Bet365Feed:
             url = getattr(Config, "BET365_LIVE_URL", "https://www.bet365.com/#/IP/B1")
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             if not self._want_run:
+                logger.info("[BET365] EXIT: _want_run turned False during page load")
                 return False
             if (resp and resp.status == 403) or got_403:
+                logger.warning(
+                    f"[BET365] EXIT: 403 detected (main page status={resp.status if resp else 'no-resp'}, "
+                    f"got_403_flag={got_403})"
+                )
                 await self._tg("⚠️ Bet365 403 — change Proton")
                 return False
             await asyncio.sleep(2)
             self.running = True
-            await self._tg("✅ Bet365 ON — real football FI → Telegram")
+            logger.success("[BET365] session UP — waiting for frames / idle timeout")
+            await self._tg("✅ Bet365 ON — all live FI → Telegram")
             while self._want_run:
                 if got_403:
+                    logger.warning("[BET365] EXIT: 403 flagged during running loop")
                     await self._tg("⚠️ Bet365 403")
                     return False
                 if self._last_message_at and (
                     time.time() - self._last_message_at > WS_IDLE_SECS
                 ):
+                    idle_for = time.time() - self._last_message_at
+                    logger.warning(f"[BET365] EXIT: idle timeout ({idle_for:.0f}s since last frame, limit={WS_IDLE_SECS}s)")
                     return False
                 await asyncio.sleep(1)
+            logger.info("[BET365] EXIT: _want_run turned False in main loop (normal stop)")
             return True
         except asyncio.CancelledError:
+            logger.info("[BET365] EXIT: session cancelled")
             return False
         except Exception as e:
-            if self._want_run:
-                logger.error(f"[BET365] {e}")
+            logger.error(f"[BET365] EXIT: unhandled exception: {e!r}")
             return False
         finally:
             self.running = False
@@ -400,6 +402,7 @@ class Bet365Feed:
             await self._run_session()
             if not self._want_run:
                 break
+            logger.info("[BET365] supervisor sleeping 3s before retry")
             await asyncio.sleep(3)
         self.running = False
 
