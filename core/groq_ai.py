@@ -46,8 +46,50 @@ def _parse_json(text: str) -> dict:
 
 
 def _normalize_period(period: str, page_text: str = "") -> str:
-    p = (period or "").lower()
+    """
+    Live page truth ALWAYS wins over a stale hint. The hint (watch.period)
+    is only used as a last resort when the page itself gives no clear signal.
+    """
     t = (page_text or "").lower()
+
+    # 1. Look at the live page first — this is the actual match state.
+    sample = t[:1500]  # clock/score area is always near the top of the page
+
+    is_2h_page = bool(
+        re.search(r"\b2nd\s*half\b|\bsecond\s*half\b", sample)
+    )
+    is_1h_page = bool(
+        re.search(r"\b1st\s*half\b|\bfirst\s*half\b", sample)
+    )
+    is_ht_page = bool(
+        re.search(r"\bht\b|\bhalf\s*time\b|\bhalf-time\b", sample)
+    )
+
+    # Minute-based fallback: "46'" or higher means 2nd half has started.
+    minute = None
+    m = re.search(r"\b(\d{1,3})\s*'\s*(?:\+\d+)?\b", sample)
+    if not m:
+        m = re.search(r"\b(\d{1,2})\s*:\s*\d{0,2}\b", sample)
+    if m:
+        try:
+            minute = int(m.group(1))
+        except Exception:
+            minute = None
+
+    if is_2h_page:
+        return "2H"
+    if is_ht_page:
+        # Half time has passed — treat as heading into 2nd half.
+        return "2H"
+    if minute is not None and minute >= 46:
+        return "2H"
+    if is_1h_page:
+        return "1H"
+    if minute is not None and minute <= 45:
+        return "1H"
+
+    # 2. Page gave nothing usable — fall back to the hint.
+    p = (period or "").lower()
     if any(x in p for x in ("2h", "2nd", "second half", "2nd half")):
         return "2H"
     if any(x in p for x in ("1h", "1st", "first half", "1st half")):
@@ -56,13 +98,7 @@ def _normalize_period(period: str, page_text: str = "") -> str:
         return "HT"
     if any(x in p for x in ("ft", "full time", "ended", "finished")):
         return "FT"
-    # Infer from page
-    if re.search(r"\b2nd\s*half\b|\bsecond\s*half\b|\b2h\b", t) and not re.search(
-        r"\b1st\s*half\b|\bfirst\s*half\b", t[:500]
-    ):
-        return "2H"
-    if re.search(r"\b1st\s*half\b|\bfirst\s*half\b|\b1h\b", t):
-        return "1H"
+
     return "1H"
 
 
