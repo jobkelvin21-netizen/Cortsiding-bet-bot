@@ -1,4 +1,4 @@
-"""Bet365 WS — real football FI list; hard stop (no reconnect when stopped)."""
+"""Bet365 WS — ALL live FI+name to Telegram; goals only for locked FI."""
 
 import asyncio
 import re
@@ -20,59 +20,9 @@ NA_RE = re.compile(r"(?:^|[|;,\s])NA=([^|;]+)", re.I)
 TM_RE = re.compile(r"(?:^|[|;,\s])TM=(\d+)", re.I)
 OV_RE = re.compile(r"OV(\d{6,})C\d+", re.I)
 
-_SKIP = re.compile(
-    r"terrorist|counter-terror|darts|snooker|tennis|table\s*tennis|"
-    r"volleyball|basketball|hockey|ice\s*hockey|baseball|"
-    r"esport|e-?sport|e-?football|efootball|virtual|simulat|"
-    r"cs:?go|valorant|dota|fifa\b|ufc|boxing|mma|cricket|rugby|"
-    r"afl|nfl|nba|nhl|mlb|badminton|squash|padel|handball|futsal|"
-    r"mavericks|hornets|lakers|celtics|warriors|nets|knicks|"
-    r"dimes|hyper|thunder|spurs|bulls|heat|suns|kings",
-    re.I,
-)
-_CLUB = re.compile(
-    r"\b(fc|cf|sc|afc|united|city|town|rovers|athletic|atletico|"
-    r"real|sporting|club|bayern|psg|liverpool|chelsea|arsenal|"
-    r"madrid|milan|inter|porto|benfica|ajax|dortmund|juventus)\b",
-    re.I,
-)
-
-
-def _looks_football(na: str, ss: str = "") -> bool:
-    na = (na or "").strip()
-    if not na or not re.search(r"\s+v(?:s)?\.?\s+", na, re.I):
-        return False
-    if _SKIP.search(na):
-        return False
-    if re.search(r"\([^)]{1,24}\)", na):
-        return False
-    if "/" in na or "@" in na:
-        return False
-    if ss:
-        try:
-            h, a = map(int, ss.replace(":", "-").split("-"))
-            if (h in (6, 7) and 0 <= a <= 7) or (a in (6, 7) and 0 <= h <= 7):
-                return False
-            if h > 10 or a > 10:
-                return False
-        except Exception:
-            pass
-    parts = re.split(r"\s+v(?:s)?\.?\s+", na, maxsplit=1, flags=re.I)
-    if len(parts) != 2:
-        return False
-    left, right = parts[0].strip(), parts[1].strip()
-    if (
-        2 <= len(left.split()) <= 3
-        and 2 <= len(right.split()) <= 3
-        and not _CLUB.search(left)
-        and not _CLUB.search(right)
-    ):
-        return False
-    return True
-
 
 def _split_teams(na: str):
-    for sep in (r"\s+vs\.?\s+", r"\s+v\.?\s+"):
+    for sep in (r"\s+vs\.?\s+", r"\s+v\.?\s+", r"\s+@\s+"):
         parts = re.split(sep, (na or "").strip(), maxsplit=1, flags=re.I)
         if len(parts) == 2:
             return parts[0].strip(), parts[1].strip()
@@ -84,7 +34,7 @@ class Bet365Feed:
         self.callback = callback
         self.matches: Dict[str, dict] = {}
         self.running = False
-        self._want_run = False  # False = user stopped; do not reconnect
+        self._want_run = False
         self._last_message_at: Optional[float] = None
         self._task: Optional[asyncio.Task] = None
         self.alerter = None
@@ -100,7 +50,7 @@ class Bet365Feed:
     def set_callback(self, callback: Callable):
         self.callback = callback
 
-    async def _tg(self, text: str, min_gap: float = 15.0):
+    async def _tg(self, text: str, min_gap: float = 12.0):
         now = time.time()
         if now - self._last_alert_at < min_gap:
             return
@@ -124,16 +74,18 @@ class Bet365Feed:
     def get_match(self, match_id: str) -> Optional[dict]:
         return self.matches.get(str(match_id))
 
-    async def _announce_match(self, fi: str, name: str, ss: str):
+    async def _announce(self, fi: str, name: str, ss: str):
         if not self.running or not self._want_run:
             return
-        if fi in self._announced or not _looks_football(name, ss):
+        if fi in self._announced:
+            return
+        if not name or not re.search(r"\s+v(?:s)?\.?\s+|\s+@\s+", name, re.I):
             return
         self._announced.add(fi)
         if self.alerter:
             try:
                 await self.alerter.send(
-                    f"⚽ <b>FOOTBALL</b>\n"
+                    f"📡 <b>LIVE</b>\n"
                     f"🆔 FI=<code>{fi}</code>\n"
                     f"📋 {name}\n"
                     f"SS={ss or '?'}"
@@ -157,7 +109,7 @@ class Bet365Feed:
             m = NA_RE.search(part)
             if m:
                 na = m.group(1).strip()
-                if re.search(r"\s+v(?:s)?\.?\s+", na, re.I):
+                if re.search(r"\s+v(?:s)?\.?\s+|\s+@\s+", na, re.I):
                     cur_na = na
             m = FI_RE.search(part)
             if m:
@@ -201,7 +153,7 @@ class Bet365Feed:
                 rec["name"] = cur_na
                 rec["home_team"], rec["away_team"] = h, a
                 asyncio.create_task(
-                    self._announce_match(mid, cur_na, cur_ss or rec.get("ss") or "")
+                    self._announce(mid, cur_na, cur_ss or rec.get("ss") or "")
                 )
             score_changed = False
             if cur_ss:
@@ -259,9 +211,8 @@ class Bet365Feed:
             self._browser = await self._playwright.chromium.connect_over_cdp(CDP_URL)
         except Exception:
             if self._want_run:
-                await self._tg("⚠️ Bet365 CDP offline — start Chrome with port 9222")
+                await self._tg("⚠️ Bet365 CDP offline")
             return False
-
         try:
             if not self._browser.contexts:
                 return False
@@ -297,7 +248,6 @@ class Bet365Feed:
                 ws.on("framereceived", on_frame)
 
             page.on("websocket", on_websocket)
-
             url = getattr(Config, "BET365_LIVE_URL", "https://www.bet365.com/#/IP/B1")
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             if not self._want_run:
@@ -305,23 +255,9 @@ class Bet365Feed:
             if (resp and resp.status == 403) or got_403:
                 await self._tg("⚠️ Bet365 403 — change Proton")
                 return False
-
             await asyncio.sleep(2)
-            for sel in ("text=Football", "text=Soccer"):
-                if not self._want_run:
-                    return False
-                try:
-                    loc = page.locator(sel)
-                    if await loc.count() > 0:
-                        await loc.first.click(timeout=2000)
-                        await asyncio.sleep(1.5)
-                        break
-                except Exception:
-                    pass
-
             self.running = True
-            await self._tg("✅ Bet365 feed ON (football only)")
-
+            await self._tg("✅ Bet365 ON — all live FI → Telegram")
             while self._want_run:
                 if got_403:
                     await self._tg("⚠️ Bet365 403")
@@ -329,7 +265,7 @@ class Bet365Feed:
                 if self._last_message_at and (
                     time.time() - self._last_message_at > WS_IDLE_SECS
                 ):
-                    return False  # reconnect only if still want_run
+                    return False
                 await asyncio.sleep(1)
             return True
         except asyncio.CancelledError:
@@ -349,7 +285,6 @@ class Bet365Feed:
                 break
             await asyncio.sleep(3)
         self.running = False
-        logger.info("[BET365] fully stopped")
 
     async def start(self):
         if self._want_run and self._task and not self._task.done():
@@ -357,10 +292,8 @@ class Bet365Feed:
         self._want_run = True
         self.running = False
         self._task = asyncio.create_task(self._supervisor())
-        logger.info("[BET365] start requested")
 
     async def stop(self):
-        """Hard stop: no frames, no announce, no reconnect."""
         self._want_run = False
         self.running = False
         self.callback = None
@@ -373,4 +306,3 @@ class Bet365Feed:
             except Exception:
                 pass
         await self._close_browser()
-        logger.info("[BET365] stop done")
