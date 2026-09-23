@@ -1,4 +1,4 @@
-"""Bet365 WS — ALL live FI+name to Telegram; goals only for locked FI."""
+"""Bet365 WS — REAL FOOTBALL ONLY FI+name to Telegram; goals only for locked FI."""
 
 import asyncio
 import re
@@ -12,6 +12,7 @@ from config import Config
 
 CDP_URL = "http://127.0.0.1:9222"
 WS_IDLE_SECS = 90
+CATCHUP_INTERVAL_SECS = 15.0
 
 SS_RE = re.compile(r"(?:^|[|;,\s])SS=(\d{1,2})\s*[-:]\s*(\d{1,2})", re.I)
 FI_RE = re.compile(r"(?:^|[|;,\s])FI=(\d{6,})", re.I)
@@ -19,6 +20,31 @@ ID_RE = re.compile(r"(?:^|[|;,\s])ID=(\d{6,})", re.I)
 NA_RE = re.compile(r"(?:^|[|;,\s])NA=([^|;]+)", re.I)
 TM_RE = re.compile(r"(?:^|[|;,\s])TM=(\d+)", re.I)
 OV_RE = re.compile(r"OV(\d{6,})C\d+", re.I)
+
+# Fast reject: obvious esports/virtual football keywords in the match name.
+_ESPORTS_HINTS = re.compile(
+    r"esoccer|efootball|e-football|e[\s\-]?sports?|cyber\s*football|"
+    r"virtual\s*football|gt\s*league|h2h\s*gg|egames|e-games|liga\s*pro|"
+    r"volta\b|battle\b|fifa\s*\d|pes\s*\d",
+    re.I,
+)
+# Real football teams almost never carry a parenthetical gamer tag.
+_GAMER_TAG_RE = re.compile(r"\([^)]{1,25}\)")
+
+# Individual-athlete sports (tennis, table tennis, darts, snooker, badminton)
+# almost always name players as "Surname I." on each side — football teams
+# never look like this.
+_INDIVIDUAL_SPORT_NAME_RE = re.compile(
+    r"^[A-Z][a-zA-Z'\-]+\s+[A-Z]\.?\s*(?:vs\.?|v\.?)\s*[A-Z][a-zA-Z'\-]+\s+[A-Z]\.?$",
+    re.I,
+)
+# Explicit non-football sport keywords that occasionally show up in the name.
+_NON_FOOTBALL_KEYWORDS = re.compile(
+    r"\btennis\b|\bvolleyball\b|\bbasketball\b|\btable\s*tennis\b|\bhandball\b|"
+    r"\bdarts\b|\bsnooker\b|\bbadminton\b|\bice\s*hockey\b|\brugby\b|\bcricket\b|"
+    r"\bfutsal\b|\bbaseball\b|\bboxing\b|\bmma\b|\bbeach\s*volleyball\b",
+    re.I,
+)
 
 
 def _split_teams(na: str):
@@ -37,12 +63,14 @@ class Bet365Feed:
         self._want_run = False
         self._last_message_at: Optional[float] = None
         self._task: Optional[asyncio.Task] = None
+        self._catchup_task: Optional[asyncio.Task] = None
         self.alerter = None
         self._page = None
         self._browser = None
         self._playwright = None
         self._last_alert_at = 0.0
         self._announced: Set[str] = set()
+        self._football_cache: Dict[str, bool] = {}
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -74,6 +102,68 @@ class Bet365Feed:
     def get_match(self, match_id: str) -> Optional[dict]:
         return self.matches.get(str(match_id))
 
+    async def _ask_groq_is_football(self, name: str) -> bool:
+        """Only called for ambiguous names that pass the fast regex filters.
+        Fails CLOSED (returns False) if Groq is unavailable or errors, so a
+        broken AI call never leaks non-football matches through again."""
+        try:
+            from core.groq_ai import _client_or_none
+
+            client = _client_or_none()
+            if not client:
+                logger.warning("[BET365][GROQ] no client — treating as non-football")
+                return False
+            resp = client.chat.completions.create(
+                model=getattr(Config, "GROQ_TEXT_MODEL", "llama-3.3-70b-versatile"),
+                temperature=0,
+                max_tokens=10,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Is this a REAL human football (soccer) match between "
+                            "real clubs or national teams — NOT tennis, table tennis, "
+                            "volleyball, basketball, darts, snooker, badminton, "
+                            "esports, eFootball, virtual football, FIFA/PES video "
+                            "game leagues, or any other non-football sport?\n"
+                            f"Match: {name}\n"
+                            "Answer with exactly one word: YES or NO."
+                        ),
+                    }
+                ],
+            )
+            answer = (resp.choices[0].message.content or "").strip().upper()
+            return answer.startswith("Y")
+        except Exception as e:
+            logger.warning(f"[BET365][GROQ] classify failed, treating as non-football: {e}")
+            return False
+
+    async def _is_real_football(self, fi: str, name: str) -> bool:
+        cached = self._football_cache.get(fi)
+        if cached is not None:
+            return cached
+
+        if _ESPORTS_HINTS.search(name) or _GAMER_TAG_RE.search(name):
+            self._football_cache[fi] = False
+            logger.debug(f"[BET365] filtered esports FI={fi} {name}")
+            return False
+
+        if _NON_FOOTBALL_KEYWORDS.search(name):
+            self._football_cache[fi] = False
+            logger.debug(f"[BET365] filtered non-football keyword FI={fi} {name}")
+            return False
+
+        if _INDIVIDUAL_SPORT_NAME_RE.match(name.strip()):
+            self._football_cache[fi] = False
+            logger.debug(f"[BET365] filtered individual-sport name pattern FI={fi} {name}")
+            return False
+
+        result = await self._ask_groq_is_football(name)
+        self._football_cache[fi] = result
+        if not result:
+            logger.debug(f"[BET365] filtered non-football (groq) FI={fi} {name}")
+        return result
+
     async def _announce(self, fi: str, name: str, ss: str):
         if not self.running or not self._want_run:
             return
@@ -81,17 +171,44 @@ class Bet365Feed:
             return
         if not name or not re.search(r"\s+v(?:s)?\.?\s+|\s+@\s+", name, re.I):
             return
+
+        is_football = await self._is_real_football(fi, name)
         self._announced.add(fi)
+        if not is_football:
+            return
+
         if self.alerter:
             try:
                 await self.alerter.send(
-                    f"📡 <b>LIVE</b>\n"
+                    f"⚽ <b>LIVE FOOTBALL</b>\n"
                     f"🆔 FI=<code>{fi}</code>\n"
                     f"📋 {name}\n"
                     f"SS={ss or '?'}"
                 )
             except Exception:
                 pass
+
+    async def _catchup_loop(self):
+        """Periodically re-scan everything currently tracked and send any
+        football match that hasn't been announced yet — covers matches
+        that were already live before the bot connected, or any that
+        didn't get announced the first time a frame for them arrived."""
+        while self._want_run:
+            try:
+                await asyncio.sleep(CATCHUP_INTERVAL_SECS)
+                if not self.running or not self._want_run:
+                    continue
+                for fi, rec in list(self.matches.items()):
+                    if fi in self._announced:
+                        continue
+                    name = rec.get("name") or ""
+                    if not name:
+                        continue
+                    await self._announce(fi, name, rec.get("ss") or "")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"[BET365][CATCHUP] {e}")
 
     def _parse_frame(self, raw: str):
         if not self.running or not self._want_run:
@@ -257,7 +374,7 @@ class Bet365Feed:
                 return False
             await asyncio.sleep(2)
             self.running = True
-            await self._tg("✅ Bet365 ON — all live FI → Telegram")
+            await self._tg("✅ Bet365 ON — real football FI → Telegram")
             while self._want_run:
                 if got_403:
                     await self._tg("⚠️ Bet365 403")
@@ -292,6 +409,8 @@ class Bet365Feed:
         self._want_run = True
         self.running = False
         self._task = asyncio.create_task(self._supervisor())
+        if not self._catchup_task or self._catchup_task.done():
+            self._catchup_task = asyncio.create_task(self._catchup_loop())
 
     async def stop(self):
         self._want_run = False
@@ -303,6 +422,14 @@ class Bet365Feed:
             t.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(t), timeout=2.0)
+            except Exception:
+                pass
+        ct = self._catchup_task
+        self._catchup_task = None
+        if ct and not ct.done():
+            ct.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(ct), timeout=2.0)
             except Exception:
                 pass
         await self._close_browser()
