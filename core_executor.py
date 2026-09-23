@@ -1,11 +1,12 @@
 """
-BetExecutor — video flow:
+BetExecutor — video flow + market rules:
   Click Over (right period) → must appear on betslip → stake → Place Bet → Confirm
   1H: 1st Half Over {goals+0.5} → else Full Time Over
   2H: 2nd Half Over {goals+0.5} → else Full Time Over
-  Odds move → Accept Changes → restake → Place → Confirm
-  Goal (locked FI) → Confirm only
-  Suspended → stop, no next market
+  Unavailable on slip → clear → Full Time Over only (never another 1H)
+  Suspended (no Bet365 goal) → stay on match
+  Match ended / FT → clear slip, stop watch
+  Goal (locked FI) → Confirm only (main stops if locked)
   Disallowed → Cashout tab → Cash Out → Confirm
 """
 
@@ -57,6 +58,8 @@ class MatchWatch:
         self.task: Optional[asyncio.Task] = None
         self.running = False
         self.flagged_suspended = False
+        self.match_ended = False
+        self.force_full_time = False
 
     @property
     def total_goals(self) -> int:
@@ -167,7 +170,7 @@ class BetExecutor:
     async def _detect_period(self, page: Page) -> str:
         try:
             t = (await page.inner_text("body")).lower()
-            sample = t[:2000]
+            sample = t[:2500]
             if re.search(r"\b2nd\s*half\b|\bsecond\s*half\b", sample):
                 return "2H"
             if re.search(r"\bht\b|\bhalf\s*time\b", sample):
@@ -180,6 +183,102 @@ class BetExecutor:
             return "1H"
         except Exception:
             return "1H"
+
+    async def _match_ended(self, page: Page) -> bool:
+        try:
+            t = (await page.inner_text("body")).lower()
+            markers = (
+                "match finished",
+                "match ended",
+                "full time",
+                "result confirmed",
+                "finished",
+            )
+            still_live = ("1st half", "2nd half", "live", "45+", "90+")
+            if any(x in t for x in markers) and not any(x in t[:1200] for x in still_live):
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _selection_unavailable(self, page: Page) -> bool:
+        try:
+            for root in (
+                '[class*="betslip" i]',
+                '[class*="BetSlip" i]',
+                '[class*="m-betslip" i]',
+                '#betslip',
+            ):
+                loc = page.locator(root)
+                if await loc.count() == 0:
+                    continue
+                txt = (await loc.first.inner_text(timeout=800)).lower()
+                if "unavailable" in txt:
+                    return True
+            if await page.locator(
+                '[class*="betslip" i] >> text=/unavailable/i'
+            ).count() > 0:
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _is_suspended(self, page: Page) -> bool:
+        """Suspended only — not Unavailable."""
+        try:
+            t = (await page.inner_text("body")).lower()
+            if "unavailable" in t and "suspended" not in t:
+                return False
+            return any(
+                x in t
+                for x in (
+                    "suspended",
+                    "market suspended",
+                    "bet closed",
+                    "market closed",
+                )
+            )
+        except Exception:
+            return False
+
+    async def _clear_betslip(self, page: Page):
+        for sel in (
+            '[class*="betslip" i] [class*="remove" i]',
+            '[class*="betslip" i] [class*="delete" i]',
+            '[class*="betslip" i] [class*="close" i]',
+            '[class*="betslip" i] button:has-text("×")',
+            'button[aria-label*="remove" i]',
+            'button[aria-label*="delete" i]',
+        ):
+            try:
+                loc = page.locator(sel)
+                n = await loc.count()
+                for i in range(min(n, 5)):
+                    el = loc.nth(i)
+                    if await el.is_visible():
+                        await el.click(timeout=800)
+                        await asyncio.sleep(0.25)
+            except Exception:
+                pass
+        try:
+            await page.evaluate(
+                """() => {
+                    const roots = document.querySelectorAll(
+                        '[class*="betslip"], [class*="BetSlip"], [class*="m-betslip"]'
+                    );
+                    for (const r of roots) {
+                        r.querySelectorAll('button, span, i, a').forEach(el => {
+                            const t = (el.innerText || el.getAttribute('aria-label') || '').toLowerCase();
+                            if (t.includes('×') || t === 'x' || t.includes('remove') || t.includes('delete')) {
+                                el.click();
+                            }
+                        });
+                    }
+                }"""
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(0.4)
 
     async def _betslip_has_selection(self, page: Page, line: float) -> bool:
         line_s = f"{line:g}"
@@ -196,13 +295,14 @@ class BetExecutor:
                 if await loc.count() == 0:
                     continue
                 txt = (await loc.first.inner_text(timeout=800)).lower()
-                if f"over {line_s}" in txt or (
-                    "over" in txt and line_s in txt
-                ):
+                if "unavailable" in txt:
+                    return False
+                if f"over {line_s}" in txt or ("over" in txt and line_s in txt):
                     return True
             body = (await page.inner_text("body")).lower()
             if "place bet" in body and "over" in body and line_s in body:
-                return True
+                if "unavailable" not in body:
+                    return True
         except Exception:
             pass
         return False
@@ -243,6 +343,8 @@ class BetExecutor:
                 except Exception:
                     ctx = (await el.inner_text()).lower()
 
+                if "unavailable" in ctx:
+                    continue
                 if require_kw and not any(k in ctx for k in require_kw):
                     continue
                 if forbid_kw and any(k in ctx for k in forbid_kw):
@@ -273,6 +375,8 @@ class BetExecutor:
                 txt = (await el.inner_text(timeout=100)).strip().lower()
                 if not txt or len(txt) > 280:
                     continue
+                if "unavailable" in txt:
+                    continue
                 if f"over {line_s}" not in txt:
                     continue
                 if require_kw and not any(k in txt for k in require_kw):
@@ -298,6 +402,19 @@ class BetExecutor:
         line = watch.over_line
         period = watch.period
 
+        if watch.force_full_time or period == "FT":
+            ok = await self._find_and_click_over(
+                page, line,
+                require_kw=["over/under", "over under", "total"],
+                forbid_kw=["1st half", "first half", "2nd half", "second half"],
+                label="Full Time",
+            )
+            if ok:
+                watch.active_market = f"Full Time Over {line:g}"
+                watch.target_line = line
+                return True
+            return False
+
         if period == "1H":
             ok = await self._find_and_click_over(
                 page, line,
@@ -318,6 +435,7 @@ class BetExecutor:
             if ok:
                 watch.active_market = f"Full Time Over {line:g}"
                 watch.target_line = line
+                watch.force_full_time = True
                 return True
             return False
 
@@ -340,6 +458,7 @@ class BetExecutor:
         if ok:
             watch.active_market = f"Full Time Over {line:g}"
             watch.target_line = line
+            watch.force_full_time = True
             return True
         return False
 
@@ -479,27 +598,11 @@ class BetExecutor:
         except Exception:
             return False
 
-    async def _is_suspended(self, page: Page) -> bool:
-        try:
-            t = (await page.inner_text("body")).lower()
-            return any(
-                x in t
-                for x in (
-                    "suspended",
-                    "market suspended",
-                    "not available",
-                    "bet closed",
-                    "market closed",
-                )
-            )
-        except Exception:
-            return False
-
     async def ai_arm_from_plan(
         self, page: Page, plan: Optional[dict], watch: MatchWatch
     ) -> bool:
-        if watch.flagged_suspended:
-            await self._tg("⛔ Suspended — not arming")
+        if watch.flagged_suspended or watch.match_ended:
+            await self._tg("⛔ Not arming (suspended or match ended)")
             return False
 
         watch.period = await self._detect_period(page)
@@ -528,6 +631,8 @@ class BetExecutor:
                 plan = None
             elif watch.period == "2H" and pmarket == "1H":
                 plan = None
+            if plan and pmarket == "FT":
+                watch.force_full_time = True
 
         ok = await self._click_correct_over(page, watch)
         if not ok:
@@ -542,6 +647,15 @@ class BetExecutor:
         if not await self._betslip_has_selection(page, watch.target_line):
             await self._tg("❌ Selection never reached betslip — NOT betting")
             return False
+
+        if await self._selection_unavailable(page):
+            await self._clear_betslip(page)
+            watch.force_full_time = True
+            watch.confirm_armed = False
+            ok = await self._click_correct_over(page, watch)
+            if not ok or not await self._betslip_has_selection(page, watch.target_line):
+                await self._tg("❌ Unavailable and Full Time failed — NOT betting")
+                return False
 
         await asyncio.sleep(0.4)
         odds = await self._read_slip_odds(page)
@@ -583,6 +697,8 @@ class BetExecutor:
 
     async def click_confirm_only(self, page: Page) -> bool:
         if await self._is_suspended(page):
+            return False
+        if await self._selection_unavailable(page):
             return False
         await self._click_accept_changes(page)
         await asyncio.sleep(0.1)
@@ -684,22 +800,49 @@ class BetExecutor:
             return False
 
     async def _watch_loop(self, mid: str, watch: MatchWatch):
-        while watch.running and not watch.flagged_suspended:
+        while watch.running and not watch.flagged_suspended and not watch.match_ended:
             try:
                 page = watch.page
                 if page.is_closed():
                     break
-                if await self._is_suspended(page):
-                    watch.flagged_suspended = True
+
+                if await self._match_ended(page):
+                    watch.match_ended = True
                     watch.confirm_armed = False
+                    await self._clear_betslip(page)
                     await self._tg(
-                        f"⛔ MARKET SUSPENDED\n"
+                        f"🏁 MATCH ENDED\n"
                         f"{watch.home_team} vs {watch.away_team}\n"
-                        f"Was on: {watch.active_market}\n"
-                        f"Stopped — will NOT switch market"
+                        f"Cleared betslip — no longer active"
                     )
                     watch.running = False
                     break
+
+                # Unavailable → clear slip → Full Time only
+                if await self._selection_unavailable(page):
+                    logger.warning("[ARM] Unavailable → Full Time")
+                    await self._clear_betslip(page)
+                    watch.force_full_time = True
+                    watch.confirm_armed = False
+                    ok = await self.ai_arm_from_plan(page, None, watch)
+                    if ok:
+                        await self._tg(
+                            f"↪️ Market Unavailable\n"
+                            f"Moved to {watch.active_market}\n"
+                            f"(not another 1H market)"
+                        )
+                    else:
+                        await self._tg(
+                            "⚠️ Unavailable — Full Time arm failed, still watching"
+                        )
+                    await asyncio.sleep(1.0)
+                    continue
+
+                # Suspended without goal → stay (main stops only on goal+lock)
+                if await self._is_suspended(page):
+                    logger.info("[WATCH] suspended (no goal) — staying on match")
+                    await asyncio.sleep(1.0)
+                    continue
 
                 if await page.locator('button:has-text("Accept Changes")').count() > 0:
                     await self._click_accept_changes(page)
