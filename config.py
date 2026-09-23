@@ -8,7 +8,7 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-    MAX_PROFIT_PER_BET = float(os.getenv("MAX_PROFIT_PER_BET", "8000"))
+    MAX_PROFIT_PER_BET = float(os.getenv("MAX_PROFIT_PER_BET", "7800"))
     SUBMISSION_TIMEOUT = int(os.getenv("SUBMISSION_TIMEOUT", "5"))
     MAX_CONSECUTIVE_SLOW = int(os.getenv("MAX_CONSECUTIVE_SLOW", "2"))
     ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "auto")
