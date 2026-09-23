@@ -1,4 +1,4 @@
-"""Bet365 WS — ALL LIVE MATCHES (initial dump + updates) to Telegram."""
+"""Bet365 WS — ALL FOOTBALL MATCHES (permissive filter) to Telegram."""
 
 import asyncio
 import re
@@ -13,12 +13,22 @@ from config import Config
 CDP_URL = "http://127.0.0.1:9222"
 WS_IDLE_SECS = 90
 
-# From working standalone
+# Regex patterns
 RE_FI = re.compile(r"(?:^|[|;,\s])FI=(\d{6,})", re.I)
 RE_ID = re.compile(r"(?:^|[|;,\s])ID=(\d{6,})", re.I)
 RE_NA = re.compile(r"(?:^|[|;,\s])NA=([^|;]+)", re.I)
 RE_SS = re.compile(r"(?:^|[|;,\s])SS=(\d{1,2}\s*[-:]\s*\d{1,2})", re.I)
 RE_OV = re.compile(r"OV(\d{6,})C\d+", re.I)
+
+# PERMISSIVE: Only filter obvious non-football (don't be strict!)
+_OBVIOUS_NON_FOOTBALL = re.compile(
+    r"\btennis\b|\bvolleyball\b|\bbasketball\b|\btable\s*tennis\b|"
+    r"\bdarts\b|\bsnooker\b|\bbadminton\b|\bice\s*hockey\b|"
+    r"\brugby\b|\bcricket\b|\bbaseball\b|\bboxing\b|\bmma\b|"
+    r"\besports?\b|\be-?football\b|\bvirtual\b|\bfifa\s*\d{2,}\b|\bpes\s*\d{2,}\b|"
+    r"\bgt\s*league\b|\bh2h\s*gg\b|\bliga\s*pro\b",
+    re.I,
+)
 
 
 def _split_teams(na: str):
@@ -27,6 +37,20 @@ def _split_teams(na: str):
         if len(parts) == 2:
             return parts[0].strip(), parts[1].strip()
     return (na or "").strip(), ""
+
+
+def _is_probably_football(name: str) -> bool:
+    """Permissive check - only reject obvious non-football."""
+    if not name:
+        return False
+    # Must have vs/v/@ (indicates team vs team)
+    if not re.search(r"\s+v(?:s)?\.?\s+|\s+@\s+", name, re.I):
+        return False
+    # Only reject obvious non-football keywords
+    if _OBVIOUS_NON_FOOTBALL.search(name):
+        return False
+    # Everything else is probably football (clubs, national teams, etc.)
+    return True
 
 
 class Bet365Feed:
@@ -42,6 +66,7 @@ class Bet365Feed:
         self._browser = None
         self._playwright = None
         self._last_alert_at = 0.0
+        self._announced: set = set()
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -74,29 +99,32 @@ class Bet365Feed:
         return self.matches.get(str(match_id))
 
     async def _announce(self, fi: str, name: str, ss: str):
-        """Send EVERY match to Telegram - NO FILTERING."""
+        """Announce football match to Telegram."""
         if not self.running or not self._want_run:
             return
+        if fi in self._announced:
+            return
+
+        self._announced.add(fi)
 
         if self.alerter:
             try:
                 await self.alerter.send(
-                    f"🔴 <b>LIVE</b>\n"
+                    f"⚽ <b>FOOTBALL</b>\n"
                     f"🆔 <code>{fi}</code>\n"
-                    f"⚽ {name}\n"
+                    f"📋 {name}\n"
                     f"📊 {ss or '?'}"
                 )
             except Exception:
                 pass
 
     def _parse_frame(self, text: str):
-        """Parse using working standalone pattern - sends ALL matches including initial dump."""
+        """Parse ALL matches, announce only football WITH names."""
         if not self.running or not self._want_run:
             return
         if not text or len(text) < 8:
             return
 
-        # Split rough event blocks (from standalone)
         parts = re.split(r"[|\x01\x08]", text)
         current_na = None
         current_fi = None
@@ -134,10 +162,9 @@ class Bet365Feed:
                 ss = current_ss or prev.get("ss") or ""
 
                 if name or ss:
-                    # Check if changed from previous
                     changed = prev.get("ss") != ss or prev.get("name") != name
                     
-                    # ALWAYS update stored match
+                    # Store ALL matches (football or not)
                     self.matches[current_fi] = {
                         "source": "bet365",
                         "match_id": current_fi,
@@ -156,20 +183,17 @@ class Bet365Feed:
                         self.matches[current_fi]["home_team"] = h
                         self.matches[current_fi]["away_team"] = a
 
-                    # KEY: Announce on ANY change (catches initial dump!)
-                    if changed:
-                        display_name = name if name else f"Match {current_fi}"
-                        asyncio.create_task(self._announce(current_fi, display_name, ss))
-                        if name:
-                            logger.info(f"[MATCH] FI={current_fi} {name}")
-                        else:
-                            logger.info(f"[SCORE] FI={current_fi} SS={ss} (no name yet)")
-                        
-                        # Callback on score changes
-                        if ss and prev.get("ss") and ss != prev.get("ss") and self.callback:
-                            asyncio.create_task(self._safe_cb(self.matches[current_fi]))
+                    # OPTION 1: Only announce when we have NAME
+                    # But only for FOOTBALL matches (permissive filter)
+                    if changed and name and _is_probably_football(name):
+                        asyncio.create_task(self._announce(current_fi, name, ss))
+                        logger.info(f"[FOOTBALL] FI={current_fi} {name}")
 
-                # Reset for next match in same frame
+                    # Callback for goal detection (only for football)
+                    if (ss and prev.get("ss") and ss != prev.get("ss") and 
+                        self.callback and name and _is_probably_football(name)):
+                        asyncio.create_task(self._safe_cb(self.matches[current_fi]))
+
                 current_na = None
                 current_ss = None
 
@@ -257,7 +281,6 @@ class Bet365Feed:
             
             await asyncio.sleep(2)
             
-            # Click Football/Soccer to load in-play
             for sel in ("text=Football", "text=Soccer"):
                 try:
                     loc = page.locator(sel)
@@ -270,8 +293,8 @@ class Bet365Feed:
                     pass
 
             self.running = True
-            logger.success("[BET365] session UP - receiving ALL matches")
-            await self._tg("✅ Bet365 ON - sending ALL live matches")
+            logger.success("[BET365] session UP - all football matches")
+            await self._tg("✅ Bet365 ON - sending ALL football matches")
             
             while self._want_run:
                 if got_403:
