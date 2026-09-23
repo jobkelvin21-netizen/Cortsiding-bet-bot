@@ -89,12 +89,10 @@ class BetExecutor:
     async def _read_score_from_page(self, page: Page) -> tuple:
         """Read live score from SportyBet DOM only. Never trust old watch/Bet365."""
         text = await self._page_text(page)
-        # Common patterns: "0 - 1", "0-1", "0:1" near match tracker
         patterns = [
             r"(?:score|result)?\s*(\d{1,2})\s*[-:]\s*(\d{1,2})",
             r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\b",
         ]
-        # Prefer scores that look like live football (0-15 goals each)
         candidates = []
         for pat in patterns:
             for m in re.finditer(pat, text, re.I):
@@ -106,7 +104,6 @@ class BetExecutor:
                     pass
         if not candidates:
             return None, None
-        # Most football live pages show current score early; take first sensible
         return candidates[0]
 
     async def _detect_period(self, page: Page) -> str:
@@ -117,7 +114,6 @@ class BetExecutor:
             return "HT"
         if re.search(r"\b(2nd\s*half|second\s*half|2h\b)\b", text):
             return "2H"
-        # clock 46+ often 2H
         m = re.search(r"\b(4[6-9]|[5-9]\d)\s*[':]?\d*", text)
         if m:
             return "2H"
@@ -164,7 +160,6 @@ class BetExecutor:
                     if "unavailable" in t:
                         return False
                     return True
-            # fallback: whole page betslip-ish
             body = (await self._page_text(page, 4000)).lower()
             if ("betslip" in body or "stake" in body) and (
                 needle in body or needle2 in body
@@ -206,12 +201,22 @@ class BetExecutor:
         forbid_kw: List[str],
         label: str,
     ) -> bool:
-        """Click Over {line} under the right period heading. Verify betslip after."""
+        """Click Over {line} under the right period heading. Verify betslip after.
+
+        Keyword matching is scoped to ONLY the line(s) of surrounding text
+        that literally contain "Over/Under" — the market's own heading
+        (e.g. "1st Half - Over/Under", "2nd Half - Over/Under", or plain
+        "Over/Under" for Full Time). This avoids false matches from OTHER
+        nearby markets that also contain "1st half"/"2nd half" in their
+        name (e.g. "1st Half - Handicap", "1st Half - 3rd Goal",
+        "1st Half - Double Chance"), which would otherwise pollute the
+        6-level ancestor text grab and cause require_kw/forbid_kw to match
+        against the wrong market entirely.
+        """
         await self._click_all_tab(page)
         await self._scroll_markets(page, 6)
 
         line_str = f"{line:g}"
-        # Build candidate selectors
         patterns = [
             f"text=/Over\\s*{re.escape(line_str)}/i",
             f"text=/O\\s*{re.escape(line_str)}/i",
@@ -230,7 +235,6 @@ class BetExecutor:
                             box = await el.bounding_box()
                             if not box:
                                 continue
-                            # Context text around element
                             handle = await el.element_handle()
                             if not handle:
                                 continue
@@ -244,7 +248,18 @@ class BetExecutor:
                                 }""",
                                 handle,
                             )
-                            ctx_l = (ctx or "").lower()
+                            ctx = ctx or ""
+                            # Isolate only the heading line(s) that actually
+                            # say "Over/Under" — ignore everything else that
+                            # may have been swept up by the ancestor walk.
+                            heading_lines = [
+                                ln for ln in ctx.split("\n")
+                                if "over/under" in ln.lower()
+                            ]
+                            ctx_l = (
+                                "\n".join(heading_lines) if heading_lines else ctx
+                            ).lower()
+
                             if any(f in ctx_l for f in forbid_kw):
                                 continue
                             if require_kw and not any(r in ctx_l for r in require_kw):
@@ -255,7 +270,6 @@ class BetExecutor:
                             if await self._betslip_has_selection(page, line):
                                 logger.success(f"[ARM] clicked {label} Over {line}")
                                 return True
-                            # click again once if slip empty
                             await el.click(timeout=1500)
                             await asyncio.sleep(0.5)
                             if await self._betslip_has_selection(page, line):
@@ -270,6 +284,14 @@ class BetExecutor:
         logger.warning(f"[ARM] could not put {label} Over {line} on betslip")
         return False
 
+    # RULE:
+    #   1H  -> try 1st Half Over first. If not on the page, fall back to Full Time Over.
+    #   2H  -> try 2nd Half Over first. If not on the page, fall back to Full Time Over.
+    #   FT/HT or force_full_time -> Full Time Over only.
+    # Full Time matching uses require_kw=[] because SportyBet's default
+    # Over/Under section (the Full Time market) has NO "Full Time" label —
+    # it's just plain "Over/Under". forbid_kw still excludes any section
+    # explicitly headed "1st Half - Over/Under" / "2nd Half - Over/Under".
     async def _click_correct_over(self, page: Page, watch: MatchWatch) -> bool:
         line = watch.over_line
         period = watch.period
@@ -278,7 +300,7 @@ class BetExecutor:
             ok = await self._find_and_click_over(
                 page,
                 line,
-                require_kw=["full time", "fulltime", "match goals", "total", "ft"],
+                require_kw=[],
                 forbid_kw=["1st half", "first half", "2nd half", "second half", "half time"],
                 label="FT",
             )
@@ -302,7 +324,7 @@ class BetExecutor:
             ok = await self._find_and_click_over(
                 page,
                 line,
-                require_kw=["full time", "fulltime", "match goals", "total"],
+                require_kw=[],
                 forbid_kw=["1st half", "first half", "2nd half", "second half"],
                 label="FT-fallback",
             )
@@ -326,7 +348,7 @@ class BetExecutor:
         ok = await self._find_and_click_over(
             page,
             line,
-            require_kw=["full time", "fulltime", "match goals", "total"],
+            require_kw=[],
             forbid_kw=["1st half", "first half", "2nd half", "second half"],
             label="FT-fallback-2H",
         )
@@ -363,7 +385,6 @@ class BetExecutor:
                     return True
             except Exception:
                 continue
-        # keyboard fallback on focused slip
         try:
             await page.keyboard.press("Control+a")
             await page.keyboard.type(stake_str, delay=25)
@@ -506,7 +527,6 @@ class BetExecutor:
         if page.is_closed():
             return False
 
-        # ALWAYS refresh score from SportyBet page
         h, a = await self._read_score_from_page(page)
         if h is not None and a is not None:
             watch.home_score = h
@@ -518,16 +538,14 @@ class BetExecutor:
             await self._tg("⏹ Match ended — not arming")
             return False
 
-        # Unavailable on slip → clear + force FT
         if await self._selection_unavailable(page):
             await self._clear_betslip(page)
             watch.force_full_time = True
             await self._tg("⚠️ Market Unavailable → switching to Full Time Over only")
 
-        max_profit = float(getattr(Config, "MAX_PROFIT_PER_BET", 20000))
+        max_profit = float(Config.MAX_PROFIT_PER_BET)
         balance = 0.0
         try:
-            # optional balance read
             text = await self._page_text(page, 2000)
             bm = re.search(r"(?:NGN|₦)\s*([\d,]+(?:\.\d+)?)", text)
             if bm:
@@ -535,7 +553,6 @@ class BetExecutor:
         except Exception:
             pass
 
-        # Groq optional — if key broken, still arm with pure logic
         if plan is None:
             try:
                 page_text = await self._page_text(page, 1500)
@@ -556,7 +573,6 @@ class BetExecutor:
         if plan and plan.get("period_market") == "FT":
             watch.force_full_time = True
 
-        # Clear old selection so we don't stack wrong market
         await self._clear_betslip(page)
         await asyncio.sleep(0.3)
 
@@ -586,9 +602,7 @@ class BetExecutor:
 
         await self._click_place_bet(page)
         await asyncio.sleep(0.4)
-        # Confirm dialog = armed
         armed = await self._click_confirm(page)
-        # Sometimes Confirm is the stay-state after Place Bet
         watch.confirm_armed = True
         await self._tg(
             f"✅ ARMED\n"
@@ -619,10 +633,8 @@ class BetExecutor:
                     watch.running = False
                     break
 
-                # Live score refresh from page
                 h, a = await self._read_score_from_page(page)
                 if h is not None and a is not None:
-                    # Score went DOWN → disallowed goal → cashout
                     if h + a < watch.total_goals:
                         await self.cashout_disallowed(
                             page, f"{watch.home_score}-{watch.away_score}→{h}-{a}"
@@ -634,37 +646,31 @@ class BetExecutor:
                 prev = watch.period
                 watch.period = period
 
-                # HT seen
                 if period == "HT":
                     watch.ht_seen = True
                     watch.confirm_armed = False
 
-                # Back from HT → 2H: re-arm
                 if watch.ht_seen and period == "2H" and prev in ("HT", "1H"):
                     await self._tg("🔄 2nd half started — re-arming")
                     watch.force_full_time = False
                     await self.ai_arm_from_plan(page, None, watch)
 
-                # Unavailable → clear + FT only (not another 1H)
                 if await self._selection_unavailable(page):
                     await self._clear_betslip(page)
                     watch.force_full_time = True
                     watch.confirm_armed = False
                     await self.ai_arm_from_plan(page, None, watch)
 
-                # Suspended (no goal): stay, do not leave match
                 if await self._is_suspended(page):
                     await asyncio.sleep(1.0)
                     continue
 
-                # Odds changed → Accept Changes → Place Bet → Confirm
                 try:
                     if await page.locator("button:has-text('Accept Changes')").count() > 0:
                         await self._click_accept_changes(page)
-                        # re-check stake vs hard cap
                         odds = await self._read_odds_from_slip(page)
                         if odds > 1.01:
-                            max_profit = float(getattr(Config, "MAX_PROFIT_PER_BET", 20000))
+                            max_profit = float(Config.MAX_PROFIT_PER_BET)
                             stake = max_profit / (odds - 1.0)
                             watch.odds_over = odds
                             watch.stake_over = round(stake, 2)
@@ -675,14 +681,12 @@ class BetExecutor:
                 except Exception:
                     pass
 
-                # Keep Confirm if lost
                 if watch.confirm_armed:
                     try:
                         conf = page.locator("button:has-text('Confirm')")
                         if await conf.count() > 0 and await conf.first.is_visible():
-                            pass  # already on confirm
+                            pass
                         else:
-                            # try place+confirm again if selection still there
                             if await self._betslip_has_selection(page, watch.over_line):
                                 await self._click_place_bet(page)
                                 await self._click_confirm(page)
@@ -699,7 +703,6 @@ class BetExecutor:
 
     def start_watching(self, mid: str, page: Page, home: str, away: str, **kwargs):
         mid = str(mid)
-        # Wipe any old watch for this id
         old = self.watches.pop(mid, None)
         if old:
             old.running = False
@@ -756,7 +759,6 @@ class BetExecutor:
         if not w.confirm_armed:
             await self._tg("⚠️ Goal but not armed — skip")
             return BetResult.ABORTED_SAFETY
-        # If SportyBet already locked/suspended hard after goal signal from Bet365
         if await self._is_suspended(w.page) or await self._selection_unavailable(w.page):
             await self._tg("🔒 Goal + SportyBet locked — stop watching this match")
             await self.clear_match(mid)
@@ -764,7 +766,6 @@ class BetExecutor:
         ok = await self._click_confirm(w.page)
         if ok:
             await self._tg(f"✅ BET CLICKED Confirm | {w.active_market}")
-            # re-arm same game next line after brief pause
             await asyncio.sleep(1.0)
             h, a = await self._read_score_from_page(w.page)
             if h is not None:
