@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start/stop bot; /slow by FI only; 1H→FT / 2H→FT markets; safe one-game."""
+"""Telegram control; FI-only goals; always right Over market; safe one-game."""
 
 import asyncio
 import os
@@ -68,8 +68,11 @@ class ArbitrageBot:
         from playwright.async_api import async_playwright
 
         self.playwright = await async_playwright().start()
+        profile = os.path.abspath("chrome_profile_sporty")
+        os.makedirs(profile, exist_ok=True)
+
         self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=os.path.abspath("chrome_profile"),
+            user_data_dir=profile,
             channel="chrome",
             headless=False,
             no_viewport=True,
@@ -78,11 +81,17 @@ class ArbitrageBot:
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
-                "--start-maximized",
                 "--disable-dev-shm-usage",
+                "--start-maximized",
+                "--disable-features=ChromeWhatsNewUI,InfiniteSessionRestore",
             ],
         )
-        page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+
+        if self.context.pages:
+            page = self.context.pages[0]
+        else:
+            page = await self.context.new_page()
+
         await page.goto(
             "https://www.sportybet.com/ng/",
             wait_until="domcontentloaded",
@@ -90,13 +99,15 @@ class ArbitrageBot:
         )
         await asyncio.sleep(2)
         try:
-            await page.click('button:has-text("Log In"), a:has-text("Log In")', timeout=5000)
+            await page.click(
+                'button:has-text("Log In"), a:has-text("Log In")', timeout=5000
+            )
             await asyncio.sleep(1)
         except Exception:
             pass
-        await page.fill('input[name="phone"]', phone)
-        await page.fill('input[name="psd"]', password)
-        await page.click('button[name="logIn"]')
+        await page.fill('input[name="phone"], input[type="tel"]', phone)
+        await page.fill('input[name="psd"], input[type="password"]', password)
+        await page.click('button[name="logIn"], button:has-text("Log In")')
         await asyncio.sleep(5)
 
     async def _finish_setup(self, balance: float):
@@ -165,8 +176,8 @@ class ArbitrageBot:
         logger.info("[START] bot active")
         await self.alerter.send(
             "🟢 <b>BOT STARTED</b>\n"
-            "All live FI → Telegram\n"
-            "Send /slow with SportyBet URL + FI"
+            "Send /slow with SportyBet URL + FI\n"
+            "Always arms correct Over market only"
         )
 
     async def stop_bot(self):
@@ -186,9 +197,7 @@ class ArbitrageBot:
         self._rearming = False
         self._awaiting_switch_decision = False
         logger.info("[STOP] bot inactive")
-        await self.alerter.send(
-            "🛑 <b>BOT STOPPED</b>\nFeed OFF · slow cleared\n/startbot to run again"
-        )
+        await self.alerter.send("🛑 <b>BOT STOPPED</b>\n/startbot to run again")
 
     async def clear_slow(self):
         if self._manual_slow_match:
@@ -200,7 +209,7 @@ class ArbitrageBot:
         self._current_total_goals = 0
         self._has_open_bet = False
         self._rearming = False
-        await self.alerter.send("🧹 Slow cleared — not watching any match")
+        await self.alerter.send("🧹 Slow cleared")
 
     async def _handle_disallowed(self, home_score, away_score, total_goals):
         if not self._bot_active or not self._manual_slow_match:
@@ -215,7 +224,9 @@ class ArbitrageBot:
             page = self.match_pages.get(mid)
             if not page or page.is_closed():
                 return
-            await self.alerter.send(f"🚫 GOAL CANCELLED {teams} {home_score}-{away_score}")
+            await self.alerter.send(
+                f"🚫 GOAL CANCELLED {teams} {home_score}-{away_score}"
+            )
             if hasattr(self.executor, "cashout_disallowed"):
                 await self.executor.cashout_disallowed(
                     page, description=f"{teams} {home_score}-{away_score}"
@@ -284,7 +295,9 @@ class ArbitrageBot:
             ok = await self.executor.click_confirm_only(page)
             if ok:
                 self._has_open_bet = True
-                stake = self.executor.calc_stake(self.executor.last_odds_used or 1.5)
+                stake = self.executor.calc_stake(
+                    self.executor.last_odds_used or 1.5
+                )
                 await self.alerter.notify_bet_placed(
                     teams,
                     f"Over {total_goals - 0.5}",
@@ -325,7 +338,7 @@ class ArbitrageBot:
             watch = self.executor.get_watch(mid)
             armed = await self.executor.ai_arm_from_plan(page, None, watch)
             await self.alerter.send(
-                f"✅ Re-armed Over {total_goals + 0.5}"
+                f"✅ Re-armed {watch.active_market if watch else ''}"
                 if armed
                 else "⚠️ Re-arm failed"
             )
@@ -400,13 +413,16 @@ class ArbitrageBot:
         away = slow.get("away", "")
         mid = f"manual_{abs(hash(url)) % 10_000_000}"
         slow["match_id"] = mid
+
         page = await self.context.new_page()
-        page.set_default_timeout(20000)
+        await page.goto("about:blank")
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        await asyncio.sleep(1.2)
-        if not await self.executor.wait_match_details_ready(page, home, away, 12.0):
+        await asyncio.sleep(1.5)
+
+        if not await self.executor.wait_match_details_ready(page, home, away, 15.0):
             await page.close()
             return False
+
         await self.executor.open_all_tab(page)
         self.match_pages[mid] = page
         hs = self._last_score[0] if self._last_score else 0
