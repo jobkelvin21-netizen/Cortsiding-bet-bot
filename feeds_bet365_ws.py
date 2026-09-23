@@ -1,4 +1,4 @@
-"""Bet365 WS — REAL FOOTBALL ONLY FI+name to Telegram; goals only for locked FI."""
+"""Bet365 WS — ALL LIVE MATCHES FI+name to Telegram; goals only for locked FI."""
 
 import asyncio
 import re
@@ -20,25 +20,6 @@ ID_RE = re.compile(r"(?:^|[|;,\s])ID=(\d{6,})", re.I)
 NA_RE = re.compile(r"(?:^|[|;,\s])NA=([^|;]+)", re.I)
 TM_RE = re.compile(r"(?:^|[|;,\s])TM=(\d+)", re.I)
 OV_RE = re.compile(r"OV(\d{6,})C\d+", re.I)
-
-# Fast reject: obvious esports/virtual football keywords in the match name.
-_ESPORTS_HINTS = re.compile(
-    r"esoccer|efootball|e-football|e[\s\-]?sports?|cyber\s*football|"
-    r"virtual\s*football|gt\s*league|h2h\s*gg|egames|e-games|liga\s*pro|"
-    r"volta\b|battle\b|fifa\s*\d|pes\s*\d",
-    re.I,
-)
-_GAMER_TAG_RE = re.compile(r"\([^)]{1,25}\)")
-_INDIVIDUAL_SPORT_NAME_RE = re.compile(
-    r"^[A-Z][a-zA-Z'\-]+\s+[A-Z]\.?\s*(?:vs\.?|v\.?)\s*[A-Z][a-zA-Z'\-]+\s+[A-Z]\.?$",
-    re.I,
-)
-_NON_FOOTBALL_KEYWORDS = re.compile(
-    r"\btennis\b|\bvolleyball\b|\bbasketball\b|\btable\s*tennis\b|\bhandball\b|"
-    r"\bdarts\b|\bsnooker\b|\bbadminton\b|\bice\s*hockey\b|\brugby\b|\bcricket\b|"
-    r"\bfutsal\b|\bbaseball\b|\bboxing\b|\bmma\b|\bbeach\s*volleyball\b",
-    re.I,
-)
 
 
 def _split_teams(na: str):
@@ -64,7 +45,6 @@ class Bet365Feed:
         self._playwright = None
         self._last_alert_at = 0.0
         self._announced: Set[str] = set()
-        self._football_cache: Dict[str, bool] = {}
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -96,82 +76,21 @@ class Bet365Feed:
     def get_match(self, match_id: str) -> Optional[dict]:
         return self.matches.get(str(match_id))
 
-    async def _ask_groq_is_football(self, name: str) -> bool:
-        try:
-            from core.groq_ai import _client_or_none
-
-            client = _client_or_none()
-            if not client:
-                logger.warning("[BET365][GROQ] no client — treating as non-football")
-                return False
-            resp = client.chat.completions.create(
-                model=getattr(Config, "GROQ_TEXT_MODEL", "llama-3.3-70b-versatile"),
-                temperature=0,
-                max_tokens=10,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": (
-                            "Is this a REAL human football (soccer) match between "
-                            "real clubs or national teams — NOT tennis, table tennis, "
-                            "volleyball, basketball, darts, snooker, badminton, "
-                            "esports, eFootball, virtual football, FIFA/PES video "
-                            "game leagues, or any other non-football sport?\n"
-                            f"Match: {name}\n"
-                            "Answer with exactly one word: YES or NO."
-                        ),
-                    }
-                ],
-            )
-            answer = (resp.choices[0].message.content or "").strip().upper()
-            return answer.startswith("Y")
-        except Exception as e:
-            logger.warning(f"[BET365][GROQ] classify failed, treating as non-football: {e}")
-            return False
-
-    async def _is_real_football(self, fi: str, name: str) -> bool:
-        cached = self._football_cache.get(fi)
-        if cached is not None:
-            return cached
-
-        if _ESPORTS_HINTS.search(name) or _GAMER_TAG_RE.search(name):
-            self._football_cache[fi] = False
-            logger.debug(f"[BET365] filtered esports FI={fi} {name}")
-            return False
-
-        if _NON_FOOTBALL_KEYWORDS.search(name):
-            self._football_cache[fi] = False
-            logger.debug(f"[BET365] filtered non-football keyword FI={fi} {name}")
-            return False
-
-        if _INDIVIDUAL_SPORT_NAME_RE.match(name.strip()):
-            self._football_cache[fi] = False
-            logger.debug(f"[BET365] filtered individual-sport name pattern FI={fi} {name}")
-            return False
-
-        result = await self._ask_groq_is_football(name)
-        self._football_cache[fi] = result
-        if not result:
-            logger.debug(f"[BET365] filtered non-football (groq) FI={fi} {name}")
-        return result
-
     async def _announce(self, fi: str, name: str, ss: str):
+        """Announce ALL matches - no football filter."""
         if not self.running or not self._want_run:
             return
         if fi in self._announced:
             return
-        if not name or not re.search(r"\s+v(?:s)?\.?\s+|\s+@\s+", name, re.I):
+        if not name:
             return
 
-        is_football = await self._is_real_football(fi, name)
         self._announced.add(fi)
-        if not is_football:
-            return
 
         if self.alerter:
             try:
                 await self.alerter.send(
-                    f"⚽ <b>LIVE FOOTBALL</b>\n"
+                    f"🔴 <b>LIVE MATCH</b>\n"
                     f"🆔 FI=<code>{fi}</code>\n"
                     f"📋 {name}\n"
                     f"SS={ss or '?'}"
