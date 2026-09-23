@@ -87,24 +87,44 @@ class BetExecutor:
             return ""
 
     async def _read_score_from_page(self, page: Page) -> tuple:
-        """Read live score from SportyBet DOM only. Never trust old watch/Bet365."""
-        text = await self._page_text(page)
-        patterns = [
-            r"(?:score|result)?\s*(\d{1,2})\s*[-:]\s*(\d{1,2})",
-            r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\b",
-        ]
-        candidates = []
-        for pat in patterns:
-            for m in re.finditer(pat, text, re.I):
-                try:
-                    h, a = int(m.group(1)), int(m.group(2))
-                    if 0 <= h <= 15 and 0 <= a <= 15:
-                        candidates.append((h, a))
-                except Exception:
-                    pass
-        if not candidates:
-            return None, None
-        return candidates[0]
+        """Read live score from SportyBet DOM only. Never trust old watch/Bet365.
+
+        Priority order matters. The match tracker shows the score as
+        "H : A" (e.g. "2 : 1") right next to the team names, near the top
+        of the page. Further down, the match timeline prints minute
+        markers ("0 15 30 45 60 75 90") and other dash-separated numbers
+        (odds, stats) that a loose "X-Y" pattern can mistake for the score
+        if it's searched first — which is what was causing 0-0 or wrong
+        scores to be read even when the real score was different.
+
+        So: try a tight "digit : digit" match first (score format), and
+        only fall back to a dash-based match if no colon-score is found.
+        Also prefer whichever candidate appears earliest but only among a
+        SINGLE pattern's results, not mixed across pattern types.
+        """
+        text = await self._page_text(page, 3000)  # score is always near the top
+
+        # 1) Preferred: "H : A" — this is the live score in the match tracker.
+        colon_pattern = re.compile(r"\b(\d{1,2})\s*:\s*(\d{1,2})\b")
+        for m in colon_pattern.finditer(text):
+            try:
+                h, a = int(m.group(1)), int(m.group(2))
+                if 0 <= h <= 15 and 0 <= a <= 15:
+                    return h, a
+            except Exception:
+                continue
+
+        # 2) Fallback: "H - A" or "H – A", only if no colon-score was found.
+        dash_pattern = re.compile(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\b")
+        for m in dash_pattern.finditer(text):
+            try:
+                h, a = int(m.group(1)), int(m.group(2))
+                if 0 <= h <= 15 and 0 <= a <= 15:
+                    return h, a
+            except Exception:
+                continue
+
+        return None, None
 
     async def _detect_period(self, page: Page) -> str:
         text = (await self._page_text(page)).lower()
@@ -249,9 +269,6 @@ class BetExecutor:
                                 handle,
                             )
                             ctx = ctx or ""
-                            # Isolate only the heading line(s) that actually
-                            # say "Over/Under" — ignore everything else that
-                            # may have been swept up by the ancestor walk.
                             heading_lines = [
                                 ln for ln in ctx.split("\n")
                                 if "over/under" in ln.lower()
