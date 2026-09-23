@@ -1,4 +1,4 @@
-"""Bet365 WS — ALL LIVE MATCHES FI+name to Telegram; goals only for locked FI."""
+"""Bet365 WS — ALL LIVE MATCHES to Telegram (using working parse pattern)."""
 
 import asyncio
 import re
@@ -14,12 +14,12 @@ CDP_URL = "http://127.0.0.1:9222"
 WS_IDLE_SECS = 90
 CATCHUP_INTERVAL_SECS = 15.0
 
-SS_RE = re.compile(r"(?:^|[|;,\s])SS=(\d{1,2})\s*[-:]\s*(\d{1,2})", re.I)
-FI_RE = re.compile(r"(?:^|[|;,\s])FI=(\d{6,})", re.I)
-ID_RE = re.compile(r"(?:^|[|;,\s])ID=(\d{6,})", re.I)
-NA_RE = re.compile(r"(?:^|[|;,\s])NA=([^|;]+)", re.I)
-TM_RE = re.compile(r"(?:^|[|;,\s])TM=(\d+)", re.I)
-OV_RE = re.compile(r"OV(\d{6,})C\d+", re.I)
+# Capture FI / ID / NA / SS from frames (from working standalone)
+RE_FI = re.compile(r"(?:^|[|;,\s])FI=(\d{6,})", re.I)
+RE_ID = re.compile(r"(?:^|[|;,\s])ID=(\d{6,})", re.I)
+RE_NA = re.compile(r"(?:^|[|;,\s])NA=([^|;]+)", re.I)
+RE_SS = re.compile(r"(?:^|[|;,\s])SS=(\d{1,2}\s*[-:]\s*\d{1,2})", re.I)
+RE_OV = re.compile(r"OV(\d{6,})C\d+", re.I)
 
 
 def _split_teams(na: str):
@@ -45,6 +45,8 @@ class Bet365Feed:
         self._playwright = None
         self._last_alert_at = 0.0
         self._announced: Set[str] = set()
+        self._frame_count = 0
+        self._named_count = 0
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -77,7 +79,7 @@ class Bet365Feed:
         return self.matches.get(str(match_id))
 
     async def _announce(self, fi: str, name: str, ss: str):
-        """Announce ALL matches - no football filter."""
+        """Send ALL matches to Telegram - no filtering."""
         if not self.running or not self._want_run:
             return
         if fi in self._announced:
@@ -98,109 +100,89 @@ class Bet365Feed:
             except Exception:
                 pass
 
-    async def _catchup_loop(self):
-        while self._want_run:
-            try:
-                await asyncio.sleep(CATCHUP_INTERVAL_SECS)
-                if not self.running or not self._want_run:
-                    continue
-                for fi, rec in list(self.matches.items()):
-                    if fi in self._announced:
-                        continue
-                    name = rec.get("name") or ""
-                    if not name:
-                        continue
-                    await self._announce(fi, name, rec.get("ss") or "")
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.debug(f"[BET365][CATCHUP] {e}")
-
-    def _parse_frame(self, raw: str):
+    def _parse_frame(self, text: str):
+        """Parse using the working standalone pattern."""
         if not self.running or not self._want_run:
             return
-        raw = (raw or "").replace("\x01", "").strip()
-        if not raw:
+        if not text or len(text) < 8:
             return
-        parts = re.split(r"[|\x08]", raw)
-        cur_fi = cur_na = cur_ss = cur_tm = None
+
+        self._frame_count += 1
+
+        # Split rough event blocks (from standalone)
+        parts = re.split(r"[|\x01\x08]", text)
+        current_na = None
+        current_fi = None
+        current_ss = None
 
         for part in parts:
             part = part.strip()
             if not part:
                 continue
-            m = NA_RE.search(part)
-            if m:
+
+            for m in RE_NA.finditer(part):
                 na = m.group(1).strip()
-                if re.search(r"\s+v(?:s)?\.?\s+|\s+@\s+", na, re.I):
-                    cur_na = na
-            m = FI_RE.search(part)
-            if m:
-                cur_fi = m.group(1)
-            else:
-                m = ID_RE.search(part)
-                if m and re.fullmatch(r"\d{6,}", m.group(1)):
-                    cur_fi = m.group(1)
-                else:
-                    m = OV_RE.search(part)
-                    if m:
-                        cur_fi = m.group(1)
-            m = SS_RE.search(part)
-            if m:
-                cur_ss = f"{int(m.group(1))}-{int(m.group(2))}"
-            m = TM_RE.search(part)
-            if m:
-                cur_tm = m.group(1)
+                # Likely a match name if has v / vs / @
+                if re.search(r"\bv\b|\bvs\b|@", na, re.I) or " v " in na.lower():
+                    current_na = na
+                    self._named_count += 1
 
-            if not cur_fi or not (cur_na or cur_ss):
-                continue
+            for m in RE_FI.finditer(part):
+                current_fi = m.group(1)
 
-            mid = str(cur_fi)
-            rec = self.matches.get(
-                mid,
-                {
-                    "source": "bet365",
-                    "match_id": mid,
-                    "home_team": "",
-                    "away_team": "",
-                    "name": "",
-                    "home_score": 0,
-                    "away_score": 0,
-                    "ss": "",
-                    "minute": 0,
-                    "updated": 0.0,
-                },
-            )
-            if cur_na:
-                h, a = _split_teams(cur_na)
-                rec["name"] = cur_na
-                rec["home_team"], rec["away_team"] = h, a
-                asyncio.create_task(
-                    self._announce(mid, cur_na, cur_ss or rec.get("ss") or "")
-                )
-            score_changed = False
-            if cur_ss:
-                old = rec.get("ss") or ""
-                try:
-                    h, a = map(int, cur_ss.split("-"))
-                except Exception:
-                    h = a = 0
-                rec["ss"] = cur_ss
-                rec["home_score"], rec["away_score"] = h, a
-                if old and old != cur_ss:
-                    score_changed = True
-                    logger.success(f"[GOAL] FI={mid} {old}→{cur_ss}")
-            if cur_tm:
-                try:
-                    rec["minute"] = int(float(cur_tm))
-                except Exception:
-                    pass
-            rec["updated"] = time.time()
-            self.matches[mid] = rec
-            self._last_message_at = time.time()
-            if score_changed and self.callback:
-                asyncio.create_task(self._safe_cb(rec))
-            cur_ss = cur_na = None
+            for m in RE_ID.finditer(part):
+                if not current_fi:
+                    current_fi = m.group(1)
+
+            for m in RE_OV.finditer(part):
+                if not current_fi:
+                    current_fi = m.group(1)
+
+            for m in RE_SS.finditer(part):
+                current_ss = re.sub(r"\s+", "", m.group(1).replace(":", "-"))
+
+            # Commit when we have an id
+            if current_fi and (current_na or current_ss):
+                prev = self.matches.get(current_fi, {})
+                name = current_na or prev.get("name") or ""
+                ss = current_ss or prev.get("ss") or ""
+
+                if name or ss:
+                    changed = prev.get("ss") != ss or prev.get("name") != name
+                    self.matches[current_fi] = {
+                        "source": "bet365",
+                        "match_id": current_fi,
+                        "home_team": "",
+                        "away_team": "",
+                        "name": name,
+                        "home_score": 0,
+                        "away_score": 0,
+                        "ss": ss,
+                        "minute": 0,
+                        "updated": time.time(),
+                    }
+
+                    if name:
+                        h, a = _split_teams(name)
+                        self.matches[current_fi]["home_team"] = h
+                        self.matches[current_fi]["away_team"] = a
+
+                    # Announce to Telegram if new or changed
+                    if changed and name:
+                        asyncio.create_task(self._announce(current_fi, name, ss))
+                        logger.info(f"[MATCH] FI={current_fi} NA={name} SS={ss or '?'}")
+                    elif changed and ss:
+                        logger.info(f"[SCORE] FI={current_fi} SS={ss} NA={name or '(no name yet)'}")
+
+                    # Trigger callback on score change
+                    if changed and ss and prev.get("ss") and self.callback:
+                        asyncio.create_task(self._safe_cb(self.matches[current_fi]))
+
+                current_na = None
+                current_ss = None
+                # keep fi for following fields in same block sometimes
+
+        self._last_message_at = time.time()
 
     async def _safe_cb(self, rec: dict):
         if not self.running or not self._want_run or not self.callback:
@@ -240,18 +222,18 @@ class Bet365Feed:
             return False
         try:
             if not self._browser.contexts:
-                logger.warning("[BET365] EXIT: browser has no contexts (no tabs/profile open)")
+                logger.warning("[BET365] EXIT: browser has no contexts")
                 return False
             page = await self._browser.contexts[0].new_page()
             self._page = page
-            logger.info(f"[BET365] opened new tab (context has {len(self._browser.contexts[0].pages)} pages now)")
+            logger.info(f"[BET365] opened new tab")
 
             def on_response(resp):
                 nonlocal got_403
                 try:
                     if resp.status == 403:
                         got_403 = True
-                        logger.debug(f"[BET365] 403 seen on subresource: {resp.url}")
+                        logger.debug(f"[BET365] 403 seen: {resp.url}")
                 except Exception:
                     pass
 
@@ -268,7 +250,8 @@ class Bet365Feed:
                             if isinstance(payload, (bytes, bytearray))
                             else str(payload)
                         )
-                        if any(x in text for x in ("NA=", "FI=", "SS=", "OV", "ID=")):
+                        # Only parse frames that look useful (from standalone)
+                        if any(x in text for x in ("NA=", "FI=", "SS=", "OV", "EV;")):
                             self._parse_frame(text)
                     except Exception:
                         pass
@@ -276,41 +259,50 @@ class Bet365Feed:
                 ws.on("framereceived", on_frame)
 
             page.on("websocket", on_websocket)
+            
             url = getattr(Config, "BET365_LIVE_URL", "https://www.bet365.com/#/IP/B1")
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            
             if not self._want_run:
-                logger.info("[BET365] EXIT: _want_run turned False during page load")
                 return False
             if (resp and resp.status == 403) or got_403:
-                logger.warning(
-                    f"[BET365] EXIT: 403 detected (main page status={resp.status if resp else 'no-resp'}, "
-                    f"got_403_flag={got_403})"
-                )
                 await self._tg("⚠️ Bet365 403 — change Proton")
                 return False
+            
             await asyncio.sleep(2)
+            
+            # Click Football/Soccer like standalone
+            for sel in ("text=Football", "text=Soccer"):
+                try:
+                    loc = page.locator(sel)
+                    if await loc.count() > 0:
+                        await loc.first.click(timeout=2000)
+                        logger.info(f"[BET365] clicked {sel}")
+                        await asyncio.sleep(2)
+                        break
+                except Exception:
+                    pass
+
             self.running = True
-            logger.success("[BET365] session UP — waiting for frames / idle timeout")
+            logger.success("[BET365] session UP")
             await self._tg("✅ Bet365 ON — all live FI → Telegram")
+            
             while self._want_run:
                 if got_403:
-                    logger.warning("[BET365] EXIT: 403 flagged during running loop")
                     await self._tg("⚠️ Bet365 403")
                     return False
                 if self._last_message_at and (
                     time.time() - self._last_message_at > WS_IDLE_SECS
                 ):
                     idle_for = time.time() - self._last_message_at
-                    logger.warning(f"[BET365] EXIT: idle timeout ({idle_for:.0f}s since last frame, limit={WS_IDLE_SECS}s)")
+                    logger.warning(f"[BET365] idle timeout ({idle_for:.0f}s)")
                     return False
                 await asyncio.sleep(1)
-            logger.info("[BET365] EXIT: _want_run turned False in main loop (normal stop)")
             return True
         except asyncio.CancelledError:
-            logger.info("[BET365] EXIT: session cancelled")
             return False
         except Exception as e:
-            logger.error(f"[BET365] EXIT: unhandled exception: {e!r}")
+            logger.error(f"[BET365] EXIT: {e!r}")
             return False
         finally:
             self.running = False
@@ -331,8 +323,6 @@ class Bet365Feed:
         self._want_run = True
         self.running = False
         self._task = asyncio.create_task(self._supervisor())
-        if not self._catchup_task or self._catchup_task.done():
-            self._catchup_task = asyncio.create_task(self._catchup_loop())
 
     async def stop(self):
         self._want_run = False
@@ -344,14 +334,6 @@ class Bet365Feed:
             t.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(t), timeout=2.0)
-            except Exception:
-                pass
-        ct = self._catchup_task
-        self._catchup_task = None
-        if ct and not ct.done():
-            ct.cancel()
-            try:
-                await asyncio.wait_for(asyncio.shield(ct), timeout=2.0)
             except Exception:
                 pass
         await self._close_browser()
