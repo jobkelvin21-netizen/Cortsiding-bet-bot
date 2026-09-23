@@ -1,12 +1,17 @@
 """
-BetExecutor — fast arm (Groq Over rules) + Confirm-only on goal.
-Full hard-cap stake. No validation bet. Errors → Telegram.
+BetExecutor — video flow + market priority:
+  1H: 1st Half Over {goals+0.5} → else Full Time Over
+  2H: 2nd Half Over {goals+0.5} → else Full Time Over
+  Stake hard-cap → Place Bet → Confirm
+  Odds move → Accept Changes → stake → Place → Confirm
+  Goal (correct FI only from main) → Confirm only
+  Suspended → flag, stop, NO next market
+  Disallowed → Cashout → Confirm
 """
 
 import asyncio
 import re
 import time
-import uuid
 from enum import Enum, auto
 from typing import Optional, Dict, Any
 
@@ -14,20 +19,25 @@ from playwright.async_api import Page
 from loguru import logger
 
 from config import Config
-from browser.fast_executor import FastExecutor
 from utils.telegram import TelegramAlerter
-from core.groq_ai import plan_over_market, _normalize_period
 
 
 class BetResult(Enum):
     SUCCESS = auto()
     FAILED = auto()
-    SWITCHED = auto()
-    ABORTED_SAFETY = auto()
+    ABORTED = auto()
+    SUSPENDED = auto()
 
 
 class MatchWatch:
-    def __init__(self, page: Page, home_team: str, away_team: str, home_score: int = 0, away_score: int = 0):
+    def __init__(
+        self,
+        page: Page,
+        home_team: str,
+        away_team: str,
+        home_score: int = 0,
+        away_score: int = 0,
+    ):
         self.page = page
         self.home_team = home_team
         self.away_team = away_team
@@ -41,6 +51,7 @@ class MatchWatch:
         self.period: str = "1H"
         self.task: Optional[asyncio.Task] = None
         self.running = False
+        self.flagged_suspended = False
 
     @property
     def total_goals(self) -> int:
@@ -52,670 +63,498 @@ class MatchWatch:
 
 
 class BetExecutor:
-    SUCCESS_PATTERNS = ("Submission Successful", "Bet Successful")
-
-    def __init__(self, alerter: TelegramAlerter, account_manager, sportybet_matches_ref: dict, learning=None):
+    def __init__(self, alerter: TelegramAlerter, account_manager, accounts, browser=None):
         self.alerter = alerter
         self.account_manager = account_manager
-        self.sportybet_matches = sportybet_matches_ref
-        self.learning = learning
-
-        self.balance: Optional[float] = 0.0
-        self.consecutive_slow = 0
-        self.stopped = False
-        self.fast = FastExecutor()
+        self.balance = 0.0
         self.current_account = None
-        self.last_odds_used = 0.0
-        self.last_stake_used = 0.0
-
-        # Always full production mode
         self.validation_bet_placed = True
         self.validation_passed = True
+        self.last_odds_used = 0.0
+        self._watches: Dict[str, MatchWatch] = {}
+        self.max_profit = float(getattr(Config, "MAX_PROFIT_PER_BET", 20000))
 
-        self.watches: Dict[str, MatchWatch] = {}
-        self.max_rebet = int(getattr(Config, "MAX_STACK_PER_GOAL", 3))
-        self.rebet_delay = float(getattr(Config, "MIN_STACK_DELAY", 0.8))
-        self._rearm_interval = float(getattr(Config, "ODDS_TRACK_INTERVAL", 2.0))
+    def calc_stake(self, odds: float) -> float:
+        if odds <= 1.01:
+            return 0.0
+        stake = self.max_profit / (odds - 1.0)
+        if self.balance > 0:
+            stake = min(stake, self.balance)
+        return round(max(stake, 10.0), 2)
 
     async def _tg(self, msg: str):
         try:
             await self.alerter.send(msg)
         except Exception:
-            try:
-                await self.alerter.send_message(msg)
-            except Exception:
-                pass
-
-    def calc_stake(self, odds: float) -> float:
-        if odds <= 1.0 or not self.balance or self.balance <= 0:
-            return 0.0
-        target = float(Config.MAX_PROFIT_PER_BET) / (odds - 1.0)
-        return float(self.balance) if self.balance < target else float(target)
-
-    async def _safe_closed(self, page: Page) -> bool:
-        try:
-            return page is None or page.is_closed()
-        except Exception:
-            return True
-
-    async def _page_alive(self, page: Page) -> bool:
-        if await self._safe_closed(page):
-            return False
-        try:
-            url = (page.url or "").lower()
-            return bool(url) and not url.startswith("about:")
-        except Exception:
-            return False
-
-    async def wait_match_details_ready(self, page: Page, home: str = "", away: str = "", timeout_s: float = 18.0) -> bool:
-        if not await self._page_alive(page):
-            return False
-        deadline = time.time() + timeout_s
-        ht = (home.split()[0] if home else "").strip()
-        at = (away.split()[0] if away else "").strip()
-        while time.time() < deadline:
-            if not await self._page_alive(page):
-                return False
-            try:
-                url = (page.url or "").lower()
-                has_all = (await page.get_by_text(re.compile(r"^\s*All\s*$")).count()) > 0
-                has_teams = True
-                if ht and at:
-                    has_teams = (await page.get_by_text(ht, exact=False).count()) > 0 and (
-                        await page.get_by_text(at, exact=False).count()
-                    ) > 0
-                if has_all and has_teams and "live_list" not in url:
-                    return True
-            except Exception:
-                pass
-            await asyncio.sleep(0.25)
-        return False
-
-    async def open_all_tab(self, page: Page) -> bool:
-        if not await self._page_alive(page):
-            return False
-        for loc in (
-            page.get_by_role("tab", name=re.compile(r"^\s*All\s*$", re.I)),
-            page.get_by_text(re.compile(r"^\s*All\s*$")),
-        ):
-            try:
-                if await loc.count() > 0:
-                    await loc.first.click(timeout=1200)
-                    await page.wait_for_timeout(200)
-                    return True
-            except Exception:
-                continue
-        return False
-
-    async def _scroll_markets_panel(self, page: Page, amount: int = 420) -> bool:
-        """Nudge the virtualized markets container so hidden rows render
-        into the DOM. Returns True if something actually moved."""
-        try:
-            moved = await page.evaluate(
-                """(amount) => {
-                    const nodes = Array.from(document.querySelectorAll(
-                        'div, section, main, [class*="market"], [class*="Market"],' +
-                        ' [class*="scroll"], [class*="content"]'
-                    ));
-                    let best = null, bestOverflow = 0;
-                    for (const el of nodes) {
-                        const sh = el.scrollHeight || 0;
-                        const ch = el.clientHeight || 0;
-                        if (sh > ch + 80) {
-                            const overflow = sh - ch;
-                            const rect = el.getBoundingClientRect();
-                            if (rect.width < 200) continue;
-                            if (overflow > bestOverflow) {
-                                bestOverflow = overflow;
-                                best = el;
-                            }
-                        }
-                    }
-                    if (best) {
-                        const before = best.scrollTop;
-                        best.scrollTop = Math.min(best.scrollTop + amount, best.scrollHeight);
-                        return best.scrollTop !== before;
-                    }
-                    window.scrollBy(0, amount);
-                    return true;
-                }""",
-                amount,
-            )
-            return bool(moved)
-        except Exception:
-            return False
-
-    async def _capture_full_market_text(self, page: Page, steps: int = 12) -> str:
-        """The markets panel is virtualized — only what's scrolled into
-        view exists in the DOM at any instant. Scroll step by step and
-        accumulate every unique line seen along the way, so the full
-        market list (including 1H/2H/FT Over-Under lines further down)
-        reaches the AI instead of just whatever happened to be on screen."""
-        seen_lines = []
-        seen_set = set()
-
-        async def snapshot():
-            try:
-                text = await page.inner_text("body")
-            except Exception:
-                text = ""
-            for line in text.splitlines():
-                line = line.strip()
-                if line and line not in seen_set:
-                    seen_set.add(line)
-                    seen_lines.append(line)
-
-        await snapshot()
-        for i in range(steps):
-            moved = await self._scroll_markets_panel(page, amount=400 + i * 30)
-            await page.wait_for_timeout(180)
-            await snapshot()
-            if not moved:
-                break
-
-        # Scroll back to top so the page looks normal again / clock stays visible
-        try:
-            await page.evaluate("window.scrollTo(0, 0)")
-        except Exception:
             pass
 
-        return "\n".join(seen_lines)
-
-    async def fetch_balance(self, page: Page) -> Optional[float]:
-        for sel in (
-            '[class*="balance"]',
-            '[class*="Balance"]',
-            'text=/₦\\s*[\\d,]+/',
-        ):
-            try:
-                loc = page.locator(sel)
-                if await loc.count() > 0:
-                    t = await loc.first.inner_text()
-                    m = re.search(r"([\d,]+(?:\.\d+)?)", t.replace(",", ""))
-                    if m:
-                        self.balance = float(m.group(1).replace(",", ""))
-                        return self.balance
-            except Exception:
-                continue
-        return self.balance
-
-    async def _set_stake_input(self, page: Page, stake: float) -> bool:
-        box = page.locator(
-            'input[type="number"], input[type="tel"], input[inputmode="numeric"], '
-            'input[placeholder*="Stake" i], input[placeholder*="Amount" i]'
-        )
-        try:
-            if await box.count() > 0:
-                el = box.first
-                await el.click(timeout=600)
-                await el.fill("")
-                await el.fill(str(int(stake)))
-                return True
-        except Exception:
-            pass
-        try:
-            return bool(await self.fast.fast_type(page, "input", str(int(stake)), human_delay=False))
-        except Exception:
-            return False
-
-    async def _click_accept_changes(self, page: Page) -> bool:
-        for getter in (
-            lambda: page.get_by_role("button", name=re.compile(r"Accept\s*Changes", re.I)),
-            lambda: page.get_by_text(re.compile(r"Accept\s*Changes", re.I)),
-        ):
-            try:
-                btn = getter()
-                if await btn.count() > 0 and await btn.first.is_visible():
-                    await btn.first.click(timeout=800)
-                    await page.wait_for_timeout(100)
-                    return True
-            except Exception:
-                pass
-        return False
-
-    async def _click_place_bet(self, page: Page) -> bool:
-        btn = page.get_by_role("button", name=re.compile(r"^\s*Place\s*Bet\s*$", re.I))
-        try:
-            if await btn.count() > 0 and await btn.first.is_visible():
-                await btn.first.click(timeout=1000)
-                return True
-        except Exception:
-            pass
-        try:
-            return bool(
-                await self.fast.fast_click(
-                    page, 'button:has-text("Place Bet")', timeout=700, human_delay=False
-                )
-            )
-        except Exception:
-            return False
-
-    async def _confirm_visible(self, page: Page) -> bool:
-        btn = page.get_by_role("button", name=re.compile(r"^\s*Confirm\s*$", re.I))
-        try:
-            return (await btn.count()) > 0 and await btn.first.is_visible()
-        except Exception:
-            return False
-
-    async def _click_confirm_dialog(self, page: Page) -> bool:
-        btn = page.get_by_role("button", name=re.compile(r"^\s*Confirm\s*$", re.I))
-        try:
-            if await btn.count() > 0 and await btn.first.is_visible():
-                await btn.first.click(timeout=1000)
-                return True
-        except Exception:
-            pass
-        try:
-            return bool(
-                await self.fast.fast_click(
-                    page, 'button:has-text("Confirm")', timeout=700, human_delay=False
-                )
-            )
-        except Exception:
-            return False
-
-    async def _wait_bet_success(self, page: Page, timeout_ms: int = 8000) -> bool:
-        for text in self.SUCCESS_PATTERNS:
-            try:
-                await page.wait_for_selector(f"text={text}", timeout=timeout_ms // 2)
-                return True
-            except Exception:
-                continue
-        return False
-
-    def _plan_illegal_for_period(self, plan: dict, period: str) -> bool:
-        """True if plan is illegal (e.g. 2H market while 1H)."""
-        per = (period or "1H").upper()
-        name = (plan.get("market_name") or "").lower()
-        pmarket = (plan.get("period_market") or "").upper()
-        if per == "1H" and (pmarket == "2H" or "2nd half" in name or "second half" in name):
-            return True
-        if plan.get("selection", "Over").lower() == "under":
-            return True
-        return False
-
-    async def ai_arm_from_plan(
-        self, page: Page, plan: Optional[dict] = None, watch: Optional[MatchWatch] = None
-    ) -> bool:
-        if not await self._page_alive(page):
-            await self._tg("❌ Arm failed: page dead")
-            return False
-
-        home = away = ""
-        hs = as_ = 0
-        period_hint = "1H"
-        if watch:
-            home, away = watch.home_team, watch.away_team
-            hs, as_ = watch.home_score, watch.away_score
-            period_hint = watch.period or "1H"
-
-        await self.open_all_tab(page)
-
-        # Force-render the full virtualized markets list before reading text.
-        text = await self._capture_full_market_text(page, steps=12)
-        logger.info(f"[AI ARM] captured {len(text)} chars, {len(text.splitlines())} lines")
-
-        period = _normalize_period(period_hint, text)
-        if watch:
-            watch.period = period
-
-        if not plan or not plan.get("market_found"):
-            await self.fetch_balance(page)
-            plan = plan_over_market(
-                text,
-                home,
-                away,
-                hs,
-                as_,
-                period,
-                float(Config.MAX_PROFIT_PER_BET),
-                float(self.balance or 0),
-            )
-
-        if not plan.get("market_found") or self._plan_illegal_for_period(plan, period):
-            msg = plan.get("error") or plan.get("reason") or "market not found / illegal"
-            logger.warning(f"[AI ARM] {msg}")
-            await self._tg(f"⚠️ Arm failed: {msg}\n{home} vs {away} ({period})")
-            if watch:
-                watch.confirm_armed = False
-            return False
-
-        line = plan.get("line")
-        line_s = f"{float(line):.1f}" if line is not None else ""
-        odds = float(plan.get("odds") or 0)
-        stake = self.calc_stake(odds) if odds > 1.01 else float(plan.get("stake") or 0)
-        if stake < 10:
-            await self._tg(f"⚠️ Arm failed: stake < 10 (bal={self.balance})")
-            if watch:
-                watch.confirm_armed = False
-            return False
-
-        try:
-            await self.open_all_tab(page)
-            clicked = False
-            # Prefer scoped Over line click
-            if line_s:
-                patterns = [
-                    re.compile(rf"Over\s*{re.escape(line_s)}", re.I),
-                    re.compile(rf"^\s*Over\s*{re.escape(line_s)}\s*$", re.I),
-                ]
-                for pat in patterns:
-                    try:
-                        loc = page.get_by_text(pat)
-                        if await loc.count() > 0:
-                            await loc.first.scroll_into_view_if_needed(timeout=600)
-                            await loc.first.click(timeout=1500)
-                            clicked = True
-                            break
-                    except Exception:
-                        continue
-
-            if not clicked:
-                await self._tg(f"⚠️ Could not click Over {line_s} on page")
-                if watch:
-                    watch.confirm_armed = False
-                return False
-
-            if not await self._set_stake_input(page, stake):
-                await self._tg("⚠️ Stake input failed")
-                if watch:
-                    watch.confirm_armed = False
-                return False
-
-            await self._click_accept_changes(page)
-            if not await self._click_place_bet(page):
-                await self._click_accept_changes(page)
-                if not await self._click_place_bet(page):
-                    await self._tg("⚠️ Place Bet failed")
-                    if watch:
-                        watch.confirm_armed = False
-                    return False
-
-            await page.wait_for_timeout(250)
-            ok = await self._confirm_visible(page)
-
-            if watch:
-                watch.confirm_armed = ok
-                watch.odds_over = odds
-                watch.stake_over = stake
-                watch.active_market = plan.get("market_name") or f"Over {line_s}"
-                watch.target_line = float(line) if line is not None else watch.over_line
-
-            self.last_odds_used = odds if odds > 1 else self.last_odds_used
-            self.last_stake_used = stake
-
-            if ok:
-                logger.success(
-                    f"[AI ARM] CONFIRM {watch.active_market if watch else line_s} "
-                    f"stake={stake:.0f} @{odds}"
-                )
-                await self._tg(
-                    f"🟢 ON CONFIRM\n{home} vs {away}\n"
-                    f"{plan.get('market_name', line_s)} @ {odds}\n"
-                    f"Stake ₦{stake:,.0f}\nPeriod {period}"
-                )
-            else:
-                await self._tg("⚠️ Place Bet ok but Confirm not visible")
-            return ok
-        except Exception as e:
-            logger.error(f"[AI ARM] {e}")
-            await self._tg(f"❌ Arm error: {e}")
-            if watch:
-                watch.confirm_armed = False
-            return False
-
-    async def click_confirm_only(self, page: Page) -> bool:
-        if not await self._page_alive(page):
-            await self._tg("❌ Confirm failed: page dead")
-            return False
-        try:
-            await page.bring_to_front()
-        except Exception:
-            pass
-
-        start = time.time()
-        if not await self._confirm_visible(page):
-            await self._click_accept_changes(page)
-
-        if not await self._click_confirm_dialog(page):
-            await self._tg("❌ Confirm button not found")
-            return False
-
-        ok = await self._wait_bet_success(
-            page, timeout_ms=getattr(Config, "CONFIRMATION_TIMEOUT_MS", 8000)
-        )
-        elapsed = time.time() - start
-        if ok:
-            logger.success(f"[CONFIRM] OK {elapsed*1000:.0f}ms")
-            if self.balance and self.last_odds_used > 1:
-                st = self.calc_stake(self.last_odds_used)
-                self.last_stake_used = st
-                self.balance = max(0.0, self.balance - st)
-            self.consecutive_slow = 0
-            return True
-
-        if elapsed > getattr(Config, "SUBMISSION_TIMEOUT", 5):
-            try:
-                await self.alerter.notify_submission_slow("match", "slow confirm", elapsed)
-            except Exception:
-                await self._tg(f"⚠️ Slow confirm {elapsed:.1f}s")
-        await self._tg("❌ Confirm: no success text")
-        return False
-
-    async def cashout_disallowed(self, page: Page, description: str = "Goal cancelled") -> bool:
-        if not await self._page_alive(page):
-            return False
-        try:
-            await page.bring_to_front()
-        except Exception:
-            pass
-
-        logger.warning(f"[CASHOUT] {description}")
-        try:
-            for sel in (
-                page.get_by_role("link", name=re.compile(r"My\s*Bets", re.I)),
-                page.get_by_text(re.compile(r"^\s*My\s*Bets\s*$", re.I)),
-                page.get_by_text(re.compile(r"Open\s*Bets", re.I)),
-            ):
-                try:
-                    if await sel.count() > 0:
-                        await sel.first.click(timeout=1200)
-                        await page.wait_for_timeout(300)
-                        break
-                except Exception:
-                    continue
-
-            cashed = False
-            for sel in (
-                page.get_by_role("button", name=re.compile(r"Cash\s*Out", re.I)),
-                page.get_by_text(re.compile(r"^\s*Cash\s*Out\s*$", re.I)),
-                page.locator('button:has-text("Cash Out")'),
-            ):
-                try:
-                    if await sel.count() > 0:
-                        await sel.first.click(timeout=1500)
-                        await page.wait_for_timeout(250)
-                        cashed = True
-                        break
-                except Exception:
-                    continue
-
-            if not cashed:
-                await self._tg(f"❌ Cash Out not found — {description}")
-                return False
-
-            await self._click_confirm_dialog(page)
-            await page.wait_for_timeout(400)
-            await self._tg(f"💸 CASHOUT\n{description}\nStake was ₦{self.last_stake_used:,.0f}")
-            return True
-        except Exception as e:
-            await self._tg(f"❌ Cashout error: {e}")
-            return False
+    def get_watch(self, mid: str) -> Optional[MatchWatch]:
+        return self._watches.get(mid)
 
     def start_watching(
         self,
-        match_id: str,
+        mid: str,
         page: Page,
-        home_team: str,
-        away_team: str,
+        home: str,
+        away: str,
         home_score: int = 0,
         away_score: int = 0,
         match: Optional[dict] = None,
     ):
-        match_id = str(match_id)
-        if match_id in self.watches:
-            return
-        h, a = home_score, away_score
+        if mid in self._watches:
+            self.stop_watching(mid)
+        w = MatchWatch(page, home, away, home_score, away_score)
         if match:
+            w.home_score = int(match.get("home_score") or home_score)
+            w.away_score = int(match.get("away_score") or away_score)
+        self._watches[mid] = w
+        w.running = True
+        w.task = asyncio.create_task(self._watch_loop(mid, w))
+
+    def stop_watching(self, mid: str):
+        w = self._watches.pop(mid, None)
+        if not w:
+            return
+        w.running = False
+        if w.task and not w.task.done():
+            w.task.cancel()
+
+    async def wait_match_details_ready(
+        self, page: Page, home: str, away: str, timeout: float = 15.0
+    ) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
             try:
-                h = int(match.get("home_score", h) or h)
-                a = int(match.get("away_score", a) or a)
+                body = (await page.inner_text("body")).lower()
+                if "over/under" in body or "1x2" in body or "place bet" in body:
+                    return True
             except Exception:
                 pass
-        watch = MatchWatch(page, home_team, away_team, home_score=h, away_score=a)
-        watch.running = True
-        watch.task = asyncio.create_task(self._watch_loop(match_id, watch))
-        self.watches[match_id] = watch
-        logger.info(f"[WATCH] {home_team} vs {away_team} {h}-{a}")
+            await asyncio.sleep(0.4)
+        return False
 
-    def stop_watching(self, match_id: str):
-        match_id = str(match_id)
-        watch = self.watches.pop(match_id, None)
-        if not watch:
-            return
-        watch.running = False
-        if watch.task:
-            watch.task.cancel()
-
-    def get_watch(self, match_id: str) -> Optional[MatchWatch]:
-        return self.watches.get(str(match_id))
-
-    def advance_tracked_score(self, match_id: str, home: int, away: int) -> None:
-        watch = self.watches.get(str(match_id))
-        if not watch:
-            return
-        watch.home_score = int(home)
-        watch.away_score = int(away)
-        watch.confirm_armed = False
-        watch.active_market = ""
-
-    async def _watch_loop(self, match_id: str, watch: MatchWatch):
-        try:
-            await self.ai_arm_from_plan(watch.page, None, watch)
-            while watch.running:
-                try:
-                    if not await self._page_alive(watch.page):
-                        watch.running = False
-                        await self._tg(f"⚠️ Watch page dead: {watch.home_team}")
-                        break
-                    await self.fetch_balance(watch.page)
-                    if not await self._confirm_visible(watch.page) or not watch.confirm_armed:
-                        await self.ai_arm_from_plan(watch.page, None, watch)
-                except Exception as e:
-                    logger.debug(f"[WATCH] {e}")
-                await asyncio.sleep(self._rearm_interval)
-        except asyncio.CancelledError:
-            pass
-
-    async def execute(
-        self,
-        page: Page,
-        match: dict,
-        team: str = "",
-        goal_num: int = 1,
-        expected_home_score: Optional[int] = None,
-        expected_away_score: Optional[int] = None,
-        detected_at: Optional[float] = None,
-    ) -> BetResult:
-        if self.stopped or not await self._page_alive(page):
-            return BetResult.FAILED
-        match_id = str(match.get("match_id") or "")
-        home_team = match.get("home_team", "")
-        away_team = match.get("away_team", "")
-        match_name = f"{home_team} vs {away_team}"
-        watch = self.get_watch(match_id)
-        if watch is None:
-            self.start_watching(match_id, page, home_team, away_team, match=match)
-            watch = self.get_watch(match_id)
-
-        if await self._confirm_visible(page):
-            ok = await self.click_confirm_only(page)
-        else:
-            await self.ai_arm_from_plan(page, None, watch)
-            ok = await self.click_confirm_only(page)
-
-        if not ok:
-            return await self.handle_slow(match)
-
-        if expected_home_score is not None and expected_away_score is not None:
-            self.advance_tracked_score(match_id, expected_home_score, expected_away_score)
-
-        stake = self.calc_stake(self.last_odds_used or 1.5)
-        bet_id = f"{match_id}_G{goal_num}_{uuid.uuid4().hex[:8]}"
-        try:
-            await self.alerter.notify_bet_placed(
-                match_name,
-                f"Over {watch.over_line if watch else '?'}",
-                stake,
-                self.last_odds_used,
-                bet_id,
-                1,
-                1,
-            )
-        except Exception:
-            pass
-        await self._rebet_loop(page, match_name, "Over", goal_num)
-        return BetResult.SUCCESS
-
-    async def _try_rebet_once(self, page: Page) -> bool:
-        rebet = page.get_by_role("button", name=re.compile(r"^\s*Rebet\s*$", re.I))
-        if await rebet.count() == 0:
-            rebet = page.get_by_text(re.compile(r"^\s*Rebet\s*$", re.I))
-        if await rebet.count() == 0:
-            return False
-        await rebet.first.click(timeout=1200)
-        await page.wait_for_timeout(250)
-        await self.fetch_balance(page)
-        stake = self.calc_stake(self.last_odds_used or 0.0)
-        if stake < 10:
-            return False
-        if not await self._set_stake_input(page, stake):
-            return False
-        await self._click_accept_changes(page)
-        if not await self._click_place_bet(page):
-            return False
-        if not await self._click_confirm_dialog(page):
-            return False
-        return await self._wait_bet_success(
-            page, timeout_ms=getattr(Config, "CONFIRMATION_TIMEOUT_MS", 8000)
-        )
-
-    async def _rebet_loop(self, page: Page, match_name: str, team: str, goal_num: int) -> int:
-        extra = 0
-        for i in range(1, self.max_rebet):
-            await asyncio.sleep(self.rebet_delay)
-            if not await self._try_rebet_once(page):
-                break
-            extra += 1
-        return extra
-
-    async def handle_slow(self, match) -> BetResult:
-        self.consecutive_slow += 1
-        if self.consecutive_slow >= getattr(Config, "MAX_CONSECUTIVE_SLOW", 2):
-            old_user = self.current_account["username"] if self.current_account else "unknown"
+    async def open_all_tab(self, page: Page):
+        for sel in (
+            'text="All"',
+            '[role="tab"]:has-text("All")',
+            'button:has-text("All")',
+        ):
             try:
-                await self.alerter.notify_account_flagged(old_user)
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.click(timeout=1500)
+                    await asyncio.sleep(0.5)
+                    return
             except Exception:
-                await self._tg(f"⚠️ Account slow/flagged: {old_user}")
-            old, new = self.account_manager.mark_limited()
-            if new:
+                pass
+
+    async def _scroll_markets(self, page: Page, steps: int = 10):
+        for _ in range(steps):
+            try:
+                await page.mouse.wheel(0, 700)
+            except Exception:
                 try:
-                    await self.alerter.notify_account_switched(old, new["username"])
+                    await page.evaluate("window.scrollBy(0, 700)")
                 except Exception:
                     pass
-                self.current_account = new
-                self.consecutive_slow = 0
-                return BetResult.SWITCHED
-            self.stopped = True
-            return BetResult.FAILED
-        return BetResult.FAILED
+            await asyncio.sleep(0.22)
+
+    async def _detect_period(self, page: Page) -> str:
+        try:
+            t = (await page.inner_text("body")).lower()
+            if "2nd half" in t or "second half" in t:
+                return "2H"
+            if re.search(r"\b(4[6-9]|[5-9]\d)\s*[':]|half.?time|\bht\b", t):
+                if "1st half" in t or "first half" in t:
+                    return "1H"
+            return "1H"
+        except Exception:
+            return "1H"
+
+    async def _find_and_click_over(
+        self,
+        page: Page,
+        line: float,
+        require_period_keywords: list,
+        forbid_period_keywords: list,
+        label: str,
+    ) -> bool:
+        line_s = f"{line:g}"
+        await self.open_all_tab(page)
+        await self._scroll_markets(page, 12)
+
+        blocks = page.locator("div, section, article, li, tr")
+        n = min(await blocks.count(), 500)
+
+        for i in range(n):
+            try:
+                el = blocks.nth(i)
+                txt = (await el.inner_text(timeout=150)).strip().lower()
+                if not txt or len(txt) > 280:
+                    continue
+                if f"over {line_s}" not in txt and f"over{line_s}" not in txt:
+                    continue
+
+                if require_period_keywords:
+                    if not any(k in txt for k in require_period_keywords):
+                        try:
+                            parent_txt = (
+                                await el.evaluate(
+                                    """(e) => {
+                                        let p = e;
+                                        for (let k = 0; k < 4 && p; k++) p = p.parentElement;
+                                        return (p && p.innerText) ? p.innerText.slice(0, 500).toLowerCase() : '';
+                                    }"""
+                                )
+                            ) or ""
+                        except Exception:
+                            parent_txt = ""
+                        if not any(k in parent_txt for k in require_period_keywords):
+                            continue
+                        txt = parent_txt
+
+                if forbid_period_keywords and any(k in txt for k in forbid_period_keywords):
+                    continue
+
+                over = el.locator(
+                    f'text=/Over\\s*{re.escape(line_s)}/i, '
+                    f'button:has-text("Over {line_s}")'
+                )
+                if await over.count() > 0:
+                    await over.first.click(timeout=1500)
+                else:
+                    await el.click(timeout=1500)
+                await asyncio.sleep(0.55)
+                logger.success(f"[ARM] {label} Over {line_s}")
+                return True
+            except Exception:
+                continue
+
+        try:
+            if require_period_keywords:
+                loc = page.get_by_text(
+                    re.compile(
+                        rf"(?:{'|'.join(re.escape(k) for k in require_period_keywords)}).{{0,80}}Over\s*{re.escape(line_s)}|"
+                        rf"Over\s*{re.escape(line_s)}.{{0,80}}(?:{'|'.join(re.escape(k) for k in require_period_keywords)})",
+                        re.I,
+                    )
+                )
+            else:
+                loc = page.get_by_text(re.compile(rf"Over\s*{re.escape(line_s)}", re.I))
+            if await loc.count() > 0:
+                await loc.first.click(timeout=2000)
+                await asyncio.sleep(0.55)
+                logger.success(f"[ARM] fallback {label} Over {line_s}")
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _click_correct_over(self, page: Page, watch: MatchWatch) -> bool:
+        """
+        1H → 1st Half Over → else Full Time Over
+        2H → 2nd Half Over → else Full Time Over
+        """
+        line = watch.over_line
+        period = watch.period
+
+        if period == "1H":
+            ok = await self._find_and_click_over(
+                page,
+                line,
+                require_period_keywords=["1st half", "first half", "1h -", "1h–"],
+                forbid_period_keywords=["2nd half", "second half"],
+                label="1st Half",
+            )
+            if ok:
+                watch.active_market = f"1st Half Over {line:g}"
+                watch.target_line = line
+                return True
+            ok = await self._find_and_click_over(
+                page,
+                line,
+                require_period_keywords=["over/under", "over under"],
+                forbid_period_keywords=["1st half", "first half", "2nd half", "second half"],
+                label="Full Time",
+            )
+            if ok:
+                watch.active_market = f"Full Time Over {line:g}"
+                watch.target_line = line
+                return True
+            return False
+
+        ok = await self._find_and_click_over(
+            page,
+            line,
+            require_period_keywords=["2nd half", "second half"],
+            forbid_period_keywords=["1st half", "first half"],
+            label="2nd Half",
+        )
+        if ok:
+            watch.active_market = f"2nd Half Over {line:g}"
+            watch.target_line = line
+            return True
+        ok = await self._find_and_click_over(
+            page,
+            line,
+            require_period_keywords=["over/under", "over under"],
+            forbid_period_keywords=["1st half", "first half", "2nd half", "second half"],
+            label="Full Time",
+        )
+        if ok:
+            watch.active_market = f"Full Time Over {line:g}"
+            watch.target_line = line
+            return True
+        return False
+
+    async def _read_slip_odds(self, page: Page) -> float:
+        try:
+            txt = await page.locator("body").inner_text()
+            m = re.search(r"Over\s*[\d.]+\s*.*?(\d+\.\d{2})", txt, re.I | re.S)
+            if m:
+                return float(m.group(1))
+            for x in re.findall(r"\b(\d+\.\d{2})\b", txt):
+                v = float(x)
+                if 1.01 < v < 50:
+                    return v
+        except Exception:
+            pass
+        return 0.0
+
+    async def _set_stake(self, page: Page, stake: float) -> bool:
+        try:
+            for sel in (
+                'input[type="tel"]',
+                'input[type="number"]',
+                'input[placeholder*="Stake" i]',
+                'input[class*="stake" i]',
+            ):
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.fill("")
+                    await loc.first.fill(str(int(stake) if stake >= 10 else stake))
+                    await asyncio.sleep(0.3)
+                    return True
+        except Exception as e:
+            logger.warning(f"stake: {e}")
+        return False
+
+    async def _click_place_bet(self, page: Page) -> bool:
+        for sel in (
+            'button:has-text("Place Bet")',
+            'button:has-text("PLACE BET")',
+            'text="Place Bet"',
+        ):
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.click(timeout=2000)
+                    await asyncio.sleep(0.75)
+                    return True
+            except Exception:
+                pass
+        return False
+
+    async def _click_accept_changes(self, page: Page) -> bool:
+        for sel in (
+            'button:has-text("Accept Changes")',
+            'button:has-text("Accept")',
+            'text="Accept Changes"',
+        ):
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.click(timeout=1500)
+                    await asyncio.sleep(0.45)
+                    return True
+            except Exception:
+                pass
+        return False
+
+    async def _confirm_visible(self, page: Page) -> bool:
+        try:
+            loc = page.locator('button:has-text("Confirm")')
+            return await loc.count() > 0 and await loc.first.is_visible()
+        except Exception:
+            return False
+
+    async def _is_suspended(self, page: Page) -> bool:
+        try:
+            t = (await page.inner_text("body")).lower()
+            return any(
+                x in t
+                for x in (
+                    "suspended",
+                    "market suspended",
+                    "not available",
+                    "bet closed",
+                    "market closed",
+                )
+            )
+        except Exception:
+            return False
+
+    async def ai_arm_from_plan(
+        self, page: Page, plan: Optional[dict], watch: MatchWatch
+    ) -> bool:
+        if watch.flagged_suspended:
+            await self._tg("⛔ Match flagged suspended — not arming")
+            return False
+
+        watch.period = await self._detect_period(page)
+        watch.target_line = watch.over_line
+
+        ok = await self._click_correct_over(page, watch)
+        if not ok:
+            await self._tg(
+                f"❌ No market for {watch.period} Over {watch.target_line:g}\n"
+                f"Score {watch.home_score}-{watch.away_score}\n"
+                f"Tried period then Full Time — NOT betting"
+            )
+            return False
+
+        await asyncio.sleep(0.45)
+        odds = await self._read_slip_odds(page)
+        if odds < 1.05:
+            odds = 1.5
+        self.last_odds_used = odds
+        stake = self.calc_stake(odds)
+        watch.odds_over = odds
+        watch.stake_over = stake
+
+        if not await self._set_stake(page, stake):
+            await self._tg("❌ Stake failed — NOT betting")
+            return False
+        if not await self._click_place_bet(page):
+            await self._tg("❌ Place Bet failed — NOT betting")
+            return False
+
+        for _ in range(8):
+            if await self._confirm_visible(page):
+                watch.confirm_armed = True
+                await self._tg(
+                    f"✅ ARMED\n"
+                    f"📌 {watch.active_market}\n"
+                    f"📊 {watch.home_score}-{watch.away_score}\n"
+                    f"💵 ₦{stake:,.0f} @ {odds}\n"
+                    f"On Confirm — waiting goal"
+                )
+                return True
+            if await self._click_accept_changes(page):
+                await self._set_stake(page, stake)
+                await self._click_place_bet(page)
+            await asyncio.sleep(0.35)
+
+        await self._tg("❌ Confirm not reached — NOT armed")
+        watch.confirm_armed = False
+        return False
+
+    async def click_confirm_only(self, page: Page) -> bool:
+        if await self._is_suspended(page):
+            return False
+        await self._click_accept_changes(page)
+        await asyncio.sleep(0.12)
+        for sel in ('button:has-text("Confirm")', 'button:has-text("CONFIRM")'):
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    await loc.first.click(timeout=1500)
+                    await asyncio.sleep(0.8)
+                    body = (await page.inner_text("body")).lower()
+                    if any(
+                        x in body
+                        for x in (
+                            "bet accepted",
+                            "successful",
+                            "placed",
+                            "bet id",
+                            "congratulations",
+                        )
+                    ):
+                        await self._tg("✅ BET CREDITED")
+                        return True
+                    if not await self._confirm_visible(page):
+                        await self._tg("✅ BET SUBMITTED")
+                        return True
+                    return True
+            except Exception:
+                pass
+        return False
+
+    async def cashout_disallowed(self, page: Page, description: str = "") -> bool:
+        try:
+            for sel in (
+                'text="Cashout"',
+                'button:has-text("Cashout")',
+                '[class*="cashout" i]',
+            ):
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.click(timeout=2000)
+                    await asyncio.sleep(0.55)
+                    break
+            for sel in (
+                'button:has-text("Cash Out")',
+                'button:has-text("Cashout")',
+                'button:has-text("Confirm")',
+            ):
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.click(timeout=2000)
+                    await asyncio.sleep(0.45)
+            await self._tg(f"💸 Cashout attempted\n{description}")
+            return True
+        except Exception as e:
+            await self._tg(f"❌ Cashout failed: {e}")
+            return False
+
+    async def _try_rebet_once(self, page: Page) -> bool:
+        try:
+            for sel in ('button:has-text("Rebet")', 'text="Rebet"'):
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.click(timeout=1500)
+                    await asyncio.sleep(0.55)
+                    if await self._click_place_bet(page):
+                        if await self._confirm_visible(page) or await self.click_confirm_only(page):
+                            return True
+        except Exception:
+            pass
+        return False
+
+    async def _watch_loop(self, mid: str, watch: MatchWatch):
+        while watch.running and not watch.flagged_suspended:
+            try:
+                page = watch.page
+                if page.is_closed():
+                    break
+                if await self._is_suspended(page):
+                    watch.flagged_suspended = True
+                    watch.confirm_armed = False
+                    await self._tg(
+                        f"⛔ MARKET SUSPENDED\n"
+                        f"{watch.home_team} vs {watch.away_team}\n"
+                        f"Stopped — will NOT switch market"
+                    )
+                    watch.running = False
+                    break
+
+                if await page.locator('button:has-text("Accept Changes")').count() > 0:
+                    await self._click_accept_changes(page)
+                    odds = await self._read_slip_odds(page) or watch.odds_over
+                    if odds >= 1.05:
+                        stake = self.calc_stake(odds)
+                        await self._set_stake(page, stake)
+                        watch.odds_over = odds
+                        watch.stake_over = stake
+                        self.last_odds_used = odds
+                    await self._click_place_bet(page)
+                    await asyncio.sleep(0.35)
+
+                if not await self._confirm_visible(page) and watch.confirm_armed:
+                    await self._click_place_bet(page)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+            await asyncio.sleep(0.7)
