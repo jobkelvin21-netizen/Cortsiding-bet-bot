@@ -12,6 +12,8 @@ from config import Config
 
 CDP_URL = "http://127.0.0.1:9222"
 WS_IDLE_SECS = 90
+# After reload, wait this long for real WS frames before declaring success/fail
+WS_RESUME_WAIT_SECS = 25
 
 RE_FI = re.compile(r"(?:^|[|;,\s])FI=(\d{6,})", re.I)
 RE_ID = re.compile(r"(?:^|[|;,\s])ID=(\d{6,})", re.I)
@@ -246,7 +248,6 @@ class Bet365Feed:
         if not self._browser or not self._browser.contexts:
             return None
         ctx = self._browser.contexts[0]
-        # Prefer tab already on bet365
         for p in ctx.pages:
             try:
                 u = (p.url or "").lower()
@@ -254,30 +255,45 @@ class Bet365Feed:
                     return p
             except Exception:
                 continue
-        # Reuse our held page if still open
         if self._page and not self._page.is_closed():
             return self._page
-        # First open only: use first page if any, else one new page once
         if ctx.pages:
             return ctx.pages[0]
         return await ctx.new_page()
 
+    async def _wait_for_ws_resume(self, timeout: float = WS_RESUME_WAIT_SECS) -> bool:
+        """True only if real frames arrive after reload (updates _last_message_at)."""
+        deadline = time.time() + timeout
+        marker = self._last_message_at or 0.0
+        while time.time() < deadline:
+            if self._got_403:
+                return False
+            if self._last_message_at and self._last_message_at > marker:
+                return True
+            await asyncio.sleep(0.4)
+        return bool(self._last_message_at and self._last_message_at > marker)
+
     async def _reload_same_page(self) -> bool:
-        """Immediately refresh the same page when WS goes quiet."""
+        """Refresh SAME tab when WS is quiet. Success only if frames resume."""
         page = self._page
         if not page or page.is_closed():
             page = await self._pick_existing_page()
             self._page = page
         if not page or page.is_closed():
+            logger.error("[BET365] reload aborted — no page")
+            await self._tg("⚠️ Bet365 reload failed — no tab")
             return False
 
         url = getattr(Config, "BET365_LIVE_URL", "https://www.bet365.com/#/IP/B1")
         self._got_403 = False
+        # Do NOT fake activity before frames return
+        before = self._last_message_at
         self._bind_page_handlers(page)
 
+        logger.warning("[BET365] WS idle → reloading SAME tab now")
+        await self._tg("🔄 Bet365 WS idle → reloading same tab…")
+
         try:
-            # Fast path: reload current tab (what the video shows)
-            logger.info("[BET365] WS idle → reload same tab")
             await page.reload(wait_until="domcontentloaded", timeout=45000)
         except Exception as e:
             logger.warning(f"[BET365] reload failed, goto same tab: {e}")
@@ -285,13 +301,14 @@ class Bet365Feed:
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             except Exception as e2:
                 logger.error(f"[BET365] goto failed: {e2}")
+                await self._tg("❌ Bet365 reload/goto failed")
                 return False
 
         if self._got_403:
-            await self._tg("⚠️ Bet365 403")
+            await self._tg("⚠️ Bet365 403 after reload — change VPN")
             return False
 
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1.2)
         for sel in ("text=Football", "text=Soccer"):
             try:
                 loc = page.locator(sel)
@@ -302,14 +319,25 @@ class Bet365Feed:
             except Exception:
                 pass
 
-        self._last_message_at = time.time()  # reset idle clock after refresh
-        logger.success("[BET365] same tab refreshed — listening again")
-        return True
+        resumed = await self._wait_for_ws_resume(WS_RESUME_WAIT_SECS)
+        if resumed:
+            logger.success("[BET365] WS frames resumed after same-tab reload")
+            await self._tg("✅ Bet365 WS resumed after reload")
+            return True
+
+        # Still quiet — honest failure (do not set fake last_message_at)
+        if before:
+            self._last_message_at = before
+        logger.error("[BET365] reload done but NO WS frames")
+        await self._tg(
+            "❌ Bet365 reloaded same tab but still no live data\n"
+            "Check VPN / open live football on that tab"
+        )
+        return False
 
     async def _connect_cdp_once(self) -> bool:
         if self._browser:
             try:
-                # still alive?
                 _ = self._browser.contexts
                 return True
             except Exception:
@@ -383,13 +411,11 @@ class Bet365Feed:
                 await self._tg("⚠️ Bet365 403")
                 break
 
-            # WS quiet → immediate reload of SAME tab (no new tab)
             if self._last_message_at and (
                 time.time() - self._last_message_at > WS_IDLE_SECS
             ):
                 ok = await self._reload_same_page()
                 if not ok:
-                    # CDP may have died — reattach, still same-tab policy
                     await self._detach_cdp()
                     if not await self._connect_cdp_once():
                         await asyncio.sleep(2)
