@@ -593,6 +593,19 @@ class BetExecutor:
 
         text = await self._capture_full_market_text(page)
 
+        # DEBUG: Log what was captured
+        logger.info(f"[GROQ DEBUG] Text length: {len(text)}")
+        logger.info(f"[GROQ DEBUG] Contains 'Over/Under': {'over/under' in text.lower()}")
+        logger.info(f"[GROQ DEBUG] First 800 chars:\n{text[:800]}")
+        
+        # Save to file for inspection
+        try:
+            with open(f"debug_{watch.match_id}.txt", "w", encoding="utf-8") as f:
+                f.write(text)
+            logger.info(f"[GROQ DEBUG] Saved full text to debug_{watch.match_id}.txt")
+        except Exception as e:
+            logger.error(f"[GROQ DEBUG] Failed to save file: {e}")
+
         balance = 0.0
         try:
             quick = await self._page_text(page, 2000)
