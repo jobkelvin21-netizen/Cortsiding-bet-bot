@@ -1,8 +1,24 @@
 """
-BetExecutor — score from SportyBet page only.
-Click market → betslip must show selection → stake → Place Bet → Confirm.
-Odds change → Accept Changes → Place Bet → Confirm.
-/clear closes tab + wipes watch. HT→2H detected and re-armed.
+BetExecutor — Groq decides the market + reads the score. Playwright only
+scrolls, finds the exact button Groq chose, clicks it, sets stake, and
+arms up to Confirm. Confirm itself is ONLY ever clicked in
+confirm_goal_click(), in response to a Bet365 goal event.
+
+STRICT MARKET RULE (enforced independently of Groq, as a safety net):
+Only these three market shapes may ever be clicked:
+  - "1st Half - Over/Under"  (1H)
+  - "2nd Half - Over/Under"  (2H)
+  - plain "Over/Under" with no half label (Full Time)
+A candidate is rejected outright if no nearby heading literally contains
+"over/under" — this blocks things like "Rest of Match Total Goals",
+Handicap, 3rd Goal, Double Chance, etc. even if a button on the page
+happens to say "Over {line}". If no valid market is found, the bot does
+not bet at all.
+
+Arming happens ONCE per state change (initial /slow lock, HT→2H
+transition, market-unavailable recovery, VAR/disallowed-goal recovery,
+and once after each confirmed bet to set up the next line) — not on a
+continuous loop.
 """
 
 import asyncio
@@ -46,11 +62,11 @@ class MatchWatch:
         self.target_line: float = 0.5
         self.confirm_armed: bool = False
         self.period: str = "1H"
-        self.force_full_time: bool = False
         self.task: Optional[asyncio.Task] = None
         self.running = False
-        self.last_period: str = "1H"
+        self.last_period_hint: str = "1H"
         self.ht_seen: bool = False
+        self.ht_alerted: bool = False
 
     @property
     def total_goals(self) -> int:
@@ -59,6 +75,38 @@ class MatchWatch:
     @property
     def over_line(self) -> float:
         return float(self.total_goals) + 0.5
+
+
+# Final allow-list check: active_market must be EXACTLY one of these
+# shapes before any stake is ever placed. "1H Over 1.5", "2H Over 2.5",
+# "FT Over 0.5" — nothing else passes, no matter what Groq or the DOM
+# search produced.
+_ALLOWED_MARKET_RE = re.compile(r"^(1H|2H|FT) Over \d+(\.\d+)?$")
+
+
+def _is_allowed_market_label(label: str) -> bool:
+    return bool(_ALLOWED_MARKET_RE.match((label or "").strip()))
+
+
+def _require_forbid_for_period_market(pm: str):
+    """Turns Groq's chosen period_market into the require/forbid keyword
+    lists used by the strict DOM click-scoping in _find_and_click_over."""
+    pm = (pm or "FT").upper()
+    if pm == "1H":
+        return (
+            ["1st half", "first half", "1h"],
+            ["2nd half", "second half", "full time", "fulltime"],
+        )
+    if pm == "2H":
+        return (
+            ["2nd half", "second half", "2h"],
+            ["1st half", "first half"],
+        )
+    # FT / anything else
+    return (
+        [],
+        ["1st half", "first half", "2nd half", "second half", "half time"],
+    )
 
 
 class BetExecutor:
@@ -86,25 +134,54 @@ class BetExecutor:
         except Exception:
             return ""
 
-    async def _read_score_from_page(self, page: Page) -> tuple:
-        """Read live score from SportyBet DOM only. Never trust old watch/Bet365.
+    async def _capture_full_market_text(self, page: Page, steps: int = 10) -> str:
+        """SportyBet's markets panel is virtualized — only what's scrolled
+        into view exists in the DOM at any instant. Scroll step by step
+        and accumulate every unique line seen along the way, so Groq gets
+        the FULL market list (1H/2H/FT Over-Under lines included), not
+        just whatever happened to be on screen at one instant.
+        Scrolls back to the top afterward so the later click-search phase
+        starts from the top of the page again."""
+        await self._click_all_tab(page)
 
-        Priority order matters. The match tracker shows the score as
-        "H : A" (e.g. "2 : 1") right next to the team names, near the top
-        of the page. Further down, the match timeline prints minute
-        markers ("0 15 30 45 60 75 90") and other dash-separated numbers
-        (odds, stats) that a loose "X-Y" pattern can mistake for the score
-        if it's searched first — which is what was causing 0-0 or wrong
-        scores to be read even when the real score was different.
+        seen_lines: List[str] = []
+        seen_set = set()
 
-        So: try a tight "digit : digit" match first (score format), and
-        only fall back to a dash-based match if no colon-score is found.
-        Also prefer whichever candidate appears earliest but only among a
-        SINGLE pattern's results, not mixed across pattern types.
-        """
-        text = await self._page_text(page, 3000)  # score is always near the top
+        async def snapshot():
+            try:
+                t = await page.inner_text("body", timeout=2500)
+            except Exception:
+                t = ""
+            for line in (t or "").split("\n"):
+                line = line.strip()
+                if line and line not in seen_set:
+                    seen_set.add(line)
+                    seen_lines.append(line)
 
-        # 1) Preferred: "H : A" — this is the live score in the match tracker.
+        await snapshot()
+        for i in range(steps):
+            try:
+                await page.mouse.wheel(0, 500 + i * 30)
+                await asyncio.sleep(0.25)
+            except Exception:
+                break
+            await snapshot()
+
+        try:
+            await page.evaluate("window.scrollTo(0, 0)")
+        except Exception:
+            pass
+
+        return "\n".join(seen_lines)[:9000]
+
+    async def _quick_score_check(self, page: Page) -> tuple:
+        """Cheap, local-only score read — used ONLY as a trigger for
+        VAR/disallowed-goal detection in the watch loop (comparing against
+        watch.total_goals, which Groq owns/updates). This does NOT decide
+        which market to bet on; that's exclusively Groq's job via
+        ai_arm_from_plan."""
+        text = await self._page_text(page, 3000)
+
         colon_pattern = re.compile(r"\b(\d{1,2})\s*:\s*(\d{1,2})\b")
         for m in colon_pattern.finditer(text):
             try:
@@ -114,7 +191,6 @@ class BetExecutor:
             except Exception:
                 continue
 
-        # 2) Fallback: "H - A" or "H – A", only if no colon-score was found.
         dash_pattern = re.compile(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\b")
         for m in dash_pattern.finditer(text):
             try:
@@ -127,6 +203,10 @@ class BetExecutor:
         return None, None
 
     async def _detect_period(self, page: Page) -> str:
+        """Cheap regex heuristic used ONLY to decide WHEN to trigger a
+        re-arm (HT alert, HT→2H transition) in the watch loop. Groq does
+        its own, more careful period read (via _normalize_period inside
+        groq_ai.py) every time ai_arm_from_plan actually runs."""
         text = (await self._page_text(page)).lower()
         if re.search(r"\b(full\s*time|ft\b|match\s*ended|finished)\b", text):
             return "FT"
@@ -189,6 +269,13 @@ class BetExecutor:
             pass
         return False
 
+    async def _confirm_visible(self, page: Page) -> bool:
+        try:
+            loc = page.locator("button:has-text('Confirm')")
+            return await loc.count() > 0 and await loc.first.is_visible()
+        except Exception:
+            return False
+
     async def _click_all_tab(self, page: Page):
         for sel in (
             "text=All",
@@ -221,17 +308,19 @@ class BetExecutor:
         forbid_kw: List[str],
         label: str,
     ) -> bool:
-        """Click Over {line} under the right period heading. Verify betslip after.
+        """Click Over {line} — but ONLY if the button sits under a heading
+        that literally contains "over/under". This is a strict allow-list:
 
-        Keyword matching is scoped to ONLY the line(s) of surrounding text
-        that literally contain "Over/Under" — the market's own heading
-        (e.g. "1st Half - Over/Under", "2nd Half - Over/Under", or plain
-        "Over/Under" for Full Time). This avoids false matches from OTHER
-        nearby markets that also contain "1st half"/"2nd half" in their
-        name (e.g. "1st Half - Handicap", "1st Half - 3rd Goal",
-        "1st Half - Double Chance"), which would otherwise pollute the
-        6-level ancestor text grab and cause require_kw/forbid_kw to match
-        against the wrong market entirely.
+          - Walk up to 6 ancestor levels from the candidate button.
+          - Find the line(s) of that ancestor's text that contain
+            "over/under".
+          - If NO such line exists nearby, REJECT the candidate outright
+            (no fallback to raw surrounding text — that was the bug that
+            let markets like "Rest of Match Total Goals" get clicked just
+            because a button on the page happened to say "Over 0.5").
+          - Only once a genuine "over/under" heading is found do
+            require_kw / forbid_kw (from Groq's chosen period_market) get
+            checked against THAT heading text.
         """
         await self._click_all_tab(page)
         await self._scroll_markets(page, 6)
@@ -269,18 +358,23 @@ class BetExecutor:
                                 handle,
                             )
                             ctx = ctx or ""
+
                             heading_lines = [
                                 ln for ln in ctx.split("\n")
                                 if "over/under" in ln.lower()
                             ]
-                            ctx_l = (
-                                "\n".join(heading_lines) if heading_lines else ctx
-                            ).lower()
+                            if not heading_lines:
+                                continue
 
+                            ctx_l = "\n".join(heading_lines).lower()
+
+                            if "rest of" in ctx_l:
+                                continue
                             if any(f in ctx_l for f in forbid_kw):
                                 continue
                             if require_kw and not any(r in ctx_l for r in require_kw):
                                 continue
+
                             await el.scroll_into_view_if_needed(timeout=1500)
                             await el.click(timeout=2000)
                             await asyncio.sleep(0.6)
@@ -299,80 +393,6 @@ class BetExecutor:
             await self._scroll_markets(page, 3)
 
         logger.warning(f"[ARM] could not put {label} Over {line} on betslip")
-        return False
-
-    # RULE:
-    #   1H  -> try 1st Half Over first. If not on the page, fall back to Full Time Over.
-    #   2H  -> try 2nd Half Over first. If not on the page, fall back to Full Time Over.
-    #   FT/HT or force_full_time -> Full Time Over only.
-    # Full Time matching uses require_kw=[] because SportyBet's default
-    # Over/Under section (the Full Time market) has NO "Full Time" label —
-    # it's just plain "Over/Under". forbid_kw still excludes any section
-    # explicitly headed "1st Half - Over/Under" / "2nd Half - Over/Under".
-    async def _click_correct_over(self, page: Page, watch: MatchWatch) -> bool:
-        line = watch.over_line
-        period = watch.period
-
-        if watch.force_full_time or period in ("FT", "HT"):
-            ok = await self._find_and_click_over(
-                page,
-                line,
-                require_kw=[],
-                forbid_kw=["1st half", "first half", "2nd half", "second half", "half time"],
-                label="FT",
-            )
-            if ok:
-                watch.active_market = f"FT Over {line}"
-                return True
-            return False
-
-        if period == "1H":
-            ok = await self._find_and_click_over(
-                page,
-                line,
-                require_kw=["1st half", "first half", "1h"],
-                forbid_kw=["2nd half", "second half", "full time", "fulltime"],
-                label="1H",
-            )
-            if ok:
-                watch.active_market = f"1H Over {line}"
-                return True
-            # fallback Full Time only (never another 1H line)
-            ok = await self._find_and_click_over(
-                page,
-                line,
-                require_kw=[],
-                forbid_kw=["1st half", "first half", "2nd half", "second half"],
-                label="FT-fallback",
-            )
-            if ok:
-                watch.active_market = f"FT Over {line}"
-                watch.force_full_time = True
-                return True
-            return False
-
-        # 2H
-        ok = await self._find_and_click_over(
-            page,
-            line,
-            require_kw=["2nd half", "second half", "2h"],
-            forbid_kw=["1st half", "first half"],
-            label="2H",
-        )
-        if ok:
-            watch.active_market = f"2H Over {line}"
-            return True
-        ok = await self._find_and_click_over(
-            page,
-            line,
-            require_kw=[],
-            forbid_kw=["1st half", "first half", "2nd half", "second half"],
-            label="FT-fallback-2H",
-        )
-        if ok:
-            watch.active_market = f"FT Over {line}"
-            watch.force_full_time = True
-            return True
         return False
 
     async def _set_stake(self, page: Page, stake: float) -> bool:
@@ -496,6 +516,25 @@ class BetExecutor:
             except Exception:
                 continue
 
+    async def _maybe_accept_changes(self, page: Page, watch: MatchWatch):
+        """Lightweight maintenance only — if odds moved while we're sitting
+        armed, accept the change and refresh the stake amount. This does
+        NOT click Place Bet or Confirm and does NOT re-select the market;
+        it just keeps the existing (Groq-chosen) selection valid."""
+        try:
+            if await page.locator("button:has-text('Accept Changes')").count() > 0:
+                await self._click_accept_changes(page)
+                odds = await self._read_odds_from_slip(page)
+                if odds > 1.01:
+                    max_profit = float(Config.MAX_PROFIT_PER_BET)
+                    stake = max_profit / (odds - 1.0)
+                    watch.odds_over = odds
+                    watch.stake_over = round(max(10.0, stake), 2)
+                    await self._set_stake(page, watch.stake_over)
+                watch.confirm_armed = await self._confirm_visible(page)
+        except Exception:
+            pass
+
     async def cashout_disallowed(self, page: Page, description: str = "") -> bool:
         """Cashout tab first, then Cash Out → Confirm (disallowed goal only)."""
         try:
@@ -532,7 +571,7 @@ class BetExecutor:
             logger.error(f"[CASHOUT] {e}")
         return False
 
-    # ─── arm / watch ────────────────────────────────────────────
+    # ─── arm (Groq decides, Playwright executes) ───────────────
 
     async def ai_arm_from_plan(
         self,
@@ -540,41 +579,35 @@ class BetExecutor:
         plan: Optional[dict],
         watch: MatchWatch,
     ) -> bool:
-        """Fresh score from page → click market → betslip check → stake → Place → Confirm."""
+        """Groq reads the full (scrolled) market text + the live score,
+        decides the period/market/line. Playwright then finds and clicks
+        EXACTLY that market (strict heading check still applies as a
+        safety net), sets stake, clicks Accept Changes / Place Bet, and
+        stops once Confirm is visible. Confirm is NEVER clicked here."""
         if page.is_closed():
             return False
-
-        h, a = await self._read_score_from_page(page)
-        if h is not None and a is not None:
-            watch.home_score = h
-            watch.away_score = a
-        watch.period = await self._detect_period(page)
-        watch.target_line = watch.over_line
 
         if await self._match_ended(page):
             await self._tg("⏹ Match ended — not arming")
             return False
 
-        if await self._selection_unavailable(page):
-            await self._clear_betslip(page)
-            watch.force_full_time = True
-            await self._tg("⚠️ Market Unavailable → switching to Full Time Over only")
+        text = await self._capture_full_market_text(page)
 
-        max_profit = float(Config.MAX_PROFIT_PER_BET)
         balance = 0.0
         try:
-            text = await self._page_text(page, 2000)
-            bm = re.search(r"(?:NGN|₦)\s*([\d,]+(?:\.\d+)?)", text)
+            quick = await self._page_text(page, 2000)
+            bm = re.search(r"(?:NGN|₦)\s*([\d,]+(?:\.\d+)?)", quick)
             if bm:
                 balance = float(bm.group(1).replace(",", ""))
         except Exception:
             pass
 
+        max_profit = float(Config.MAX_PROFIT_PER_BET)
+
         if plan is None:
             try:
-                page_text = await self._page_text(page, 1500)
                 plan = plan_over_market(
-                    page_text,
+                    text,
                     watch.home_team,
                     watch.away_team,
                     watch.home_score,
@@ -584,52 +617,128 @@ class BetExecutor:
                     balance,
                 )
             except Exception as e:
-                logger.warning(f"[GROQ] skip: {e}")
-                plan = {}
+                logger.warning(f"[GROQ] error: {e}")
+                plan = {"market_found": False, "error": str(e)}
 
-        if plan and plan.get("period_market") == "FT":
-            watch.force_full_time = True
+        if not plan.get("market_found"):
+            msg = plan.get("error") or plan.get("reason") or "no valid market"
+            logger.warning(f"[AI ARM] {msg}")
+            await self._tg(
+                f"⚠️ Arm failed: {msg}\n"
+                f"{watch.home_team} vs {watch.away_team}\n"
+                f"NOT betting"
+            )
+            watch.confirm_armed = False
+            return False
+
+        # Groq read the score — trust it (already sanity-checked in
+        # groq_ai.py against 0-15 range and cross-verified via regex hint).
+        sh = plan.get("score_home")
+        sa = plan.get("score_away")
+        try:
+            if sh is not None and sa is not None:
+                watch.home_score, watch.away_score = int(sh), int(sa)
+        except Exception:
+            pass
+
+        pm = (plan.get("period_market") or "FT").upper()
+        try:
+            line = float(plan.get("line"))
+        except Exception:
+            await self._tg("⚠️ Arm failed: Groq returned an invalid line")
+            watch.confirm_armed = False
+            return False
+
+        label_prefix = {"1H": "1H", "2H": "2H"}.get(pm, "FT")
+        candidate_label = f"{label_prefix} Over {line:g}"
+
+        # Safety check BEFORE we even try to click anything.
+        if not _is_allowed_market_label(candidate_label):
+            logger.error(f"[SAFETY] blocked pre-click label: {candidate_label!r}")
+            await self._tg(
+                f"🛑 SAFETY BLOCK (pre-click)\n{candidate_label!r}\nNOT betting."
+            )
+            watch.confirm_armed = False
+            return False
 
         await self._clear_betslip(page)
         await asyncio.sleep(0.3)
 
-        ok = await self._click_correct_over(page, watch)
-        if not ok or not await self._betslip_has_selection(page, watch.over_line):
+        require_kw, forbid_kw = _require_forbid_for_period_market(pm)
+        clicked = await self._find_and_click_over(
+            page, line, require_kw, forbid_kw, label_prefix
+        )
+        if not clicked or not await self._betslip_has_selection(page, line):
             await self._tg(
                 f"❌ Market not on betslip\n"
-                f"{watch.active_market or f'Over {watch.over_line}'}\n"
+                f"{candidate_label}\n"
                 f"Score {watch.home_score}-{watch.away_score}\n"
                 f"NOT betting"
             )
             watch.confirm_armed = False
             return False
 
+        watch.active_market = candidate_label
+        watch.target_line = line
+
+        # Final safety check AFTER clicking, before any stake is placed —
+        # independent of Groq, independent of the DOM search above.
+        if not _is_allowed_market_label(watch.active_market):
+            logger.error(f"[SAFETY] blocked post-click label: {watch.active_market!r}")
+            await self._tg(
+                f"🛑 SAFETY BLOCK (post-click)\n{watch.active_market!r}\nNOT betting."
+            )
+            await self._clear_betslip(page)
+            watch.confirm_armed = False
+            watch.active_market = ""
+            return False
+
         odds = await self._read_odds_from_slip(page)
         if odds <= 1.01:
-            odds = 1.50  # safe fallback only for stake math
+            try:
+                odds = float(plan.get("odds") or 1.5)
+            except Exception:
+                odds = 1.5
         watch.odds_over = odds
         stake = max_profit / (odds - 1.0) if odds > 1.0 else 10.0
         if balance > 0 and stake > balance:
             stake = balance
-        watch.stake_over = round(stake, 2)
+        watch.stake_over = round(max(10.0, stake), 2)
 
         if not await self._set_stake(page, watch.stake_over):
             await self._tg("❌ Stake failed")
+            watch.confirm_armed = False
             return False
 
-        await self._click_place_bet(page)
+        await self._click_accept_changes(page)  # harmless if not present
+        if not await self._click_place_bet(page):
+            await self._tg("❌ Place Bet click failed")
+            watch.confirm_armed = False
+            return False
+
         await asyncio.sleep(0.4)
-        armed = await self._click_confirm(page)
-        watch.confirm_armed = True
-        await self._tg(
-            f"✅ ARMED\n"
-            f"{watch.home_team} vs {watch.away_team}\n"
-            f"Score {watch.home_score}-{watch.away_score} | {watch.period}\n"
-            f"{watch.active_market}\n"
-            f"Odds {watch.odds_over} | Stake {watch.stake_over}\n"
-            f"Confirm ready: {armed or True}"
-        )
-        return True
+        armed = await self._confirm_visible(page)
+        watch.confirm_armed = armed
+
+        if armed:
+            logger.success(
+                f"[AI ARM] {watch.active_market} stake={watch.stake_over:.0f} @{watch.odds_over}"
+            )
+            await self._tg(
+                f"✅ ARMED\n"
+                f"{watch.home_team} vs {watch.away_team}\n"
+                f"Score {watch.home_score}-{watch.away_score} | {pm}\n"
+                f"{watch.active_market}\n"
+                f"Odds {watch.odds_over} | Stake {watch.stake_over}\n"
+                f"Waiting for goal → will click Confirm"
+            )
+        else:
+            await self._tg(
+                f"⚠️ Placed but Confirm not visible\n{watch.active_market}"
+            )
+        return armed
+
+    # ─── watch loop (cheap heuristics only, no continuous re-arming) ───
 
     async def _watch_loop(self, mid: str):
         watch = self.watches.get(mid)
@@ -639,6 +748,9 @@ class BetExecutor:
         watch.running = True
         logger.info(f"[WATCH] start {mid}")
 
+        # Arm once at the start.
+        await self.ai_arm_from_plan(page, None, watch)
+
         while watch.running:
             try:
                 if page.is_closed():
@@ -646,74 +758,68 @@ class BetExecutor:
 
                 if await self._match_ended(page):
                     await self._clear_betslip(page)
-                    await self._tg(f"⏹ Full time — cleared betslip ({mid})")
+                    await self._tg(
+                        f"🏁 FULL TIME — {watch.home_team} vs {watch.away_team}\n"
+                        f"Final score {watch.home_score}-{watch.away_score}\n"
+                        f"Betslip cleared, no longer watching this match.\n"
+                        f"Send /slow for a new match."
+                    )
                     watch.running = False
                     break
 
-                h, a = await self._read_score_from_page(page)
-                if h is not None and a is not None:
-                    if h + a < watch.total_goals:
-                        await self.cashout_disallowed(
-                            page, f"{watch.home_score}-{watch.away_score}→{h}-{a}"
-                        )
-                    watch.home_score = h
-                    watch.away_score = a
+                # Cheap VAR/disallowed-goal guard — comparison only,
+                # not a market decision.
+                h, a = await self._quick_score_check(page)
+                if h is not None and a is not None and (h + a) < watch.total_goals:
+                    await self.cashout_disallowed(
+                        page, f"{watch.home_score}-{watch.away_score}→{h}-{a}"
+                    )
+                    watch.home_score, watch.away_score = h, a
+                    watch.confirm_armed = False
+                    await self.ai_arm_from_plan(page, None, watch)
 
-                period = await self._detect_period(page)
-                prev = watch.period
-                watch.period = period
+                period_hint = await self._detect_period(page)
 
-                if period == "HT":
+                if period_hint == "HT":
                     watch.ht_seen = True
                     watch.confirm_armed = False
+                    if not watch.ht_alerted:
+                        watch.ht_alerted = True
+                        await self._tg(
+                            f"⏸ HALF TIME — {watch.home_team} vs {watch.away_team}\n"
+                            f"Score {watch.home_score}-{watch.away_score}\n"
+                            f"Not armed during HT. You can send a new /slow now if you want.\n"
+                            f"Will auto re-arm when 2nd half kicks off."
+                        )
 
-                if watch.ht_seen and period == "2H" and prev in ("HT", "1H"):
+                if (
+                    watch.ht_seen
+                    and period_hint == "2H"
+                    and watch.last_period_hint in ("HT", "1H")
+                ):
+                    watch.ht_alerted = False
                     await self._tg("🔄 2nd half started — re-arming")
-                    watch.force_full_time = False
                     await self.ai_arm_from_plan(page, None, watch)
 
                 if await self._selection_unavailable(page):
                     await self._clear_betslip(page)
-                    watch.force_full_time = True
                     watch.confirm_armed = False
+                    await self._tg("⚠️ Market Unavailable — re-arming")
                     await self.ai_arm_from_plan(page, None, watch)
 
                 if await self._is_suspended(page):
-                    await asyncio.sleep(1.0)
+                    watch.last_period_hint = period_hint
+                    await asyncio.sleep(1.5)
                     continue
 
-                try:
-                    if await page.locator("button:has-text('Accept Changes')").count() > 0:
-                        await self._click_accept_changes(page)
-                        odds = await self._read_odds_from_slip(page)
-                        if odds > 1.01:
-                            max_profit = float(Config.MAX_PROFIT_PER_BET)
-                            stake = max_profit / (odds - 1.0)
-                            watch.odds_over = odds
-                            watch.stake_over = round(stake, 2)
-                            await self._set_stake(page, watch.stake_over)
-                        await self._click_place_bet(page)
-                        await self._click_confirm(page)
-                        watch.confirm_armed = True
-                except Exception:
-                    pass
+                # Odds-changed maintenance only — never clicks Confirm.
+                await self._maybe_accept_changes(page, watch)
 
-                if watch.confirm_armed:
-                    try:
-                        conf = page.locator("button:has-text('Confirm')")
-                        if await conf.count() > 0 and await conf.first.is_visible():
-                            pass
-                        else:
-                            if await self._betslip_has_selection(page, watch.over_line):
-                                await self._click_place_bet(page)
-                                await self._click_confirm(page)
-                    except Exception:
-                        pass
-
-                await asyncio.sleep(0.8)
+                watch.last_period_hint = period_hint
+                await asyncio.sleep(2.0)
             except Exception as e:
                 logger.error(f"[WATCH] {mid}: {e}")
-                await asyncio.sleep(1.2)
+                await asyncio.sleep(1.5)
 
         watch.running = False
         logger.info(f"[WATCH] stop {mid}")
@@ -769,7 +875,8 @@ class BetExecutor:
                 w.task.cancel()
 
     async def confirm_goal_click(self, mid: str) -> BetResult:
-        """Bet365 goal for locked FI → click Confirm immediately."""
+        """Bet365 goal for locked FI → the ONLY thing this does is click
+        Confirm. No market selection, no DOM search, no Groq call here."""
         w = self.watches.get(str(mid))
         if not w or not w.page or w.page.is_closed():
             return BetResult.FAILED
@@ -780,14 +887,20 @@ class BetExecutor:
             await self._tg("🔒 Goal + SportyBet locked — stop watching this match")
             await self.clear_match(mid)
             return BetResult.ABORTED_SAFETY
+
         ok = await self._click_confirm(w.page)
         if ok:
-            await self._tg(f"✅ BET CLICKED Confirm | {w.active_market}")
+            await self._tg(
+                f"✅ BET PLACED (goal)\n"
+                f"{w.home_team} vs {w.away_team}\n"
+                f"{w.active_market}\n"
+                f"Odds {w.odds_over} | Stake {w.stake_over}"
+            )
+            w.confirm_armed = False
             await asyncio.sleep(1.0)
-            h, a = await self._read_score_from_page(w.page)
-            if h is not None:
-                w.home_score = h
-                w.away_score = a
+            # One Groq call to arm the NEXT line — not continuous.
             await self.ai_arm_from_plan(w.page, None, w)
             return BetResult.SUCCESS
+
+        await self._tg("❌ Confirm click failed")
         return BetResult.FAILED
