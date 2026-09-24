@@ -8,7 +8,7 @@ from __future__ import annotations
 import base64
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from groq import Groq
 from loguru import logger
@@ -102,6 +102,31 @@ def _normalize_period(period: str, page_text: str = "") -> str:
     return "1H"
 
 
+def _extract_score_hint(page_text: str) -> Optional[Tuple[int, int]]:
+    """
+    Cheap regex pre-scan so Groq isn't starting from nothing — same idea
+    as _normalize_period's minute-based fallback. This is only a HINT:
+    the prompt tells Groq to verify it against the PAGE text and correct
+    it if wrong. Groq is still the one doing the actual "reading of the
+    score" decision; this just gives it a fast starting point and lets us
+    sanity-check its answer afterward.
+    """
+    t = page_text or ""
+    sample = t[:1500]
+
+    m = re.search(r"\b(\d{1,2})\s*:\s*(\d{1,2})\b", sample)
+    if not m:
+        m = re.search(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\b", sample)
+    if m:
+        try:
+            h, a = int(m.group(1)), int(m.group(2))
+            if 0 <= h <= 15 and 0 <= a <= 15:
+                return h, a
+        except Exception:
+            pass
+    return None
+
+
 def plan_over_market(
     page_text: str,
     home: str,
@@ -117,21 +142,31 @@ def plan_over_market(
     1H: 1st-half Over if present, else Full-time Over. NEVER 2nd-half Over.
     2H: 2nd-half Over if present, else Full-time Over.
     Stake = full hard cap.
+
+    Groq also READS the current score off the page itself (score_home /
+    score_away in the response) rather than blindly trusting whatever was
+    passed in — the passed-in home_score/away_score and the regex hint
+    below are just starting points it's told to verify and correct.
     """
     client = _client_or_none()
     if not client:
         return {"market_found": False, "error": "no_api_key"}
 
-    total = int(home_score) + int(away_score)
-    target = float(total) + 0.5
     per = _normalize_period(period, page_text)
+
+    hint = _extract_score_hint(page_text)
+    if hint:
+        hint_h, hint_a = hint
+    else:
+        hint_h, hint_a = int(home_score), int(away_score)
+    hint_target = float(hint_h + hint_a) + 0.5
 
     if per == "1H":
         period_rules = f"""
 PERIOD = FIRST HALF.
 ALLOWED (in order):
-  1) 1st Half / First Half Over {target} (or nearest Over line for 1H goals)
-  2) If 1st Half Over NOT on page → Full Time / Match Over {target}
+  1) 1st Half / First Half Over {hint_target} (or nearest Over line for 1H goals)
+  2) If 1st Half Over NOT on page → Full Time / Match Over {hint_target}
 FORBIDDEN:
   - Any 2nd Half / Second Half market (NEVER in first half)
   - Under (never)
@@ -140,8 +175,8 @@ FORBIDDEN:
         period_rules = f"""
 PERIOD = SECOND HALF.
 ALLOWED (in order):
-  1) 2nd Half / Second Half Over {target}
-  2) If not on page → Full Time / Match Over {target}
+  1) 2nd Half / Second Half Over {hint_target}
+  2) If not on page → Full Time / Match Over {hint_target}
 FORBIDDEN:
   - 1st Half markets
   - Under
@@ -149,31 +184,38 @@ FORBIDDEN:
     else:
         period_rules = f"""
 PERIOD = {per}.
-Use Full Time / Match Over {target} only. Never Under.
+Use Full Time / Match Over {hint_target} only. Never Under.
 """
 
     prompt = f"""
 SportyBet live page for {home} vs {away}.
-Score: {home_score}-{away_score} (total goals = {total}).
+Score hint from a quick scan (VERIFY this against the PAGE text below and
+correct it if it's wrong — read the actual score shown on the page):
+{hint_h}-{hint_a}.
 Period hint: {per}.
 Balance: {balance}. MAX_PROFIT_PER_BET: {max_profit}.
 
 {period_rules}
 
 STRICT:
+- Read the ACTUAL current score from the PAGE text below (it is shown near
+  the team names / match clock, usually as "H : A"). Use that as ground
+  truth — return it as score_home / score_away.
 - selection must be Over only (never Under).
-- line should be {target} when that market exists (total+0.5).
+- line should be (the score you actually read) total + 0.5.
 - stake = min(balance, max_profit / (odds - 1)). Minimum 10.
-- market_found=false if no valid Over market on page.
-- reason must say which market you picked and why.
+- market_found=false if no valid Over market on page for the required period.
+- reason must say which market you picked, the score you read, and why.
 
 Return JSON ONLY:
 {{
   "market_found": true,
-  "market_name": "1st Half Over {target}",
-  "line": {target},
+  "market_name": "1st Half Over {hint_target}",
+  "line": {hint_target},
   "selection": "Over",
   "period_market": "1H",
+  "score_home": {hint_h},
+  "score_away": {hint_a},
   "odds": 1.85,
   "stake": 0,
   "reason": ""
@@ -208,6 +250,23 @@ PAGE:
                 "error": "rejected_2h_in_1h",
                 "reason": data.get("reason", ""),
             }
+
+        # Groq read (or was given) the score — sanity-check it, and always
+        # recompute "line" deterministically from that score rather than
+        # trusting the LLM's own arithmetic for it. This is the one place
+        # we don't just take Groq's word for it, since a wrong line value
+        # is the one thing that must never drift.
+        try:
+            sh = int(data.get("score_home"))
+            sa = int(data.get("score_away"))
+            if not (0 <= sh <= 15 and 0 <= sa <= 15):
+                raise ValueError("out of range")
+        except Exception:
+            sh, sa = hint_h, hint_a  # fall back to the regex hint
+
+        data["score_home"] = sh
+        data["score_away"] = sa
+        data["line"] = float(sh + sa) + 0.5
 
         odds = float(data.get("odds") or 0)
         if odds > 1.01:
