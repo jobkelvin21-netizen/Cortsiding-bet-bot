@@ -2,6 +2,7 @@
 BetExecutor — Groq plans; Playwright clicks real Over/Under only.
 Scroll accumulates markets; fallback arms if page has Over lines.
 Confirm ONLY in confirm_goal_click() on Bet365 goal.
+Every bet result is always sent to Telegram.
 """
 
 import asyncio
@@ -85,7 +86,6 @@ def _require_forbid_for_period_market(pm: str):
     )
 
 
-# Forbidden market contexts (never click these even if button says Over X.5)
 _FORBIDDEN_CTX = re.compile(
     r"rest\s*of|handicap|next\s*goal|nth\s*goal|goalscorer|correct\s*score|"
     r"double\s*chance|draw\s*no\s*bet|both\s*teams|btts|odd/even|odd\s*even|"
@@ -140,7 +140,6 @@ class BetExecutor:
         return "\n".join(filtered)
 
     async def _capture_full_market_text(self, page: Page, steps: int = 14) -> str:
-        """Scroll the markets panel and accumulate ALL unique lines seen."""
         await self._click_all_tab(page)
         await asyncio.sleep(0.8)
 
@@ -149,7 +148,6 @@ class BetExecutor:
 
         async def snapshot() -> str:
             try:
-                # Prefer market containers
                 for sel in (
                     "[class*='event-market']",
                     "[class*='EventMarket']",
@@ -196,7 +194,7 @@ class BetExecutor:
 
         for i in range(steps):
             try:
-                scrolled = await page.evaluate(
+                await page.evaluate(
                     """() => {
                         const sels = [
                             '[class*="market-list"]', '[class*="MarketList"]',
@@ -221,7 +219,6 @@ class BetExecutor:
                 logger.debug(f"[SCROLL] {i}: {e}")
                 break
 
-        # back to top for click phase
         try:
             await page.evaluate(
                 """() => {
@@ -271,41 +268,57 @@ class BetExecutor:
 
     async def _detect_period(self, page: Page) -> str:
         text = (await self._page_text(page, 4000)).lower()
-        if re.search(r"\b(half\s*time|ht\b|mid\s*break)\b", text):
-            return "HT"
-        if re.search(r"\b(2nd\s*half|second\s*half|2h\b)\b", text):
-            return "2H"
-        if re.search(r"\b(1st\s*half|first\s*half|1h\b)\b", text):
-            return "1H"
-        m = re.search(r"\b(\d{1,2})\s*[':]", text)
+
+        minute = None
+        m = re.search(r"\b(\d{1,2})\s*'\s*(?:\+\d+)?\b", text)
+        if not m:
+            m = re.search(r"\b(\d{1,2})\s*:\s*\d{1,2}\b", text)
         if m:
             try:
                 minute = int(m.group(1))
-                if minute >= 46:
-                    return "2H"
-                if 1 <= minute <= 45:
-                    return "1H"
             except Exception:
-                pass
+                minute = None
+
+        if minute is not None:
+            if 1 <= minute <= 45:
+                return "1H"
+            if 46 <= minute <= 120:
+                return "2H"
+
+        if re.search(r"\b(half\s*time|half-time|\bht\b)\b", text):
+            if not re.search(r"\b(1st\s*half|2nd\s*half|live)\b", text):
+                return "HT"
+
+        if re.search(r"\b(2nd\s*half|second\s*half)\b", text):
+            return "2H"
+        if re.search(r"\b(1st\s*half|first\s*half)\b", text):
+            return "1H"
+
         return "1H"
 
     async def _match_ended(self, page: Page) -> bool:
-        """Only True when match is clearly finished and not live."""
         text = (await self._page_text(page, 4000)).lower()
+
         has_ended = bool(
-            re.search(r"\b(full\s*time|match\s*ended|finished)\b", text)
+            re.search(
+                r"\b(full\s*time|match\s*ended|match\s*finished|ft\s*-\s*ended)\b",
+                text,
+            )
         )
         if not has_ended:
             return False
+
         has_live = bool(
             re.search(
-                r"\b(1st\s*half|2nd\s*half|live|ongoing)\b|\b\d{1,2}\s*'\s*(?:\+\d+)?\b",
+                r"\b(1st\s*half|2nd\s*half|first\s*half|second\s*half|live|ongoing)\b"
+                r"|\b\d{1,2}\s*'\s*(?:\+\d+)?"
+                r"|\b\d{1,2}\s*:\s*\d{2}\b",
                 text,
             )
         )
         if has_live:
-            # conflicted → treat as LIVE, never stop
             return False
+
         return True
 
     async def _selection_unavailable(self, page: Page) -> bool:
@@ -401,10 +414,6 @@ class BetExecutor:
         forbid_kw: List[str],
         label: str,
     ) -> bool:
-        """
-        Click Over {line}. Accept if context looks like Over/Under / Match Goals
-        and does NOT match forbidden markets. Period require/forbid still applied.
-        """
         await self._click_all_tab(page)
         await asyncio.sleep(0.3)
 
@@ -446,14 +455,11 @@ class BetExecutor:
                             )
                             ctx_l = (ctx or "").lower()
 
-                            # Hard reject bad market families
                             if _FORBIDDEN_CTX.search(ctx_l):
                                 continue
                             if any(f in ctx_l for f in forbid_kw):
                                 continue
 
-                            # Prefer real OU / goals context; allow if Over line
-                            # is clearly the selection (SportyBet often splits header)
                             is_ou_context = bool(
                                 re.search(
                                     r"over\s*/\s*under|over/under|match\s*goals|"
@@ -469,9 +475,7 @@ class BetExecutor:
                             if not is_ou_context and not has_over_btn:
                                 continue
 
-                            # Period require (soft if FT and empty require)
                             if require_kw and not any(r in ctx_l for r in require_kw):
-                                # For FT, empty require already; for 1H/2H skip wrong half
                                 if label in ("1H", "2H"):
                                     continue
 
@@ -618,6 +622,68 @@ class BetExecutor:
             except Exception:
                 continue
 
+    async def _verify_bet_result(self, page: Page) -> Tuple[bool, str]:
+        """
+        After Confirm click — decide accepted vs not.
+        Always used so Telegram always gets a result.
+        Returns (accepted: bool, detail: str).
+        """
+        await asyncio.sleep(1.2)
+        text = ""
+        try:
+            text = (await self._page_text(page, 5000)).lower()
+        except Exception:
+            text = ""
+
+        # Explicit failure signals
+        fail_patterns = [
+            r"\bbet\s*reject",
+            r"\brejected\b",
+            r"\bfailed\b",
+            r"\berror\b",
+            r"\bunavailable\b",
+            r"\bsuspended\b",
+            r"\binsufficient\b",
+            r"\bnot\s*enough\b",
+            r"\bodds\s*changed\b",
+            r"\baccept\s*changes\b",
+            r"\bstake\s*too\b",
+            r"\bminimum\s*stake\b",
+            r"\bmaximum\s*stake\b",
+            r"\bmarket\s*closed\b",
+            r"\bbetting\s*closed\b",
+        ]
+        for p in fail_patterns:
+            if re.search(p, text):
+                return False, f"page shows: {p}"
+
+        # Explicit success signals
+        ok_patterns = [
+            r"\bbet\s*placed\b",
+            r"\bbet\s*accepted\b",
+            r"\bsuccess\b",
+            r"\bplaced\s*successfully\b",
+            r"\byour\s*bet\b",
+            r"\bbet\s*id\b",
+            r"\bconfirmed\b",
+        ]
+        for p in ok_patterns:
+            if re.search(p, text):
+                return True, f"page shows success ({p})"
+
+        # Confirm gone + no failure text → treat as accepted
+        try:
+            still_confirm = await self._confirm_visible(page)
+        except Exception:
+            still_confirm = False
+
+        if not still_confirm:
+            # Betslip empty or no longer showing the Over selection is a good sign
+            return True, "Confirm gone — treated as accepted"
+
+        # Still on Confirm / dialog → not accepted
+        return False, "Confirm still visible — not accepted"
+
     async def _maybe_accept_changes(self, page: Page, watch: MatchWatch):
         try:
             if await page.locator("button:has-text('Accept Changes')").count() > 0:
@@ -678,7 +744,6 @@ class BetExecutor:
         pm: str,
         label_prefix: str,
     ) -> bool:
-        """Click → betslip check → stake → Place Bet → wait Confirm (no Confirm click)."""
         require_kw, forbid_kw = _require_forbid_for_period_market(pm)
         candidate_label = f"{label_prefix} Over {line:g}"
 
@@ -692,7 +757,6 @@ class BetExecutor:
         clicked = await self._find_and_click_over(
             page, line, require_kw, forbid_kw, label_prefix
         )
-        # FT fallback if period market missing
         if not clicked and pm in ("1H", "2H"):
             clicked = await self._find_and_click_over(
                 page,
@@ -770,7 +834,6 @@ class BetExecutor:
         if page.is_closed():
             return False
 
-        # Do NOT full-reload every arm — kills slip and slows everything.
         if await self._match_ended(page):
             await self._tg("⏹ Match ended — not arming")
             return False
@@ -779,7 +842,6 @@ class BetExecutor:
         over_lines = self._page_has_over_lines(text)
         logger.info(f"[ARM] over lines on page: {over_lines}")
 
-        # Live score from page
         h, a = await self._quick_score_check(page)
         if h is not None and a is not None:
             watch.home_score, watch.away_score = h, a
@@ -814,7 +876,6 @@ class BetExecutor:
                 logger.warning(f"[GROQ] {e}")
                 plan = {"market_found": False, "error": str(e)}
 
-        # ── Groq path ──
         if plan.get("market_found"):
             try:
                 sh = int(plan.get("score_home"))
@@ -828,18 +889,15 @@ class BetExecutor:
                 line = float(plan.get("line"))
             except Exception:
                 line = watch.over_line
-            # Prefer page line if Groq line not listed
             if over_lines and line not in over_lines:
                 target = watch.over_line
                 line = target if target in over_lines else over_lines[0]
             label_prefix = {"1H": "1H", "2H": "2H"}.get(pm, "FT")
             return await self._finish_arm(page, watch, line, pm, label_prefix)
 
-        # ── Deterministic fallback when page clearly has Over markets ──
         if over_lines:
             line = watch.over_line
             if line not in over_lines:
-                # nearest line >= target, else highest available under target+1
                 above = [x for x in over_lines if x >= line]
                 line = min(above) if above else max(over_lines)
             pm = period if period in ("1H", "2H") else "FT"
@@ -991,31 +1049,70 @@ class BetExecutor:
                 w.task.cancel()
 
     async def confirm_goal_click(self, mid: str) -> BetResult:
+        """
+        Bet365 goal → click Confirm → ALWAYS verify + Telegram result.
+        Never silent.
+        """
         w = self.watches.get(str(mid))
         if not w or not w.page or w.page.is_closed():
+            await self._tg(
+                f"❌ BET SKIPPED\nMatch {mid}\nReason: page/watch missing"
+            )
             return BetResult.FAILED
+
         if not w.confirm_armed:
-            await self._tg("⚠️ Goal but not armed — skip")
+            await self._tg(
+                f"⚠️ Goal but not armed — skip\n"
+                f"{w.home_team} vs {w.away_team}\n"
+                f"NO BET PLACED"
+            )
             return BetResult.ABORTED_SAFETY
+
         if await self._is_suspended(w.page) or await self._selection_unavailable(
             w.page
         ):
-            await self._tg("🔒 Goal + SportyBet locked — stop watching")
+            await self._tg(
+                f"🔒 Goal + SportyBet locked — stop watching\n"
+                f"{w.home_team} vs {w.away_team}\n"
+                f"NO BET PLACED"
+            )
             await self.clear_match(mid)
             return BetResult.ABORTED_SAFETY
 
-        ok = await self._click_confirm(w.page)
-        if ok:
+        ok_click = await self._click_confirm(w.page)
+        if not ok_click:
             await self._tg(
-                f"✅ BET PLACED (goal)\n"
+                f"❌ BET NOT PLACED\n"
                 f"{w.home_team} vs {w.away_team}\n"
                 f"{w.active_market}\n"
-                f"Odds {w.odds_over} | Stake {w.stake_over}"
+                f"Odds {w.odds_over} | Stake {w.stake_over}\n"
+                f"Reason: Confirm button click failed"
             )
-            w.confirm_armed = False
+            return BetResult.FAILED
+
+        accepted, detail = await self._verify_bet_result(w.page)
+        w.confirm_armed = False
+
+        if accepted:
+            await self._tg(
+                f"✅ BET ACCEPTED\n"
+                f"{w.home_team} vs {w.away_team}\n"
+                f"{w.active_market}\n"
+                f"Odds {w.odds_over} | Stake {w.stake_over}\n"
+                f"Detail: {detail}"
+            )
             await asyncio.sleep(1.0)
             await self.ai_arm_from_plan(w.page, None, w)
             return BetResult.SUCCESS
 
-        await self._tg("❌ Confirm click failed")
+        await self._tg(
+            f"❌ BET NOT ACCEPTED\n"
+            f"{w.home_team} vs {w.away_team}\n"
+            f"{w.active_market}\n"
+            f"Odds {w.odds_over} | Stake {w.stake_over}\n"
+            f"Detail: {detail}"
+        )
+        # Try re-arm so we can attempt next opportunity
+        await asyncio.sleep(0.8)
+        await self.ai_arm_from_plan(w.page, None, w)
         return BetResult.FAILED
