@@ -48,6 +48,6 @@ class Config:
 
     # Groq
     GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-    GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
+    GROQ_VISION_MODEL = "qwen/qwen3.8-27b"
     GROQ_TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "openai/gpt-oss-20b")
-    GROQ_VISION_MODEL = "llama-3.2-90b-vision-preview"
+    
