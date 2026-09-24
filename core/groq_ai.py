@@ -1,14 +1,16 @@
 """
-Groq AI — plan Over market only (strict period rules).
-Manual slow; no ticker lock required for execution.
+Groq AI — plan Over market only from SportyBet page text.
+Knows real SportyBet headers from live UI:
+  - "1st Half - Over/Under" / "2nd Half - Over/Under"
+  - plain "Over/Under" (full time)
+Never team totals, Rest of Match, Under, handicap, etc.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from groq import Groq
 from loguru import logger
@@ -30,10 +32,6 @@ def _client_or_none() -> Optional[Groq]:
     return _client
 
 
-def _b64(data: bytes) -> str:
-    return base64.b64encode(data).decode("ascii")
-
-
 def _parse_json(text: str) -> dict:
     text = (text or "").strip()
     m = re.search(r"\{[\s\S]*\}", text)
@@ -46,74 +44,43 @@ def _parse_json(text: str) -> dict:
 
 
 def _normalize_period(period: str, page_text: str = "") -> str:
-    """
-    Live page truth ALWAYS wins over a stale hint. The hint (watch.period)
-    is only used as a last resort when the page itself gives no clear signal.
-    """
     t = (page_text or "").lower()
+    sample = t[:2000]
 
-    # 1. Look at the live page first — this is the actual match state.
-    sample = t[:1500]  # clock/score area is always near the top of the page
+    if re.search(r"\b2nd\s*half\b|\bsecond\s*half\b", sample):
+        return "2H"
+    if re.search(r"\bhalf\s*time\b|\bhalf-time\b|\bht\b", sample):
+        return "HT"
+    if re.search(r"\b1st\s*half\b|\bfirst\s*half\b", sample):
+        return "1H"
 
-    is_2h_page = bool(
-        re.search(r"\b2nd\s*half\b|\bsecond\s*half\b", sample)
-    )
-    is_1h_page = bool(
-        re.search(r"\b1st\s*half\b|\bfirst\s*half\b", sample)
-    )
-    is_ht_page = bool(
-        re.search(r"\bht\b|\bhalf\s*time\b|\bhalf-time\b", sample)
-    )
-
-    # Minute-based fallback: "46'" or higher means 2nd half has started.
-    minute = None
     m = re.search(r"\b(\d{1,3})\s*'\s*(?:\+\d+)?\b", sample)
     if not m:
         m = re.search(r"\b(\d{1,2})\s*:\s*\d{0,2}\b", sample)
     if m:
         try:
             minute = int(m.group(1))
+            if minute >= 46:
+                return "2H"
+            if 1 <= minute <= 45:
+                return "1H"
         except Exception:
-            minute = None
+            pass
 
-    if is_2h_page:
-        return "2H"
-    if is_ht_page:
-        # Half time has passed — treat as heading into 2nd half.
-        return "2H"
-    if minute is not None and minute >= 46:
-        return "2H"
-    if is_1h_page:
-        return "1H"
-    if minute is not None and minute <= 45:
-        return "1H"
-
-    # 2. Page gave nothing usable — fall back to the hint.
     p = (period or "").lower()
-    if any(x in p for x in ("2h", "2nd", "second half", "2nd half")):
+    if any(x in p for x in ("2h", "2nd", "second half")):
         return "2H"
-    if any(x in p for x in ("1h", "1st", "first half", "1st half")):
-        return "1H"
     if any(x in p for x in ("ht", "half time", "half-time")):
         return "HT"
+    if any(x in p for x in ("1h", "1st", "first half")):
+        return "1H"
     if any(x in p for x in ("ft", "full time", "ended", "finished")):
         return "FT"
-
     return "1H"
 
 
 def _extract_score_hint(page_text: str) -> Optional[Tuple[int, int]]:
-    """
-    Cheap regex pre-scan so Groq isn't starting from nothing — same idea
-    as _normalize_period's minute-based fallback. This is only a HINT:
-    the prompt tells Groq to verify it against the PAGE text and correct
-    it if wrong. Groq is still the one doing the actual "reading of the
-    score" decision; this just gives it a fast starting point and lets us
-    sanity-check its answer afterward.
-    """
-    t = page_text or ""
-    sample = t[:1500]
-
+    sample = (page_text or "")[:2000]
     m = re.search(r"\b(\d{1,2})\s*:\s*(\d{1,2})\b", sample)
     if not m:
         m = re.search(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\b", sample)
@@ -138,22 +105,14 @@ def plan_over_market(
     balance: float,
 ) -> Dict[str, Any]:
     """
-    Choose Over only.
-    1H: 1st-half Over if present, else Full-time Over. NEVER 2nd-half Over.
-    2H: 2nd-half Over if present, else Full-time Over.
-    Stake = full hard cap.
-
-    Groq also READS the current score off the page itself (score_home /
-    score_away in the response) rather than blindly trusting whatever was
-    passed in — the passed-in home_score/away_score and the regex hint
-    below are just starting points it's told to verify and correct.
+    Choose Over only using SportyBet's real market headers.
+    Fallbacks are period-based only (1H→FT, 2H→FT), never random markets.
     """
     client = _client_or_none()
     if not client:
         return {"market_found": False, "error": "no_api_key"}
 
     per = _normalize_period(period, page_text)
-
     hint = _extract_score_hint(page_text)
     if hint:
         hint_h, hint_a = hint
@@ -164,53 +123,76 @@ def plan_over_market(
     if per == "1H":
         period_rules = f"""
 PERIOD = FIRST HALF.
-ALLOWED (in order):
-  1) 1st Half / First Half Over {hint_target} (or nearest Over line for 1H goals)
-  2) If 1st Half Over NOT on page → Full Time / Match Over {hint_target}
-FORBIDDEN:
-  - Any 2nd Half / Second Half market (NEVER in first half)
-  - Under (never)
+Try in this exact order (STOP at first that exists on PAGE):
+  1) Header exactly like "1st Half - Over/Under" or "1st Half Over/Under"
+     → selection Over {hint_target} (or nearest Over line under that header)
+  2) If that header is missing → plain "Over/Under" (full time, NOT team name)
+     → selection Over {hint_target}
+FORBIDDEN in 1H:
+  - Any "2nd Half" market
+  - Under
+  - "Rest of the Match"
+  - Team-named Over/Under (e.g. "{home} Over/Under", player/team totals)
+  - Handicap, Asian, 1X2, Double Chance, Correct Score, GG/NG, Odd/Even
 """
     elif per == "2H":
         period_rules = f"""
 PERIOD = SECOND HALF.
-ALLOWED (in order):
-  1) 2nd Half / Second Half Over {hint_target}
-  2) If not on page → Full Time / Match Over {hint_target}
+Try in this exact order:
+  1) "2nd Half - Over/Under" / "2nd Half Over/Under" → Over {hint_target}
+  2) Else plain "Over/Under" (full time, not team name) → Over {hint_target}
 FORBIDDEN:
   - 1st Half markets
-  - Under
+  - Under, Rest of Match, team totals, handicap, etc.
+"""
+    elif per == "HT":
+        period_rules = f"""
+PERIOD = HALF TIME.
+Only plain full-time "Over/Under" → Over {hint_target}.
+No 1st/2nd Half markets while HT.
 """
     else:
         period_rules = f"""
 PERIOD = {per}.
-Use Full Time / Match Over {hint_target} only. Never Under.
+Only plain full-time "Over/Under" → Over {hint_target}.
 """
 
     prompt = f"""
-SportyBet live page for {home} vs {away}.
-Score hint from a quick scan (VERIFY this against the PAGE text below and
-correct it if it's wrong — read the actual score shown on the page):
-{hint_h}-{hint_a}.
-Period hint: {per}.
-Balance: {balance}. MAX_PROFIT_PER_BET: {max_profit}.
+You are reading a SportyBet LIVE football match page for:
+{home} vs {away}
+
+Score hint (VERIFY on page near teams/clock, usually H:A or H-A): {hint_h}-{hint_a}
+Period: {per}
+Balance: {balance}
+MAX_PROFIT_PER_BET: {max_profit}
+
+HOW SPORTYBET MARKETS LOOK ON THIS SITE:
+- Section title then green buttons, e.g.:
+  "1st Half - Over/Under"
+     Over 0.5 | Under 0.5
+     Over 1.5 | Under 1.5
+  "Over/Under"   ← full time match goals
+     Over 1.5 | Under 1.5
+     Over 2.5 | Under 2.5
+  "2nd Half - Over/Under"
+     Over ...
+- Team totals look like: "{home} Over/Under" or long team name + Over/Under → IGNORE
+- "Rest of the Match (current score ...)" → IGNORE
 
 {period_rules}
 
 STRICT:
-- Read the ACTUAL current score from the PAGE text below (it is shown near
-  the team names / match clock, usually as "H : A"). Use that as ground
-  truth — return it as score_home / score_away.
-- selection must be Over only (never Under).
-- line should be (the score you actually read) total + 0.5.
-- stake = min(balance, max_profit / (odds - 1)). Minimum 10.
-- market_found=false if no valid Over market on page for the required period.
-- reason must say which market you picked, the score you read, and why.
+- selection = Over only (never Under)
+- line = (score you read total) + 0.5, must match a line that exists under the chosen header
+- period_market must be "1H" or "2H" or "FT"
+- market_found=false if none of the allowed headers+Over lines exist
+- reason must name the exact header you used and the Over line
+- stake = min(balance, max_profit / (odds - 1)), minimum 10
 
 Return JSON ONLY:
 {{
   "market_found": true,
-  "market_name": "1st Half Over {hint_target}",
+  "market_name": "1st Half - Over/Under Over {hint_target}",
   "line": {hint_target},
   "selection": "Over",
   "period_market": "1H",
@@ -218,73 +200,78 @@ Return JSON ONLY:
   "score_away": {hint_a},
   "odds": 1.85,
   "stake": 0,
-  "reason": ""
+  "reason": "why this header and line"
 }}
-period_market must be one of: "1H", "2H", "FT".
 
-PAGE:
-{page_text[:9000]}
+PAGE TEXT:
+{page_text[:9500]}
 """
     try:
         resp = client.chat.completions.create(
             model=getattr(Config, "GROQ_TEXT_MODEL", "llama-3.3-70b-versatile"),
             temperature=0,
-            max_tokens=400,
+            max_tokens=450,
             messages=[{"role": "user", "content": prompt}],
         )
         data = _parse_json(resp.choices[0].message.content or "")
         if not data.get("market_found"):
             return data
 
-        # Hard reject illegal 2H in 1H
         name = (data.get("market_name") or "").lower()
         pmarket = (data.get("period_market") or "").upper()
+
+        # Hard reject illegal period
         if per == "1H" and (
-            pmarket == "2H"
-            or "2nd half" in name
-            or "second half" in name
+            pmarket == "2H" or "2nd half" in name or "second half" in name
         ):
-            logger.warning(f"[GROQ] rejected illegal 2H market in 1H: {data}")
             return {
                 "market_found": False,
                 "error": "rejected_2h_in_1h",
                 "reason": data.get("reason", ""),
             }
+        if per == "2H" and (
+            pmarket == "1H" or "1st half" in name or "first half" in name
+        ):
+            return {
+                "market_found": False,
+                "error": "rejected_1h_in_2h",
+                "reason": data.get("reason", ""),
+            }
 
-        # Groq read (or was given) the score — sanity-check it, and always
-        # recompute "line" deterministically from that score rather than
-        # trusting the LLM's own arithmetic for it. This is the one place
-        # we don't just take Groq's word for it, since a wrong line value
-        # is the one thing that must never drift.
+        # Reject team totals / ROM in name
+        if "rest of" in name or re.search(
+            r"\b(handicap|asian|double chance|correct score|gg/ng|odd/even)\b", name
+        ):
+            return {
+                "market_found": False,
+                "error": "rejected_forbidden_market",
+                "reason": data.get("reason", ""),
+            }
+
         try:
             sh = int(data.get("score_home"))
             sa = int(data.get("score_away"))
             if not (0 <= sh <= 15 and 0 <= sa <= 15):
-                raise ValueError("out of range")
+                raise ValueError("bad score")
         except Exception:
-            sh, sa = hint_h, hint_a  # fall back to the regex hint
+            sh, sa = hint_h, hint_a
 
         data["score_home"] = sh
         data["score_away"] = sa
         data["line"] = float(sh + sa) + 0.5
+        data["selection"] = "Over"
 
         odds = float(data.get("odds") or 0)
         if odds > 1.01:
-            stake = min(float(balance), float(max_profit) / (odds - 1.0))
+            stake = min(float(balance or 0) or 10**9, float(max_profit) / (odds - 1.0))
             data["stake"] = round(max(10.0, stake), 2)
-        data["selection"] = "Over"
         return data
     except Exception as e:
         logger.error(f"[GROQ][MARKET] {e}")
         return {"market_found": False, "error": str(e)}
 
 
-# Optional vision helpers kept for compatibility (manual slow does not need them)
-async def analyze_tickers(
-    bet365_png: bytes,
-    sporty_png: bytes,
-    lag_seconds: float = None,
-) -> Dict[str, Any]:
+async def analyze_tickers(*args, **kwargs) -> Dict[str, Any]:
     return {"links": [], "error": "manual_slow_mode"}
 
 
