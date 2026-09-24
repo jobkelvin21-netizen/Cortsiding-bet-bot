@@ -203,27 +203,86 @@ class BetExecutor:
         return None, None
 
     async def _detect_period(self, page: Page) -> str:
-        """Cheap regex heuristic used ONLY to decide WHEN to trigger a
-        re-arm (HT alert, HT→2H transition) in the watch loop. Groq does
-        its own, more careful period read (via _normalize_period inside
-        groq_ai.py) every time ai_arm_from_plan actually runs."""
-        text = (await self._page_text(page)).lower()
-        if re.search(r"\b(full\s*time|ft\b|match\s*ended|finished)\b", text):
-            return "FT"
-        if re.search(r"\b(half\s*time|ht\b|mid.?break)\b", text):
+        """Detect period with priority to LIVE indicators over stale 'FT' text"""
+        text = (await self._page_text(page, 4000)).lower()
+        
+        # Check for LIVE indicators first (prevents stale FT detection)
+        # 1st half indicators
+        if re.search(r"\b(1st\s+half|first\s+half|1h\b)\b", text):
+            # Make sure it's not just stale text by checking for minute
+            if re.search(r"\b([0-4]?\d)\s*[':]?\d*\b", text):
+                return "1H"
+                
+        # 2nd half indicators  
+        if re.search(r"\b(2nd\s+half|second\s+half|2h\b)\b", text):
+            if re.search(r"\b([4-9]\d)\s*[':]?\d*\b", text):
+                return "2H"
+                
+        # Half time
+        if re.search(r"\b(half\s*time|ht\b|mid\s*break)\b", text):
             return "HT"
-        if re.search(r"\b(2nd\s*half|second\s*half|2h\b)\b", text):
-            return "2H"
-        m = re.search(r"\b(4[6-9]|[5-9]\d)\s*[':]?\d*", text)
-        if m:
-            return "2H"
+            
+        # Minute-based detection (reliable for live matches)
+        minute_match = re.search(r"\b(\d{1,2})\s*[':]\s*(?:\d{2})?\b", text)
+        if minute_match:
+            minute = int(minute_match.group(1))
+            if 1 <= minute <= 45:
+                return "1H"
+            elif 46 <= minute <= 90:
+                return "2H"
+        
+        # Only say FT if NO live indicators found
+        live_indicators = [
+            r"\b\d{1,2}\s*:\s*\d{1,2}\b",  # Score pattern
+            r"\blive\b",
+            r"\b1st\b", r"\b2nd\b",
+        ]
+        has_live = any(re.search(m, text) for m in live_indicators)
+        
+        if not has_live:
+            if re.search(r"\b(full\s*time|ft\b|match\s*ended|finished)\b", text):
+                return "FT"
+                
+        # Default to 1H if unsure but see score
+        if re.search(r"\b\d\s*:\s*\d\b", text):
+            return "1H"
+            
         return "1H"
 
     async def _match_ended(self, page: Page) -> bool:
-        text = (await self._page_text(page)).lower()
-        return bool(
-            re.search(r"\b(full\s*time|match\s*ended|finished|ft\s*\d)", text)
-        )
+        """Strict check - must see 'full time' or 'match ended' AND no live indicators"""
+        text = (await self._page_text(page, 4000)).lower()
+        
+        # Must have explicit end markers
+        ended_markers = [
+            r"\bfull\s*time\b",
+            r"\bmatch\s*ended\b", 
+            r"\bfinished\b",
+            r"\bft\s*-\s*(?:\d|ended)",  # FT- or FT - 
+        ]
+        
+        has_ended = any(re.search(m, text) for m in ended_markers)
+        
+        if not has_ended:
+            return False
+            
+        # BUT if we see live indicators, it's NOT ended (stale data check)
+        live_indicators = [
+            r"\b1st\s+(?:half|1h)\b",
+            r"\b2nd\s+(?:half|2h)\b", 
+            r"\b\d{1,2}\s*:\s*\d{1,2}\s*(?:am|pm)?\b",  # Time like "33:30"
+            r"\b\d{1,2}\s*'\s*(?:\+\d+)?\b",  # Minute like "33'"
+            r"\blive\b",
+            r"\bongoing\b",
+        ]
+        
+        has_live = any(re.search(m, text) for m in live_indicators)
+        
+        if has_live and has_ended:
+            logger.warning(f"[MATCH ENDED] Conflicted: has BOTH ended and live markers. Assuming LIVE.")
+            return False
+            
+        return has_ended
 
     async def _selection_unavailable(self, page: Page) -> bool:
         try:
@@ -586,6 +645,13 @@ class BetExecutor:
         stops once Confirm is visible. Confirm is NEVER clicked here."""
         if page.is_closed():
             return False
+
+        # FORCE REFRESH - ensure we have live data, not stale cache
+        try:
+            await page.reload(wait_until="networkidle", timeout=10000)
+            await asyncio.sleep(1.5)
+        except Exception as e:
+            logger.warning(f"[ARM] Reload warning: {e}")
 
         if await self._match_ended(page):
             await self._tg("⏹ Match ended — not arming")
