@@ -16,7 +16,7 @@ WS_IDLE_SECS = 10
 # Fast path: if the live socket itself CLOSES, reload immediately — don't
 # wait for the idle timer at all.
 WS_RESUME_WAIT_SECS = 6
-KEEPALIVE_SECS = 600
+KEEPALIVE_SECS = 60
 IDLE_CHECK_TICK = 0.2
 
 RE_FI = re.compile(r"(?:^|[|;,\s])FI=(\d{6,})", re.I)
@@ -449,7 +449,7 @@ class Bet365Feed:
             pass
 
     async def _run_loop(self):
-        """One long session: same tab; dead feed -> instant hard reload."""
+        """One long session: same tab; light scroll every 60s to keep alive."""
         if not await self._connect_cdp_once():
             return
 
@@ -495,44 +495,24 @@ class Bet365Feed:
         self.running = True
         self._last_message_at = time.time()
         logger.success("[BET365] session UP — same tab only")
-        await self._tg("✅ Bet365 ON — same tab; dead feed = instant hard reload")
+        await self._tg("✅ Bet365 ON — same tab; keepalive scroll every 60s")
 
+        # Start keepalive scroll task
         if not self._keepalive_task or self._keepalive_task.done():
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
+        # Main loop - just monitor health, no hard reloads
         while self._want_run:
             if self._got_403:
                 await self._tg("⚠️ Bet365 403")
                 break
-
-            # Fast path: the live socket closed -> reload NOW.
-            if self._ws_dead:
-                ok = await self._reload_same_page("socket closed")
-                if not ok:
-                    await self._detach_cdp()
-                    if not await self._connect_cdp_once():
-                        await asyncio.sleep(1)
-                        continue
-                    page = await self._pick_existing_page()
-                    self._page = page
-                    if page:
-                        await self._reload_same_page("socket closed")
-                continue
-
-            # Backup path: no frame at all for too long -> reload.
-            if self._last_frame_at and (time.time() - self._last_frame_at) > WS_IDLE_SECS:
-                ok = await self._reload_same_page("idle")
-                if not ok:
-                    await self._detach_cdp()
-                    if not await self._connect_cdp_once():
-                        await asyncio.sleep(1)
-                        continue
-                    page = await self._pick_existing_page()
-                    self._page = page
-                    if page:
-                        await self._reload_same_page("idle")
-                continue
-
+            
+            # Log health status occasionally
+            if self._last_frame_at:
+                idle = time.time() - self._last_frame_at
+                if idle > 30:
+                    logger.warning(f"[BET365] no frame for {idle:.0f}s")
+            
             await asyncio.sleep(IDLE_CHECK_TICK)
 
         self.running = False
