@@ -202,7 +202,9 @@ class TelegramCommandHandler:
             return
 
         if low.startswith("/slow") or low.startswith("slow"):
-            await self._handle_slow(text)
+            # Arming can take up to ~90s (page load + market scan). Run it
+            # in the background so /stopbot and /clear stay responsive.
+            asyncio.create_task(self._handle_slow(text))
             return
 
         if low in ("yes", "no") and getattr(
