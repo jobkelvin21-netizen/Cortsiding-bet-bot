@@ -1,4 +1,4 @@
-"""Bet365 WS — same tab only. Idle WS -> hard reload (cache-bypass) immediately. Never new tab."""
+"""Bet365 WS — same tab only. Dead feed -> instant hard reload. Never new tab."""
 
 import asyncio
 import re
@@ -11,16 +11,12 @@ from playwright.async_api import async_playwright
 from config import Config
 
 CDP_URL = "http://127.0.0.1:9222"
-# Was 90s — dropped hard so a dead feed is caught almost immediately.
+# Backup path: if no frame of any kind arrives for this long, reload.
 WS_IDLE_SECS = 10
-# Was 25s — each reload attempt now fails fast so retries happen sooner
-# instead of burning most of a minute on one stuck attempt.
+# Fast path: if the live socket itself CLOSES, reload immediately — don't
+# wait for the idle timer at all.
 WS_RESUME_WAIT_SECS = 6
-# Every 10 minutes, nudge the page with a tiny scroll so Chrome doesn't
-# treat it as fully idle/backgrounded while it's not the visible tab.
 KEEPALIVE_SECS = 600
-# Main loop's own idle-check cadence — was 0.5s, tightened so idle
-# detection isn't delayed by its own polling interval.
 IDLE_CHECK_TICK = 0.2
 
 RE_FI = re.compile(r"(?:^|[|;,\s])FI=(\d{6,})", re.I)
@@ -63,7 +59,8 @@ class Bet365Feed:
         self.matches: Dict[str, dict] = {}
         self.running = False
         self._want_run = False
-        self._last_message_at: Optional[float] = None
+        self._last_message_at: Optional[float] = None   # last RELEVANT (parsed) frame
+        self._last_frame_at: Optional[float] = None      # last frame of ANY kind
         self._task: Optional[asyncio.Task] = None
         self.alerter = None
         self._page = None
@@ -72,11 +69,11 @@ class Bet365Feed:
         self._last_alert_at = 0.0
         self._announced: set = set()
         self._got_403 = False
-        # Tracks which exact page object handlers are currently bound to,
-        # so we never stack duplicate listeners on repeated reloads.
         self._handlers_bound_for = None
-        # Keep-alive: periodic tiny scroll task, separate from the main loop.
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._ws_dead = False          # set True the instant the live socket closes
+        self._reloading = False
+        self._open_ws: set = set()
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -218,14 +215,9 @@ class Bet365Feed:
             pass
 
     def _bind_page_handlers(self, page):
-        """Attach WS + 403 listeners to the same page (no new tab).
-
-        Skips entirely if already bound to this exact page object —
-        Playwright page listeners survive navigation, so there's no need
-        to re-bind after a reload of the SAME page (and re-binding with
-        freshly created closures can never be removed later, since
-        remove_listener needs the exact same function reference).
-        """
+        """Attach WS + 403 listeners once per page object (they survive
+        reloads). Also tracks the live socket so a CLOSE fires an instant
+        reload instead of waiting on the idle timer."""
         if self._handlers_bound_for is page:
             return
 
@@ -237,7 +229,14 @@ class Bet365Feed:
                 pass
 
         def on_websocket(ws):
+            url = (getattr(ws, "url", "") or "").lower()
+            live = "zap" in url or "sportspublisher" in url
+            key = id(ws)
+            if live:
+                self._open_ws.add(key)
+
             def on_frame(ev):
+                self._last_frame_at = time.time()
                 if not self.running or not self._want_run:
                     return
                 try:
@@ -252,7 +251,14 @@ class Bet365Feed:
                 except Exception:
                     pass
 
+            def on_close(*_):
+                self._open_ws.discard(key)
+                if live and not self._open_ws and not self._reloading and self._want_run:
+                    self._ws_dead = True
+                    logger.warning("[BET365] live WebSocket closed -> reload now")
+
             ws.on("framereceived", on_frame)
+            ws.on("close", on_close)
 
         page.on("response", on_response)
         page.on("websocket", on_websocket)
@@ -277,8 +283,7 @@ class Bet365Feed:
         return await ctx.new_page()
 
     async def _wait_for_ws_resume(self, timeout: float = WS_RESUME_WAIT_SECS) -> bool:
-        """True only if real frames arrive after reload (updates _last_message_at).
-        Polls at 0.2s instead of 0.4s so a quick recovery is noticed fast."""
+        """True only if real data frames arrive after the reload."""
         deadline = time.time() + timeout
         marker = self._last_message_at or 0.0
         while time.time() < deadline:
@@ -289,24 +294,10 @@ class Bet365Feed:
             await asyncio.sleep(0.2)
         return bool(self._last_message_at and self._last_message_at > marker)
 
-    async def _reload_same_page(self) -> bool:
-        """Refresh SAME tab when WS is quiet. Success only if frames resume.
-
-        CONFIRMED WORKING (standalone test, 2026-09-27): a plain
-        page.reload() can leave the tab stuck on a loading spinner with no
-        WS ever reopening. What actually fixes it is a HARD reload
-        (cache bypassed) via CDP Page.stopLoading + Page.reload({
-        ignoreCache: True}), combined with bring_to_front() so the tab
-        isn't frozen/backgrounded. Retried up to 3 times if a given
-        attempt still doesn't bring frames back, mirroring what worked
-        manually (click refresh again if the first click doesn't help).
-
-        SPEED (this version): WS_IDLE_SECS and WS_RESUME_WAIT_SECS were
-        both cut down sharply — idle detection used to wait 90s before
-        even trying, and each attempt could wait up to 25s for frames.
-        Odds move fast right before/after a goal, so the whole recovery
-        chain now aims to be seconds, not minutes.
-        """
+    async def _reload_same_page(self, reason: str = "idle") -> bool:
+        """Hard reload (CDP Page.stopLoading + Page.reload ignoreCache) of
+        the SAME tab plus bring_to_front — proven in testing. Up to 3
+        fast attempts."""
         page = self._page
         if not page or page.is_closed():
             page = await self._pick_existing_page()
@@ -318,86 +309,88 @@ class Bet365Feed:
 
         url = getattr(Config, "BET365_LIVE_URL", "https://www.bet365.com/#/IP/B1")
         self._got_403 = False
+        self._reloading = True
+        self._ws_dead = False
         before = self._last_message_at
 
         try:
-            await page.bring_to_front()
-            await asyncio.sleep(0.2)
-        except Exception as e:
-            logger.warning(f"[BET365] bring_to_front failed: {e}")
-
-        self._bind_page_handlers(page)
-
-        for attempt in range(1, 4):  # up to 3 hard-reload attempts
-            logger.warning(f"[BET365] WS idle → hard reload attempt {attempt}/3")
-            if attempt == 1:
-                await self._tg("🔄 Bet365 WS idle → hard reload...")
-
-            try:
-                cdp = await page.context.new_cdp_session(page)
-                await cdp.send("Page.stopLoading")
-                await asyncio.sleep(0.1)
-                await cdp.send("Page.reload", {"ignoreCache": True})
-                try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                except Exception:
-                    pass  # even if this times out, we still check for frames below
-                try:
-                    await cdp.detach()
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning(f"[BET365] CDP hard reload failed: {e}")
-                try:
-                    await page.reload(wait_until="domcontentloaded", timeout=20000)
-                except Exception as e2:
-                    logger.warning(f"[BET365] reload failed, goto same tab: {e2}")
-                    try:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    except Exception as e3:
-                        logger.error(f"[BET365] goto failed: {e3}")
-                        continue  # try next attempt
-
-            if self._got_403:
-                await self._tg("⚠️ Bet365 403 after reload — change VPN")
-                return False
-
             try:
                 await page.bring_to_front()
-            except Exception:
-                pass
+                await asyncio.sleep(0.2)
+            except Exception as e:
+                logger.warning(f"[BET365] bring_to_front failed: {e}")
 
-            await asyncio.sleep(0.8)
-            for sel in ("text=Football", "text=Soccer"):
+            self._bind_page_handlers(page)
+
+            for attempt in range(1, 4):
+                logger.warning(f"[BET365] {reason} -> hard reload attempt {attempt}/3")
+                if attempt == 1:
+                    await self._tg(f"🔄 Bet365 feed dead ({reason}) → hard reload...")
+
                 try:
-                    loc = page.locator(sel)
-                    if await loc.count() > 0:
-                        await loc.first.click(timeout=1500)
-                        await asyncio.sleep(0.5)
-                        break
+                    cdp = await page.context.new_cdp_session(page)
+                    await cdp.send("Page.stopLoading")
+                    await asyncio.sleep(0.1)
+                    await cdp.send("Page.reload", {"ignoreCache": True})
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except Exception:
+                        pass
+                    try:
+                        await cdp.detach()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning(f"[BET365] CDP hard reload failed: {e}")
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=20000)
+                    except Exception as e2:
+                        logger.warning(f"[BET365] reload failed, goto same tab: {e2}")
+                        try:
+                            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        except Exception as e3:
+                            logger.error(f"[BET365] goto failed: {e3}")
+                            continue
+
+                if self._got_403:
+                    await self._tg("⚠️ Bet365 403 after reload — change VPN")
+                    return False
+
+                try:
+                    await page.bring_to_front()
                 except Exception:
                     pass
 
-            resumed = await self._wait_for_ws_resume(WS_RESUME_WAIT_SECS)
-            if resumed:
-                logger.success(
-                    f"[BET365] WS frames resumed after hard reload (attempt {attempt})"
-                )
-                await self._tg("✅ Bet365 WS resumed after hard reload")
-                return True
+                await asyncio.sleep(0.8)
+                for sel in ("text=Football", "text=Soccer"):
+                    try:
+                        loc = page.locator(sel)
+                        if await loc.count() > 0:
+                            await loc.first.click(timeout=1500)
+                            await asyncio.sleep(0.5)
+                            break
+                    except Exception:
+                        pass
 
-            logger.warning(f"[BET365] attempt {attempt} — still stuck/no frames, retrying")
-            await asyncio.sleep(0.3)
+                if await self._wait_for_ws_resume(WS_RESUME_WAIT_SECS):
+                    logger.success(f"[BET365] frames resumed (attempt {attempt})")
+                    await self._tg("✅ Bet365 WS resumed after hard reload")
+                    self._ws_dead = False
+                    return True
 
-        # All attempts failed — honest failure, do not fake activity.
-        if before:
-            self._last_message_at = before
-        logger.error("[BET365] all hard-reload attempts failed — NO WS frames")
-        await self._tg(
-            "❌ Bet365 hard-reloaded 3x but still no live data\n"
-            "Check VPN / open live football on that tab"
-        )
-        return False
+                logger.warning(f"[BET365] attempt {attempt} — no data frames, retrying")
+                await asyncio.sleep(0.3)
+
+            if before:
+                self._last_message_at = before
+            logger.error("[BET365] all hard-reload attempts failed")
+            await self._tg(
+                "❌ Bet365 hard-reloaded 3x but still no live data\n"
+                "Check VPN / open live football on that tab"
+            )
+            return False
+        finally:
+            self._reloading = False
 
     async def _connect_cdp_once(self) -> bool:
         if self._browser:
@@ -423,6 +416,7 @@ class Bet365Feed:
         self._page = None
         self._browser = None
         self._handlers_bound_for = None
+        self._open_ws.clear()
         try:
             if self._playwright:
                 await self._playwright.stop()
@@ -430,13 +424,9 @@ class Bet365Feed:
             pass
         self._playwright = None
 
-    # ── keep-alive: tiny periodic scroll so the tab doesn't go fully idle ──
-
     async def _keepalive_scroll(self):
-        """One small scroll down, then back up. Does not touch focus,
-        does not navigate, does not affect betting/watching in any way —
-        it only exists to give the page a little activity so Chrome is
-        less likely to freeze it while it sits in the background."""
+        """One small scroll down, then back up. Keeps the tab from being
+        treated as fully idle/backgrounded by Chrome. No effect on betting."""
         page = self._page
         if not page or page.is_closed():
             return
@@ -449,11 +439,6 @@ class Bet365Feed:
             logger.warning(f"[BET365] keep-alive scroll failed: {e}")
 
     async def _keepalive_loop(self):
-        """Runs independently of the main session loop. Fires every
-        KEEPALIVE_SECS while the feed is supposed to be running, regardless
-        of whether WS frames are flowing — this is purely about keeping
-        the tab 'awake', not about detecting idle WS (that's WS_IDLE_SECS'
-        job elsewhere)."""
         try:
             while self._want_run:
                 await asyncio.sleep(KEEPALIVE_SECS)
@@ -464,7 +449,7 @@ class Bet365Feed:
             pass
 
     async def _run_loop(self):
-        """One long session: same tab; on idle → hard reload same tab immediately."""
+        """One long session: same tab; dead feed -> instant hard reload."""
         if not await self._connect_cdp_once():
             return
 
@@ -476,6 +461,8 @@ class Bet365Feed:
 
         url = getattr(Config, "BET365_LIVE_URL", "https://www.bet365.com/#/IP/B1")
         self._got_403 = False
+        self._ws_dead = False
+        self._last_frame_at = None
 
         try:
             await page.bring_to_front()
@@ -508,10 +495,8 @@ class Bet365Feed:
         self.running = True
         self._last_message_at = time.time()
         logger.success("[BET365] session UP — same tab only")
-        await self._tg("✅ Bet365 ON — same tab; idle = fast hard reload")
+        await self._tg("✅ Bet365 ON — same tab; dead feed = instant hard reload")
 
-        # Start the keep-alive scroller alongside this session, if not
-        # already running (it's independent of reload/reconnect cycles).
         if not self._keepalive_task or self._keepalive_task.done():
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
@@ -520,10 +505,9 @@ class Bet365Feed:
                 await self._tg("⚠️ Bet365 403")
                 break
 
-            if self._last_message_at and (
-                time.time() - self._last_message_at > WS_IDLE_SECS
-            ):
-                ok = await self._reload_same_page()
+            # Fast path: the live socket closed -> reload NOW.
+            if self._ws_dead:
+                ok = await self._reload_same_page("socket closed")
                 if not ok:
                     await self._detach_cdp()
                     if not await self._connect_cdp_once():
@@ -532,11 +516,23 @@ class Bet365Feed:
                     page = await self._pick_existing_page()
                     self._page = page
                     if page:
-                        await self._reload_same_page()
+                        await self._reload_same_page("socket closed")
                 continue
 
-            # Was 0.5s — tightened so idle detection isn't itself a
-            # bottleneck on top of WS_IDLE_SECS.
+            # Backup path: no frame at all for too long -> reload.
+            if self._last_frame_at and (time.time() - self._last_frame_at) > WS_IDLE_SECS:
+                ok = await self._reload_same_page("idle")
+                if not ok:
+                    await self._detach_cdp()
+                    if not await self._connect_cdp_once():
+                        await asyncio.sleep(1)
+                        continue
+                    page = await self._pick_existing_page()
+                    self._page = page
+                    if page:
+                        await self._reload_same_page("idle")
+                continue
+
             await asyncio.sleep(IDLE_CHECK_TICK)
 
         self.running = False
