@@ -1,12 +1,13 @@
 """Bet365 WS — same tab only.
-Idle / black loading → immediately goto https://www.bet365.com/#/IP/B1
-Keep-alive while healthy. Never new tab. Never 3x hard-reload spam.
+Idle → fast goto clean #/IP/B1 (commit + short data wait).
+No hard reload. No Telegram spam (backoff after fail).
 """
 
 import asyncio
 import re
 import time
 from typing import Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 from loguru import logger
 from playwright.async_api import async_playwright
@@ -14,12 +15,15 @@ from playwright.async_api import async_playwright
 from config import Config
 
 CDP_URL = "http://127.0.0.1:9222"
-LIVE_URL = "https://www.bet365.com/#/IP/B1"
+DEFAULT_LIVE = "https://www.bet365.com/#/IP/B1"
 
 KEEPALIVE_SECS = 25
-STUCK_SECS = 15                 # no DATA → treat as idle
-RECOVER_COOLDOWN_SECS = 40
-IDLE_CHECK_TICK = 0.35          # fast detect
+STUCK_SECS = 25
+FAIL_BACKOFF_SECS = 180
+MAX_FAILS_THEN_LONG_PAUSE = 3
+LONG_PAUSE_SECS = 600
+IDLE_CHECK_TICK = 0.4
+DATA_WAIT_SECS = 8              # fast: was 20s
 
 RE_FI = re.compile(r"(?:^|[|;,\s])FI=(\d{6,})", re.I)
 RE_ID = re.compile(r"(?:^|[|;,\s])ID=(\d{6,})", re.I)
@@ -77,6 +81,9 @@ class Bet365Feed:
         self._reloading = False
         self._open_ws: set = set()
         self._last_recover_at = 0.0
+        self._fail_streak = 0
+        self._next_recover_ok_at = 0.0
+        self._told_fail = False
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -84,7 +91,7 @@ class Bet365Feed:
     def set_callback(self, callback: Callable):
         self.callback = callback
 
-    async def _tg(self, text: str, min_gap: float = 2.0):
+    async def _tg(self, text: str, min_gap: float = 3.0):
         now = time.time()
         if now - self._last_alert_at < min_gap:
             return
@@ -100,13 +107,26 @@ class Bet365Feed:
             return False
         if self._last_data_at is None:
             return False
-        return (time.time() - self._last_data_at) < 45
+        return (time.time() - self._last_data_at) < 60
 
     def get_matches(self) -> List[dict]:
         return list(self.matches.values())
 
     def get_match(self, match_id: str) -> Optional[dict]:
         return self.matches.get(str(match_id))
+
+    def _live_url(self) -> str:
+        try:
+            page = self._page
+            if page and not page.is_closed():
+                u = page.url or ""
+                if "bet365" in u.lower():
+                    p = urlparse(u)
+                    if p.scheme and p.netloc:
+                        return f"{p.scheme}://{p.netloc}/#/IP/B1"
+        except Exception:
+            pass
+        return getattr(Config, "BET365_LIVE_URL", None) or DEFAULT_LIVE
 
     async def _announce(self, fi: str, name: str, ss: str):
         if not self.running or not self._want_run:
@@ -209,6 +229,9 @@ class Bet365Feed:
 
         self._last_message_at = time.time()
         self._last_data_at = time.time()
+        if self._fail_streak:
+            self._fail_streak = 0
+            self._told_fail = False
 
     async def _safe_cb(self, rec: dict):
         if not self.running or not self._want_run or not self.callback:
@@ -279,38 +302,12 @@ class Bet365Feed:
             return ctx.pages[0]
         return None
 
-    async def _looks_stuck(self, page) -> bool:
-        try:
-            body = (await page.inner_text("body", timeout=800) or "").strip()
-            if len(body) < 80:
-                return True
-            for sel in (
-                "[class*='spinner']",
-                "[class*='loading']",
-                ".loading",
-                "[class*='Loader']",
-            ):
-                loc = page.locator(sel)
-                if await loc.count() > 0:
-                    try:
-                        if await loc.first.is_visible():
-                            return True
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        return False
-
     async def _recover_live(self) -> bool:
-        """
-        Idle → clear stuck URL → load https://www.bet365.com/#/IP/B1
-        Same tab only. As fast as the network allows.
-        Does NOT clear locked match ID in main bot.
-        """
+        """Fast: commit goto + short data poll. No hard reload. Backoff on fail."""
         now = time.time()
         if self._reloading:
             return False
-        if now - self._last_recover_at < RECOVER_COOLDOWN_SECS:
+        if now < self._next_recover_ok_at:
             return False
 
         page = self._page
@@ -318,25 +315,31 @@ class Bet365Feed:
             page = await self._pick_existing_page()
             self._page = page
         if not page or page.is_closed():
-            await self._tg("⚠️ Bet365 — no tab. Open live football (CDP 9222).")
+            if not self._told_fail:
+                await self._tg("⚠️ Bet365 — no tab (CDP 9222).")
+                self._told_fail = True
+            self._next_recover_ok_at = now + FAIL_BACKOFF_SECS
             return False
 
+        live = self._live_url()
         self._reloading = True
         self._got_403 = False
         self._last_recover_at = now
         marker = self._last_data_at or 0.0
 
         try:
-            logger.warning("[BET365] idle → goto clean #/IP/B1")
-            await self._tg("🔄 Bet365 idle → open live page…")
+            logger.warning(f"[BET365] idle → fast goto {live}")
+            if self._fail_streak == 0:
+                await self._tg(f"🔄 Bet365 idle → {live}")
+
             self._bind_page_handlers(page)
             try:
                 await page.bring_to_front()
             except Exception:
                 pass
 
-            # Fast navigation — clear bar by loading correct URL
-            await page.goto(LIVE_URL, wait_until="commit", timeout=20000)
+            # FAST: commit only (URL changes immediately)
+            await page.goto(live, wait_until="commit", timeout=15000)
             try:
                 await page.evaluate("() => { location.hash = '#/IP/B1'; }")
             except Exception:
@@ -344,23 +347,44 @@ class Bet365Feed:
 
             if self._got_403:
                 await self._tg("⚠️ Bet365 403 — change VPN")
+                self._fail_streak += 1
+                self._next_recover_ok_at = now + LONG_PAUSE_SECS
+                self._told_fail = True
                 return False
 
-            # Brief wait for first DATA frames only
-            deadline = time.time() + 12
+            # FAST: poll data max DATA_WAIT_SECS (8s)
+            deadline = time.time() + DATA_WAIT_SECS
             while time.time() < deadline:
                 if self._last_data_at and self._last_data_at > marker:
-                    logger.success("[BET365] data after clean goto")
+                    logger.success("[BET365] data after fast goto")
+                    self._fail_streak = 0
+                    self._told_fail = False
+                    self._next_recover_ok_at = 0.0
                     await self._tg("✅ Bet365 data back")
                     return True
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.2)
 
-            await self._tg(
-                "❌ Bet365 still quiet after live URL\nCheck VPN / tab"
-            )
+            self._fail_streak += 1
+            if self._fail_streak >= MAX_FAILS_THEN_LONG_PAUSE:
+                self._next_recover_ok_at = time.time() + LONG_PAUSE_SECS
+                if not self._told_fail:
+                    await self._tg(
+                        "❌ Bet365 quiet after live URL (×3)\n"
+                        "Paused 10 min. Check VPN / live tab."
+                    )
+                    self._told_fail = True
+            else:
+                self._next_recover_ok_at = time.time() + FAIL_BACKOFF_SECS
+                if self._fail_streak == 1:
+                    await self._tg(
+                        "❌ Bet365 still quiet after live URL\n"
+                        f"Retry in {FAIL_BACKOFF_SECS // 60} min (no spam)"
+                    )
             return False
         except Exception as e:
             logger.error(f"[BET365] recover: {e}")
+            self._fail_streak += 1
+            self._next_recover_ok_at = time.time() + FAIL_BACKOFF_SECS
             return False
         finally:
             self._reloading = False
@@ -404,12 +428,9 @@ class Bet365Feed:
             self._browser = await self._playwright.chromium.connect_over_cdp(CDP_URL)
             return True
         except Exception as e:
-            logger.warning(f"[BET365] CDP connect failed: {e}")
+            logger.warning(f"[BET365] CDP: {e}")
             if self._want_run:
-                await self._tg(
-                    "⚠️ Bet365 CDP offline — Chrome "
-                    "--remote-debugging-port=9222"
-                )
+                await self._tg("⚠️ Bet365 CDP offline")
             return False
 
     async def _detach_cdp(self):
@@ -430,16 +451,16 @@ class Bet365Feed:
 
         page = await self._pick_existing_page()
         if not page:
-            await self._tg(
-                "⚠️ No Bet365 tab.\n"
-                "Open Chrome 9222 → live football → /startbot"
-            )
+            await self._tg("⚠️ No Bet365 tab — open live football on CDP Chrome")
             return
         self._page = page
 
         self._got_403 = False
         self._last_frame_at = None
         self._last_data_at = None
+        self._fail_streak = 0
+        self._told_fail = False
+        self._next_recover_ok_at = 0.0
 
         try:
             await page.bring_to_front()
@@ -451,8 +472,9 @@ class Bet365Feed:
         try:
             u = (page.url or "").lower()
             if "bet365" not in u or "ip" not in u:
-                await page.goto(LIVE_URL, wait_until="commit", timeout=30000)
-                await asyncio.sleep(1.0)
+                live = self._live_url()
+                await page.goto(live, wait_until="commit", timeout=15000)
+                await asyncio.sleep(0.8)
                 if self._got_403:
                     await self._tg("⚠️ Bet365 403 — change VPN")
                     return
@@ -465,11 +487,11 @@ class Bet365Feed:
         self._last_message_at = now
         self._last_frame_at = now
         self._last_data_at = now
-        logger.success("[BET365] UP — idle → clean #/IP/B1")
+        logger.success("[BET365] UP — fast recover")
         await self._tg(
             "✅ Bet365 ON\n"
-            "Idle → clear URL → https://www.bet365.com/#/IP/B1\n"
-            "Locked match ID kept by main bot"
+            f"Live: {self._live_url()}\n"
+            "Idle → fast #/IP/B1 (no spam)"
         )
 
         if not self._keepalive_task or self._keepalive_task.done():
@@ -482,13 +504,7 @@ class Bet365Feed:
 
             if not self._reloading and self._last_data_at:
                 data_idle = time.time() - self._last_data_at
-                stuck = data_idle >= STUCK_SECS
-                if not stuck and data_idle >= 8:
-                    try:
-                        stuck = await self._looks_stuck(self._page)
-                    except Exception:
-                        pass
-                if stuck:
+                if data_idle >= STUCK_SECS and time.time() >= self._next_recover_ok_at:
                     await self._recover_live()
 
             await asyncio.sleep(IDLE_CHECK_TICK)
@@ -505,7 +521,7 @@ class Bet365Feed:
                 logger.error(f"[BET365] loop: {e!r}")
             if not self._want_run:
                 break
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
         self.running = False
 
     async def start(self):
