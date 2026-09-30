@@ -1,13 +1,14 @@
 """Bet365 WS — same tab only.
 False-idle fixed: only recover when truly stuck (long no-data OR black UI).
-Fast goto #/IP/B1 on real idle. No hard reload. No Telegram spam.
+On idle: always navigate fresh to the exact configured live URL — never
+rebuilt from whatever (possibly broken/redirected) address the tab is
+currently on. No Telegram spam.
 """
 
 import asyncio
 import re
 import time
 from typing import Callable, Dict, List, Optional
-from urllib.parse import urlparse
 
 from loguru import logger
 from playwright.async_api import async_playwright
@@ -118,16 +119,11 @@ class Bet365Feed:
         return self.matches.get(str(match_id))
 
     def _live_url(self) -> str:
-        try:
-            page = self._page
-            if page and not page.is_closed():
-                u = page.url or ""
-                if "bet365" in u.lower():
-                    p = urlparse(u)
-                    if p.scheme and p.netloc:
-                        return f"{p.scheme}://{p.netloc}/#/IP/B1"
-        except Exception:
-            pass
+        """Always the exact configured live URL. Never rebuilt from the
+        tab's current address — a stuck/redirected page (e.g. bet365.nl
+        with a stripped session token) would only produce another broken
+        URL. This is the equivalent of clearing the address bar and
+        typing the correct link fresh every time."""
         return getattr(Config, "BET365_LIVE_URL", None) or DEFAULT_LIVE
 
     async def _announce(self, fi: str, name: str, ss: str):
@@ -370,9 +366,9 @@ class Bet365Feed:
         marker = self._last_data_at or 0.0
 
         try:
-            logger.warning(f"[BET365] real idle → fast goto {live}")
+            logger.warning(f"[BET365] real idle → fresh load {live}")
             if self._fail_streak == 0:
-                await self._tg(f"🔄 Bet365 idle → {live}")
+                await self._tg(f"🔄 Bet365 idle → reloading {live}")
 
             self._bind_page_handlers(page)
             try:
@@ -380,11 +376,19 @@ class Bet365Feed:
             except Exception:
                 pass
 
-            await page.goto(live, wait_until="commit", timeout=15000)
+            # Equivalent of clearing the address bar and typing the
+            # correct link fresh: always navigate straight to the exact
+            # canonical URL, never patch/rebuild whatever (possibly
+            # broken/redirected) address the tab is currently stuck on.
+            # Playwright can't click Chrome's real address bar (it's
+            # outside the page content it automates) — a direct goto()
+            # is the reliable equivalent, with a plain-load fallback if
+            # the fast "commit" navigation itself throws.
             try:
-                await page.evaluate("() => { location.hash = '#/IP/B1'; }")
-            except Exception:
-                pass
+                await page.goto(live, wait_until="commit", timeout=15000)
+            except Exception as e:
+                logger.warning(f"[BET365] goto commit failed, retrying plain load: {e}")
+                await page.goto(live, timeout=15000)
 
             if self._got_403:
                 await self._tg("⚠️ Bet365 403 — change VPN")
@@ -396,7 +400,7 @@ class Bet365Feed:
             deadline = time.time() + DATA_WAIT_SECS
             while time.time() < deadline:
                 if self._last_data_at and self._last_data_at > marker:
-                    logger.success("[BET365] data after fast goto")
+                    logger.success("[BET365] data after fresh load")
                     self._fail_streak = 0
                     self._told_fail = False
                     self._next_recover_ok_at = 0.0
