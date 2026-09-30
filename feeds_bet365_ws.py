@@ -1,6 +1,6 @@
 """Bet365 WS — same tab only.
-Idle → fast goto clean #/IP/B1 (commit + short data wait).
-No hard reload. No Telegram spam (backoff after fail).
+False-idle fixed: only recover when truly stuck (long no-data OR black UI).
+Fast goto #/IP/B1 on real idle. No hard reload. No Telegram spam.
 """
 
 import asyncio
@@ -18,12 +18,14 @@ CDP_URL = "http://127.0.0.1:9222"
 DEFAULT_LIVE = "https://www.bet365.com/#/IP/B1"
 
 KEEPALIVE_SECS = 25
-STUCK_SECS = 25
+# Real idle only — football pages can gap without being dead
+STUCK_SECS = 90                 # no DATA for 90s → recover
+STUCK_UI_SECS = 45              # no DATA 45s + black/spinner UI → recover
 FAIL_BACKOFF_SECS = 180
 MAX_FAILS_THEN_LONG_PAUSE = 3
 LONG_PAUSE_SECS = 600
-IDLE_CHECK_TICK = 0.4
-DATA_WAIT_SECS = 8              # fast: was 20s
+IDLE_CHECK_TICK = 0.5
+DATA_WAIT_SECS = 8
 
 RE_FI = re.compile(r"(?:^|[|;,\s])FI=(\d{6,})", re.I)
 RE_ID = re.compile(r"(?:^|[|;,\s])ID=(\d{6,})", re.I)
@@ -107,7 +109,7 @@ class Bet365Feed:
             return False
         if self._last_data_at is None:
             return False
-        return (time.time() - self._last_data_at) < 60
+        return (time.time() - self._last_data_at) < 120
 
     def get_matches(self) -> List[dict]:
         return list(self.matches.values())
@@ -261,6 +263,7 @@ class Bet365Feed:
 
             def on_frame(ev):
                 self._last_frame_at = time.time()
+                # Any live payload counts as activity (stops false idle)
                 if not self.running or not self._want_run:
                     return
                 try:
@@ -272,6 +275,9 @@ class Bet365Feed:
                     )
                     if any(x in text for x in ("NA=", "FI=", "SS=", "OV", "EV;")):
                         self._parse_frame(text)
+                    elif len(text) > 20:
+                        # odds/clock frames without NA/FI still = page alive
+                        self._last_data_at = time.time()
                 except Exception:
                     pass
 
@@ -302,8 +308,44 @@ class Bet365Feed:
             return ctx.pages[0]
         return None
 
+    async def _looks_stuck(self, page) -> bool:
+        try:
+            body = (await page.inner_text("body", timeout=800) or "").strip()
+            if len(body) < 80:
+                return True
+            for sel in (
+                "[class*='spinner']",
+                "[class*='loading']",
+                ".loading",
+                "[class*='Loader']",
+            ):
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    try:
+                        if await loc.first.is_visible():
+                            return True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return False
+
+    async def _should_recover(self) -> bool:
+        """True only when really stuck — not after a short quiet gap."""
+        if not self._last_data_at:
+            return False
+        data_idle = time.time() - self._last_data_at
+        if data_idle >= STUCK_SECS:
+            return True
+        if data_idle >= STUCK_UI_SECS and self._page and not self._page.is_closed():
+            try:
+                if await self._looks_stuck(self._page):
+                    return True
+            except Exception:
+                pass
+        return False
+
     async def _recover_live(self) -> bool:
-        """Fast: commit goto + short data poll. No hard reload. Backoff on fail."""
         now = time.time()
         if self._reloading:
             return False
@@ -328,7 +370,7 @@ class Bet365Feed:
         marker = self._last_data_at or 0.0
 
         try:
-            logger.warning(f"[BET365] idle → fast goto {live}")
+            logger.warning(f"[BET365] real idle → fast goto {live}")
             if self._fail_streak == 0:
                 await self._tg(f"🔄 Bet365 idle → {live}")
 
@@ -338,7 +380,6 @@ class Bet365Feed:
             except Exception:
                 pass
 
-            # FAST: commit only (URL changes immediately)
             await page.goto(live, wait_until="commit", timeout=15000)
             try:
                 await page.evaluate("() => { location.hash = '#/IP/B1'; }")
@@ -352,7 +393,6 @@ class Bet365Feed:
                 self._told_fail = True
                 return False
 
-            # FAST: poll data max DATA_WAIT_SECS (8s)
             deadline = time.time() + DATA_WAIT_SECS
             while time.time() < deadline:
                 if self._last_data_at and self._last_data_at > marker:
@@ -487,11 +527,11 @@ class Bet365Feed:
         self._last_message_at = now
         self._last_frame_at = now
         self._last_data_at = now
-        logger.success("[BET365] UP — fast recover")
+        logger.success("[BET365] UP — false-idle fixed + fast recover")
         await self._tg(
             "✅ Bet365 ON\n"
             f"Live: {self._live_url()}\n"
-            "Idle → fast #/IP/B1 (no spam)"
+            "Recover only if really stuck (90s / black UI)"
         )
 
         if not self._keepalive_task or self._keepalive_task.done():
@@ -502,9 +542,12 @@ class Bet365Feed:
                 await self._tg("⚠️ Bet365 403 — change VPN")
                 break
 
-            if not self._reloading and self._last_data_at:
-                data_idle = time.time() - self._last_data_at
-                if data_idle >= STUCK_SECS and time.time() >= self._next_recover_ok_at:
+            if (
+                not self._reloading
+                and self._last_data_at
+                and time.time() >= self._next_recover_ok_at
+            ):
+                if await self._should_recover():
                     await self._recover_live()
 
             await asyncio.sleep(IDLE_CHECK_TICK)
