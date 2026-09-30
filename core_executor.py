@@ -6,6 +6,12 @@ arm it, then just stay on Confirm. Confirm is clicked ONLY by
 confirm_goal_click (a Bet365 goal). Nothing re-checks the score or
 re-picks the market on its own — only a genuine change on SportyBet's own
 page (suspended / unavailable / half changes) triggers a re-arm.
+
+HARD CAP FIX: odds are re-read and the stake re-capped every time "Accept
+Changes" is clicked (initial arm, rebet, and while the confirm-watcher is
+recovering) — not just once at the start. Accept Changes means the odds
+moved; a stake sized to the OLD odds could push real profit past
+Config.MAX_PROFIT_PER_BET, which was the bug.
 """
 
 import asyncio
@@ -295,6 +301,23 @@ class BetExecutor:
             pass
         return False
 
+    async def _accept_changes_and_retarget(self, page: Page, watch: MatchWatch) -> bool:
+        """Click Accept Changes if it's showing, then immediately re-read
+        the odds and re-cap the stake against them. Accept Changes means
+        the odds moved — a stake sized to the OLD odds is exactly how the
+        hard cap was getting exceeded."""
+        if not await self._click_accept_changes(page):
+            return False
+        await asyncio.sleep(0.15)
+        odds = await self._read_odds(page)
+        if odds > 1.01:
+            watch.odds_over = odds
+            new_stake = self._stake_for_odds(odds)
+            if abs(new_stake - watch.stake_over) > 0.009:
+                watch.stake_over = new_stake
+                await self._set_stake(page, new_stake)
+        return True
+
     async def _click_rebet(self, page: Page) -> bool:
         """Short poll — the button can take a moment to render after a bet
         is confirmed."""
@@ -322,13 +345,14 @@ class BetExecutor:
             pass
         return 0.0
 
-    async def _arm_until_confirm(self, page: Page, max_seconds: float = 8.0) -> bool:
+    async def _arm_until_confirm(self, page: Page, watch: MatchWatch,
+                                 max_seconds: float = 8.0) -> bool:
         deadline = time.perf_counter() + max_seconds
         saw_place = False
         while time.perf_counter() < deadline:
             if await self._confirm_visible(page):
                 return True
-            if await self._click_accept_changes(page):
+            if await self._accept_changes_and_retarget(page, watch):
                 continue
             if await self._click_place_bet(page):
                 saw_place = True
@@ -347,7 +371,7 @@ class BetExecutor:
                     w.confirm_armed = True
                 else:
                     w.confirm_armed = False
-                    ok = await self._arm_until_confirm(w.page, 5.0)
+                    ok = await self._arm_until_confirm(w.page, w, 5.0)
                     w.confirm_armed = ok
             except asyncio.CancelledError:
                 raise
@@ -431,18 +455,18 @@ class BetExecutor:
         if not await self._set_stake(page, watch.stake_over):
             self._tg("❌ Stake failed")
             return False
-        await self._click_accept_changes(page)
+        await self._accept_changes_and_retarget(page, watch)
         if not await self._click_place_bet(page):
             self._tg("❌ Place Bet failed")
             return False
 
-        armed = await self._arm_until_confirm(page, 8.0)
+        armed = await self._arm_until_confirm(page, watch, 8.0)
         watch.confirm_armed = armed
         if armed:
-            logger.success(f"[ARM] {watch.active_market} @{odds} stake={watch.stake_over}")
+            logger.success(f"[ARM] {watch.active_market} @{watch.odds_over} stake={watch.stake_over}")
             self._tg(f"✅ ARMED\n{watch.home_team} vs {watch.away_team}\n"
                      f"Score {watch.home_score}-{watch.away_score} | {period}\n"
-                     f"{watch.active_market}\nOdds {odds} | Stake {watch.stake_over}\n"
+                     f"{watch.active_market}\nOdds {watch.odds_over} | Stake {watch.stake_over}\n"
                      f"Waiting for goal → Confirm")
             self._start_confirm_watch(mid, watch)
         else:
@@ -459,10 +483,10 @@ class BetExecutor:
             watch.stake_over = self._stake_for_odds(odds)
         if watch.stake_over > 0:
             await self._set_stake(page, watch.stake_over)
-        await self._click_accept_changes(page)
+        await self._accept_changes_and_retarget(page, watch)
         if not await self._click_place_bet(page):
             return False
-        armed = await self._arm_until_confirm(page, 6.0)
+        armed = await self._arm_until_confirm(page, watch, 6.0)
         watch.confirm_armed = armed
         if armed:
             self._tg(f"🔁 REBET ARMED\n{watch.active_market}\nOdds {watch.odds_over} | "
