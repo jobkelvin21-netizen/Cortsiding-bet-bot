@@ -1,11 +1,10 @@
 """Bet365 WS — same tab only.
-False-idle fixed: only recover when truly stuck (long no-data OR black UI).
-On idle: always navigate fresh to the exact configured live URL — never
-rebuilt from whatever (possibly broken/redirected) address the tab is
-currently on. No Telegram spam.
+Goal: SS change always signals callback (no name/filter block).
+Idle: goto exact LIVE_URL (clear bar + correct link).
 """
 
 import asyncio
+import json
 import re
 import time
 from typing import Callable, Dict, List, Optional
@@ -19,9 +18,8 @@ CDP_URL = "http://127.0.0.1:9222"
 DEFAULT_LIVE = "https://www.bet365.com/#/IP/B1"
 
 KEEPALIVE_SECS = 25
-# Real idle only — football pages can gap without being dead
-STUCK_SECS = 90                 # no DATA for 90s → recover
-STUCK_UI_SECS = 45              # no DATA 45s + black/spinner UI → recover
+STUCK_SECS = 90
+STUCK_UI_SECS = 45
 FAIL_BACKOFF_SECS = 180
 MAX_FAILS_THEN_LONG_PAUSE = 3
 LONG_PAUSE_SECS = 600
@@ -119,11 +117,6 @@ class Bet365Feed:
         return self.matches.get(str(match_id))
 
     def _live_url(self) -> str:
-        """Always the exact configured live URL. Never rebuilt from the
-        tab's current address — a stuck/redirected page (e.g. bet365.nl
-        with a stripped session token) would only produce another broken
-        URL. This is the equivalent of clearing the address bar and
-        typing the correct link fresh every time."""
         return getattr(Config, "BET365_LIVE_URL", None) or DEFAULT_LIVE
 
     async def _announce(self, fi: str, name: str, ss: str):
@@ -180,18 +173,17 @@ class Bet365Feed:
                 prev = self.matches.get(current_fi, {})
                 name = current_na or prev.get("name") or ""
                 ss = current_ss or prev.get("ss") or ""
+                prev_ss = prev.get("ss") or ""
 
                 if name or ss:
-                    changed = prev.get("ss") != ss or prev.get("name") != name
-
                     self.matches[current_fi] = {
                         "source": "bet365",
                         "match_id": current_fi,
-                        "home_team": "",
-                        "away_team": "",
+                        "home_team": prev.get("home_team") or "",
+                        "away_team": prev.get("away_team") or "",
                         "name": name,
-                        "home_score": 0,
-                        "away_score": 0,
+                        "home_score": int(prev.get("home_score") or 0),
+                        "away_score": int(prev.get("away_score") or 0),
                         "ss": ss,
                         "minute": 0,
                         "updated": time.time(),
@@ -202,25 +194,24 @@ class Bet365Feed:
                         self.matches[current_fi]["home_team"] = h
                         self.matches[current_fi]["away_team"] = a
 
-                    if changed and name and _is_probably_football(name):
+                    # Telegram list (filter OK here)
+                    if name and name != prev.get("name") and _is_probably_football(name):
                         asyncio.create_task(self._announce(current_fi, name, ss))
                         logger.info(f"[FOOTBALL] FI={current_fi} {name}")
 
-                    if (
-                        ss
-                        and prev.get("ss")
-                        and ss != prev.get("ss")
-                        and self.callback
-                        and name
-                        and _is_probably_football(name)
-                    ):
+                    # GOAL SIGNAL: any score change on known FI → always callback
+                    # (name/filter NOT required — this was why no ⚽ GOAL)
+                    if ss and prev_ss and ss != prev_ss and self.callback:
                         try:
                             h, a = map(int, ss.split("-"))
                             self.matches[current_fi]["home_score"] = h
                             self.matches[current_fi]["away_score"] = a
                         except Exception:
                             pass
-                        asyncio.create_task(self._safe_cb(self.matches[current_fi]))
+                        logger.info(
+                            f"[GOAL SS] FI={current_fi} {prev_ss} → {ss} {name}"
+                        )
+                        asyncio.create_task(self._safe_cb(dict(self.matches[current_fi])))
 
                 current_na = None
                 current_ss = None
@@ -236,8 +227,8 @@ class Bet365Feed:
             return
         try:
             await self.callback(dict(rec))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"[BET365] callback: {e}")
 
     def _bind_page_handlers(self, page):
         if self._handlers_bound_for is page:
@@ -259,7 +250,6 @@ class Bet365Feed:
 
             def on_frame(ev):
                 self._last_frame_at = time.time()
-                # Any live payload counts as activity (stops false idle)
                 if not self.running or not self._want_run:
                     return
                 try:
@@ -272,7 +262,6 @@ class Bet365Feed:
                     if any(x in text for x in ("NA=", "FI=", "SS=", "OV", "EV;")):
                         self._parse_frame(text)
                     elif len(text) > 20:
-                        # odds/clock frames without NA/FI still = page alive
                         self._last_data_at = time.time()
                 except Exception:
                     pass
@@ -327,7 +316,6 @@ class Bet365Feed:
         return False
 
     async def _should_recover(self) -> bool:
-        """True only when really stuck — not after a short quiet gap."""
         if not self._last_data_at:
             return False
         data_idle = time.time() - self._last_data_at
@@ -342,6 +330,7 @@ class Bet365Feed:
         return False
 
     async def _recover_live(self) -> bool:
+        """Clear stuck page → load exact LIVE_URL (like clearing address bar)."""
         now = time.time()
         if self._reloading:
             return False
@@ -359,36 +348,40 @@ class Bet365Feed:
             self._next_recover_ok_at = now + FAIL_BACKOFF_SECS
             return False
 
-        live = self._live_url()
+        live = self._live_url()  # always https://www.bet365.com/#/IP/B1
         self._reloading = True
         self._got_403 = False
         self._last_recover_at = now
         marker = self._last_data_at or 0.0
 
         try:
-            logger.warning(f"[BET365] real idle → fresh load {live}")
+            logger.warning(f"[BET365] idle → clear URL → {live}")
             if self._fail_streak == 0:
-                await self._tg(f"🔄 Bet365 idle → reloading {live}")
+                await self._tg(f"🔄 Bet365 idle → {live}")
 
+            # Force re-bind after navigation
+            self._handlers_bound_for = None
             self._bind_page_handlers(page)
             try:
                 await page.bring_to_front()
             except Exception:
                 pass
 
-            # Equivalent of clearing the address bar and typing the
-            # correct link fresh: always navigate straight to the exact
-            # canonical URL, never patch/rebuild whatever (possibly
-            # broken/redirected) address the tab is currently stuck on.
-            # Playwright can't click Chrome's real address bar (it's
-            # outside the page content it automates) — a direct goto()
-            # is the reliable equivalent, with a plain-load fallback if
-            # the fast "commit" navigation itself throws.
+            # Clear address bar equivalent: navigate to exact URL
             try:
                 await page.goto(live, wait_until="commit", timeout=15000)
             except Exception as e:
-                logger.warning(f"[BET365] goto commit failed, retrying plain load: {e}")
-                await page.goto(live, timeout=15000)
+                logger.warning(f"[BET365] goto commit fail: {e}")
+                try:
+                    await page.evaluate(f"window.location.href = {json.dumps(live)}")
+                    await asyncio.sleep(1.5)
+                except Exception:
+                    await page.goto(live, timeout=15000)
+
+            try:
+                await page.evaluate("() => { location.hash = '#/IP/B1'; }")
+            except Exception:
+                pass
 
             if self._got_403:
                 await self._tg("⚠️ Bet365 403 — change VPN")
@@ -400,7 +393,7 @@ class Bet365Feed:
             deadline = time.time() + DATA_WAIT_SECS
             while time.time() < deadline:
                 if self._last_data_at and self._last_data_at > marker:
-                    logger.success("[BET365] data after fresh load")
+                    logger.success("[BET365] data after fresh URL")
                     self._fail_streak = 0
                     self._told_fail = False
                     self._next_recover_ok_at = 0.0
@@ -511,6 +504,7 @@ class Bet365Feed:
         except Exception:
             pass
 
+        self._handlers_bound_for = None
         self._bind_page_handlers(page)
 
         try:
@@ -531,11 +525,11 @@ class Bet365Feed:
         self._last_message_at = now
         self._last_frame_at = now
         self._last_data_at = now
-        logger.success("[BET365] UP — false-idle fixed + fast recover")
+        logger.success("[BET365] UP — goal SS always signals")
         await self._tg(
             "✅ Bet365 ON\n"
             f"Live: {self._live_url()}\n"
-            "Recover only if really stuck (90s / black UI)"
+            "Goal = any SS change on locked FI"
         )
 
         if not self._keepalive_task or self._keepalive_task.done():
