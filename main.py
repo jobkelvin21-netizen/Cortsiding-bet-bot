@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Telegram control; Bet365 goal fires Confirm on SportyBet; one game at a time."""
+"""Telegram control; Bet365 goal → SportyBet API place+rebet (scoring team); cashout on drop."""
 
 import asyncio
-import os
+import getpass
 import re
 import sys
 from typing import Optional
@@ -11,13 +11,15 @@ from loguru import logger
 
 from config import Config
 from feeds.bet365_ws import Bet365Feed
+from feeds.sportybet_client import SportyBetClient
 from core.executor import BetExecutor, BetResult
 from utils.telegram import TelegramAlerter, TelegramCommandHandler
 from utils.account_manager import AccountManager
 
 logger.remove()
 logger.add(
-    sys.stderr, level="INFO",
+    sys.stderr,
+    level="INFO",
     format="<green>{time:HH:mm:ss}</green> | <level>{level: <7}</level> | {message}",
 )
 
@@ -27,12 +29,18 @@ def _fi(raw: str) -> str:
     return m.group(1) if m else ""
 
 
+def _event_id_from_url(url: str) -> str:
+    m = re.search(r"(sr:match:\d+)", url or "")
+    return m.group(1) if m else ""
+
+
 class ArbitrageBot:
     def __init__(self):
         self.account_manager = AccountManager()
         self.alerter = TelegramAlerter()
         self.bet365 = Bet365Feed()
         self.bet365.set_alerter(self.alerter)
+        self.sb = SportyBetClient()
         self.executor: Optional[BetExecutor] = None
         self.match_pages = {}
         self._processing = {}
@@ -49,58 +57,39 @@ class ArbitrageBot:
         self._bot_active = False
         self._parked = None
         self._ht_task: Optional[asyncio.Task] = None
+        self._arm_task: Optional[asyncio.Task] = None
+        self._arms = {}
+        self.balance = 0.0
 
     async def terminal_login(self):
-        print("SPORTYBET LOGIN")
-        phone = input("Phone: ")
-        password = input("Password: ")
-        await self._do_login(phone, password)
-        bal = float(input("Balance: "))
+        print("SPORTYBET LOGIN (not saved to any file)")
+        print(f"Hard cap profit: ₦{Config.MAX_PROFIT_PER_BET}")
+        phone = input("Phone: ").strip()
+        password = getpass.getpass("Password: ").strip()
+        ok = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self.sb.login(phone, password)
+        )
+        password = ""
+        if not ok:
+            raise RuntimeError("SportyBet API login failed")
+        bal = float(input("Balance (NGN): ").strip() or "0")
         await self._finish_setup(bal)
 
     async def telegram_login(self, phone: str, password: str):
-        await self.alerter.send("🔐 Logging in...")
+        await self.alerter.send("Logging in (API, memory only)...")
         try:
-            await self._do_login(phone, password)
-            await self.alerter.send("✅ Login OK — send /balance AMOUNT then /startbot")
+            ok = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.sb.login(phone, password)
+            )
+            if not ok:
+                await self.alerter.send("Login failed")
+                return
+            await self.alerter.send("Login OK — send /balance AMOUNT then /startbot")
         except Exception as e:
-            await self.alerter.send(f"❌ {e}")
-
-    async def _do_login(self, phone: str, password: str):
-        from playwright.async_api import async_playwright
-
-        self.playwright = await async_playwright().start()
-        profile = os.path.abspath("chrome_profile_sporty")
-        os.makedirs(profile, exist_ok=True)
-        self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=profile,
-            channel="chrome",
-            headless=False,
-            no_viewport=True,
-            locale="en-NG",
-            ignore_default_args=["--enable-automation"],
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--start-maximized",
-                "--disable-features=ChromeWhatsNewUI,InfiniteSessionRestore",
-            ],
-        )
-        page = self.context.pages[0] if self.context.pages else await self.context.new_page()
-        await page.goto("https://www.sportybet.com/ng/", wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(2)
-        try:
-            await page.click('button:has-text("Log In"), a:has-text("Log In")', timeout=5000)
-            await asyncio.sleep(1)
-        except Exception:
-            pass
-        await page.fill('input[name="phone"], input[type="tel"]', phone)
-        await page.fill('input[name="psd"], input[type="password"]', password)
-        await page.click('button[name="logIn"], button:has-text("Log In")')
-        await asyncio.sleep(5)
+            await self.alerter.send(f"{e}")
 
     async def _finish_setup(self, balance: float):
+        self.balance = float(balance)
         self.executor = BetExecutor(self.alerter)
         self.executor.balance = balance
         self.executor.current_account = self.account_manager.get_active()
@@ -109,7 +98,10 @@ class ArbitrageBot:
 
     async def handle_balance(self, amount: float):
         if self._logged_in:
-            await self.alerter.send("Already logged in")
+            self.balance = float(amount)
+            if self.executor:
+                self.executor.balance = self.balance
+            await self.alerter.send(f"Balance set ₦{amount:,.2f}")
             return
         await self._finish_setup(amount)
 
@@ -122,7 +114,7 @@ class ArbitrageBot:
 
     async def start_bot(self):
         if not self._logged_in:
-            await self.alerter.send("❌ Login + balance first")
+            await self.alerter.send("Login + balance first")
             return
         if self._bot_active:
             await self.alerter.send("Already running — /stopbot first")
@@ -153,17 +145,22 @@ class ArbitrageBot:
             if total > self._current_total_goals:
                 home = self._manual_slow_match.get("home", "")
                 away = self._manual_slow_match.get("away", "")
-                scoring = home if new_score[0] > self._last_score[0] else away
+                if new_score[0] > self._last_score[0]:
+                    scoring, side = home, "home"
+                else:
+                    scoring, side = away, "away"
                 self._last_score, self._current_total_goals = new_score, total
-                asyncio.create_task(self._handle_goal_and_rearm(scoring, h, a, total))
+                asyncio.create_task(
+                    self._handle_goal_and_rearm(scoring, side, h, a, total)
+                )
 
         self.bet365.set_callback(bet365_callback)
         await self.bet365.start()
-        logger.info("[START] bot active")
+        logger.info("[START] bot active (API place on goal)")
         await self.alerter.send(
-            "🟢 <b>BOT STARTED</b>\n"
+            "BOT STARTED\n"
             "Send /slow with SportyBet URL + FI\n"
-            "Pure-code Over arm — Confirm only on Bet365 goal"
+            f"API place+rebet — hard cap ₦{Config.MAX_PROFIT_PER_BET}"
         )
 
     async def stop_bot(self):
@@ -172,6 +169,8 @@ class ArbitrageBot:
             await self.bet365.stop()
         except Exception as e:
             logger.error(f"stop feed: {e}")
+        if self._arm_task and not self._arm_task.done():
+            self._arm_task.cancel()
         if self._manual_slow_match:
             mid = self._manual_slow_match.get("match_id")
             if mid and self.executor:
@@ -186,10 +185,13 @@ class ArbitrageBot:
         self._has_open_bet = False
         self._rearming = False
         self._awaiting_switch_decision = False
+        self._arms = {}
         logger.info("[STOP] bot inactive")
-        await self.alerter.send("🛑 <b>BOT STOPPED</b>\n/startbot to run again")
+        await self.alerter.send("BOT STOPPED\n/startbot to run again")
 
     async def clear_slow(self):
+        if self._arm_task and not self._arm_task.done():
+            self._arm_task.cancel()
         if self._manual_slow_match:
             mid = self._manual_slow_match.get("match_id")
             if mid and self.executor:
@@ -210,95 +212,114 @@ class ArbitrageBot:
         self._current_total_goals = 0
         self._has_open_bet = False
         self._rearming = False
-        await self.alerter.send("🧹 Slow cleared — tab closed, state wiped")
+        self._arms = {}
+        await self.alerter.send("Slow cleared — state wiped")
 
     async def _handle_disallowed(self, home_score, away_score, total_goals):
         if not self._bot_active or not self._manual_slow_match:
             return
-        mid = self._manual_slow_match.get("match_id")
-        if not mid or mid not in self.match_pages or self._processing.get(mid):
+        mid = self._manual_slow_match.get("match_id") or "api"
+        if self._processing.get(mid):
             return
         self._processing[mid] = True
         self._rearming = True
         try:
             teams = self._manual_slow_match.get("teams", "Match")
-            page = self.match_pages.get(mid)
-            if not page or page.is_closed():
-                return
-            await self.alerter.send(f"🚫 GOAL CANCELLED {teams} {home_score}-{away_score}")
-            await self.executor.cashout_disallowed(
-                page, description=f"{teams} {home_score}-{away_score}")
-            self._has_open_bet = False
-            self.executor.stop_watching(mid)
-            await asyncio.sleep(1.0)
-            if not self._manual_slow_match:
-                return
-            self.executor.start_watching(
-                mid, page,
-                self._manual_slow_match.get("home", ""),
-                self._manual_slow_match.get("away", ""),
-                home_score=home_score, away_score=away_score,
+            await self.alerter.send(
+                f"GOAL CANCELLED {teams} {home_score}-{away_score}\nCashout API…"
             )
+            out = await asyncio.get_event_loop().run_in_executor(
+                None, self.sb.cashout_latest_open
+            )
+            ok = out.get("bizCode") == 10000
+            await self.alerter.send(
+                "CASHOUT SUCCESS" if ok else f"CASHOUT FAIL\n{out}"
+            )
+            self._has_open_bet = False
         except Exception as e:
-            await self.alerter.send(f"❌ {e}")
+            await self.alerter.send(f"{e}")
         finally:
             self._processing[mid] = False
             self._rearming = False
 
-    async def _handle_goal_and_rearm(self, scoring_team, home_score, away_score, total_goals):
+    async def _handle_goal_and_rearm(
+        self, scoring_team, side, home_score, away_score, total_goals
+    ):
         if not self._bot_active or not self._manual_slow_match:
             return
-        mid = self._manual_slow_match.get("match_id")
+        mid = self._manual_slow_match.get("match_id") or "api"
         locked_fi = str(self._manual_slow_match.get("bet365_id") or "")
-        if not mid or mid not in self.match_pages or self._processing.get(mid):
+        if self._processing.get(mid):
             return
         self._processing[mid] = True
         self._rearming = True
         try:
-            page = self.match_pages.get(mid)
             teams = self._manual_slow_match.get("teams", "Match")
-            if not page or page.is_closed():
-                await self.alerter.send("❌ Page closed")
-                return
-
-            if await self.executor._is_suspended(page):
-                self.executor.stop_watching(mid)
-                self._manual_slow_match = None
+            arm = self._arms.get(side)
+            if not arm:
+                event_id = self._manual_slow_match.get("event_id") or ""
+                if event_id:
+                    arms = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: self.sb.arm_next_goal_both(event_id)
+                    )
+                    self._arms.update(arms)
+                    arm = self._arms.get(side)
+            if not arm:
                 await self.alerter.send(
-                    f"⛔ SUSPENDED on goal\n{teams}\nFI={locked_fi}\nStopped — will NOT switch market")
+                    f"GOAL {home_score}-{away_score} — {scoring_team}\n"
+                    f"No next-goal market armed for {side}"
+                )
                 return
 
-            await self.alerter.send(f"⚽ GOAL {teams} — {scoring_team} | {home_score}-{away_score}")
+            stake = self.sb.stake_for_odds(arm.odds, self.balance)
+            await self.alerter.send(
+                f"GOAL {teams} — {scoring_team} ({side}) | {home_score}-{away_score}\n"
+                f"{arm.market_name} / {arm.outcome_name} @ {arm.odds}\n"
+                f"Stake ₦{stake} (cap ₦{Config.MAX_PROFIT_PER_BET})"
+            )
 
-            result = await self.executor.confirm_goal_click(mid)
-
-            if result == BetResult.SUCCESS:
+            results = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.sb.place_and_rebet(arm, stake)
+            )
+            ok_n = sum(1 for r in results if r.get("bizCode") == 10000)
+            if ok_n:
                 self._has_open_bet = True
-            elif result == BetResult.ABORTED_SAFETY:
-                return
+                await self.alerter.notify_bet_placed(
+                    teams, scoring_team, stake, arm.odds, locked_fi, ok_n, len(results)
+                )
             else:
-                ok = await self.executor._click_confirm(page)
-                if ok:
-                    self._has_open_bet = True
-                    await self.alerter.send("✅ BET CONFIRMED (retry)")
-                else:
-                    self.executor.stop_watching(mid)
-                    self._manual_slow_match = None
-                    await self.alerter.send(f"❌ Confirm failed / locked\n{teams}\nStopped watching")
+                await self.alerter.send(
+                    f"BET FAILED 0/{len(results)}\n{results[-1] if results else ''}"
+                )
         except Exception as e:
-            await self.alerter.send(f"❌ {e}")
+            await self.alerter.send(f"{e}")
         finally:
             self._processing[mid] = False
             self._rearming = False
 
+    async def _arm_loop(self, event_id: str):
+        while self._bot_active and self._manual_slow_match:
+            try:
+                arms = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.sb.arm_next_goal_both(event_id)
+                )
+                if arms:
+                    self._arms = arms
+                    h = arms.get("home")
+                    a = arms.get("away")
+                    logger.info(
+                        f"[ARM] H@{getattr(h, 'odds', '—')} A@{getattr(a, 'odds', '—')}"
+                    )
+            except Exception as e:
+                logger.debug(f"[ARM] {e}")
+            await asyncio.sleep(2.0)
+
     async def handle_slow_game(self, sporty_url: str, bet365_id: str, teams: str):
-        """Runs as a background task from TelegramCommandHandler, so
-        /stopbot and /clear stay responsive while this (up to ~90s) runs."""
         if not self._logged_in:
-            await self.alerter.send("❌ Login first")
+            await self.alerter.send("Login first")
             return
         if not self._bot_active:
-            await self.alerter.send("❌ Send /startbot first")
+            await self.alerter.send("Send /startbot first")
             return
 
         if self._awaiting_switch_decision:
@@ -306,14 +327,15 @@ class ArbitrageBot:
             self._previous_ht_match = None
             await self._close_parked()
 
+        if self._arm_task and not self._arm_task.done():
+            self._arm_task.cancel()
+
         if self._manual_slow_match:
             old_mid = self._manual_slow_match.get("match_id")
-            old_watch = self.executor.get_watch(old_mid) if old_mid else None
-            if old_watch and old_watch.period == "HT":
-                await self._park(self._manual_slow_match)
-            elif old_mid:
+            if old_mid:
                 try:
-                    await self.executor.clear_match(old_mid)
+                    if self.executor:
+                        await self.executor.clear_match(old_mid)
                 except Exception:
                     await self._close_match_page(old_mid)
 
@@ -321,10 +343,16 @@ class ArbitrageBot:
         self._current_total_goals = 0
         self._rearming = False
         self._has_open_bet = False
+        self._arms = {}
 
         b365 = _fi(bet365_id)
         if not b365:
-            await self.alerter.send("❌ Need numeric FI")
+            await self.alerter.send("Need numeric FI")
+            return
+
+        event_id = _event_id_from_url(sporty_url)
+        if not event_id:
+            await self.alerter.send("SportyBet URL must contain sr:match:ID")
             return
 
         home, away = teams, ""
@@ -335,7 +363,7 @@ class ArbitrageBot:
             p = re.split(r"\s+v\s+", teams, flags=re.I, maxsplit=1)
             home, away = p[0].strip(), p[1].strip()
 
-        rec = self.bet365.get_match(b365)
+        rec = self.bet365.get_match(b365) if hasattr(self.bet365, "get_match") else None
         if rec and rec.get("ss"):
             try:
                 h, a = map(int, str(rec["ss"]).split("-"))
@@ -344,150 +372,45 @@ class ArbitrageBot:
             except Exception:
                 pass
 
+        mid = f"api_{b365}"
         self._manual_slow_match = {
-            "url": sporty_url.strip(), "bet365_id": b365, "teams": teams,
-            "home": home, "away": away,
+            "url": sporty_url.strip(),
+            "bet365_id": b365,
+            "teams": teams,
+            "home": home,
+            "away": away,
+            "match_id": mid,
+            "event_id": event_id,
         }
         await self.alerter.notify_manual_slow_set(teams, b365)
-        try:
-            ok = await self._open_and_arm(self._manual_slow_match)
-            await self.alerter.send(f"✅ Armed FI={b365}" if ok else "❌ Open/arm failed — NOT watching")
-            if not ok:
-                self._manual_slow_match = None
-        except Exception as e:
-            self._manual_slow_match = None
-            await self.alerter.send(f"❌ {e}")
 
-    async def _open_and_arm(self, slow: dict) -> bool:
-        url = slow["url"]
-        home = slow.get("home", "")
-        away = slow.get("away", "")
-        mid = f"manual_{abs(hash(url)) % 10_000_000}"
-        slow["match_id"] = mid
-
-        page = await self.context.new_page()
-        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        await asyncio.sleep(2.0)
-
-        for loc in (
-            page.locator("div.m-nav-item").get_by_text("All", exact=True),
-            page.locator("[role='tab']").get_by_text("All", exact=True),
-        ):
-            try:
-                if await loc.count() > 0:
-                    await loc.first.click(timeout=1500)
-                    await asyncio.sleep(0.5)
-                    break
-            except Exception:
-                continue
-
-        for _ in range(15):
-            try:
-                body = (await page.inner_text("body", timeout=2000) or "").lower()
-                if home.lower()[:6] in body or away.lower()[:6] in body or "over" in body:
-                    break
-            except Exception:
-                pass
-            await asyncio.sleep(1.0)
-
-        self.match_pages[mid] = page
-        hs = self._last_score[0] if self._last_score else 0
-        aws = self._last_score[1] if self._last_score else 0
-
-        watch = self.executor.start_watching(mid, page, home, away, home_score=hs, away_score=aws)
-        for _ in range(90):
-            if mid not in self.executor.watches:
-                return False
-            if watch.confirm_armed:
-                return True
-            await asyncio.sleep(1.0)
-        return watch.confirm_armed
+        self._arm_task = asyncio.create_task(self._arm_loop(event_id))
+        await asyncio.sleep(2.5)
+        h = self._arms.get("home")
+        a = self._arms.get("away")
+        await self.alerter.send(
+            f"LOCKED FI={b365}\n{event_id}\n{home} vs {away}\n"
+            f"Next goal Home@{getattr(h, 'odds', '—')} Away@{getattr(a, 'odds', '—')}\n"
+            f"Cap ₦{Config.MAX_PROFIT_PER_BET}"
+        )
 
     async def _park(self, info: dict):
-        mid = info.get("match_id")
-        page = await self.executor.park_match(mid)
-        self.match_pages.pop(mid, None)
-        if not page or page.is_closed():
-            return
-        await self._close_parked()
-        self._parked = dict(info)
-        self._parked["page"] = page
-        self._ht_task = asyncio.create_task(self._poll_parked())
-        await self.alerter.send(f"⏸ {info.get('teams', 'Match')} parked at half-time.\n"
-                                f"I'll ask if you want it back when the 2nd half starts.")
+        await self.alerter.send(
+            f"{info.get('teams', 'Match')} HT — send new /slow or wait"
+        )
 
     async def _poll_parked(self):
-        try:
-            while self._parked:
-                p = self._parked
-                page = p["page"]
-                if page.is_closed():
-                    self._parked = None
-                    return
-                if await self.executor.detect_period(page) == "2H":
-                    self._previous_ht_match = dict(p)
-                    self._awaiting_switch_decision = True
-                    await self.alerter.send(
-                        f"🔄 {p.get('teams', 'Old match')} is back for the 2nd half.\n"
-                        f"Reply yes or no")
-                    return
-                await asyncio.sleep(5.0)
-        except asyncio.CancelledError:
-            pass
+        return
 
     async def _close_parked(self):
-        p, self._parked = self._parked, None
+        self._parked = None
         if self._ht_task and not self._ht_task.done():
             self._ht_task.cancel()
         self._ht_task = None
-        if p:
-            try:
-                if not p["page"].is_closed():
-                    await p["page"].close()
-            except Exception:
-                pass
 
     async def handle_switch_decision(self, decision: str):
-        if not self._awaiting_switch_decision:
-            return
         self._awaiting_switch_decision = False
-        old, self._previous_ht_match = self._previous_ht_match, None
-
-        if decision == "yes" and old and not old["page"].is_closed():
-            if self._manual_slow_match:
-                cur_mid = self._manual_slow_match.get("match_id")
-                if cur_mid:
-                    try:
-                        await self.executor.clear_match(cur_mid)
-                    except Exception:
-                        await self._close_match_page(cur_mid)
-
-            self._parked = None
-            if self._ht_task and not self._ht_task.done():
-                self._ht_task.cancel()
-            self._ht_task = None
-
-            page, mid = old["page"], old["match_id"]
-            self.match_pages[mid] = page
-            self._manual_slow_match = {k: v for k, v in old.items() if k != "page"}
-            self._last_score = None
-            self._current_total_goals = 0
-            self._has_open_bet = False
-
-            watch = self.executor.start_watching(
-                mid, page, old.get("home", ""), old.get("away", ""))
-            ok = False
-            for _ in range(90):
-                if mid not in self.executor.watches:
-                    break
-                if watch.confirm_armed:
-                    ok = True
-                    break
-                await asyncio.sleep(1.0)
-            await self.alerter.send("✅ Switched back and armed" if ok else "⚠️ Switched back but arming failed")
-        else:
-            await self.alerter.send("Staying on the current match")
-            await self._close_parked()
+        await self.alerter.send("Staying / switch ignored in API mode")
 
     async def _close_match_page(self, mid: str):
         page = self.match_pages.pop(mid, None)
@@ -505,8 +428,11 @@ class ArbitrageBot:
 
     def stop(self):
         self._bot_active = False
-        self.bet365._want_run = False
-        self.bet365.running = False
+        try:
+            self.bet365._want_run = False
+            self.bet365.running = False
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
