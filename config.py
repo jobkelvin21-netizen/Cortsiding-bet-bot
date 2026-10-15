@@ -8,7 +8,8 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-    MAX_PROFIT_PER_BET = float(os.getenv("MAX_PROFIT_PER_BET", "7800"))
+    MAX_PROFIT_PER_BET = float(os.getenv("MAX_PROFIT_PER_BET", "9500"))
+    MAX_REBET = int(os.getenv("MAX_REBET", "3"))
     SUBMISSION_TIMEOUT = int(os.getenv("SUBMISSION_TIMEOUT", "5"))
     MAX_CONSECUTIVE_SLOW = int(os.getenv("MAX_CONSECUTIVE_SLOW", "2"))
     ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "auto")
@@ -20,7 +21,6 @@ class Config:
     POLYMARKET_WS_URL = "wss://sports-api.polymarket.com/ws"
     BET365_LIVE_URL = os.getenv("BET365_LIVE_URL", "https://www.bet365.com/#/IP/B1")
 
-    # Ticker slow (AI frontends) — default 3s as agreed
     SLOW_LAG_SECONDS = float(os.getenv("SLOW_LAG_SECONDS", "3"))
     SLOW_THRESHOLD_SECONDS = float(os.getenv("SLOW_THRESHOLD_SECONDS", "3"))
     SLOW_MIN_MINUTE = int(os.getenv("SLOW_MIN_MINUTE", "0"))
@@ -46,8 +46,6 @@ class Config:
     TEST_MODE = os.getenv("TEST_MODE", "false").lower() in ("1", "true", "yes")
     TEST_DURATION_HOURS = float(os.getenv("TEST_DURATION_HOURS", "2"))
 
-    # Groq
     GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
     GROQ_VISION_MODEL = "qwen/qwen3.8-27b"
     GROQ_TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "openai/gpt-oss-20b")
-    
