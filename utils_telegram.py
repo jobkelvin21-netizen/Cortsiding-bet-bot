@@ -57,10 +57,12 @@ class TelegramAlerter:
 
     async def notify_startup(self, balance: float):
         await self.send(
-            f"💰 <b>LOGGED IN</b>\nBalance: <b>₦{balance:,.2f}</b>\n\n"
-            f"<code>/startbot</code> — start everything\n"
-            f"<code>/stopbot</code> — stop everything\n"
-            f"<code>/clear</code> — unlock slow\n\n"
+            f"💰 <b>LOGGED IN</b>\n"
+            f"Balance: <b>₦{balance:,.2f}</b>\n"
+            f"Hard cap: <b>₦{Config.MAX_PROFIT_PER_BET:,.0f}</b>\n\n"
+            f"<code>/startbot</code> — start\n"
+            f"<code>/stopbot</code> — stop\n"
+            f"<code>/clear</code>\n\n"
             f"<code>/slow</code>\n"
             f"<code>SportyBet- URL</code>\n"
             f"<code>Bet365- FI</code>\n"
@@ -69,7 +71,7 @@ class TelegramAlerter:
 
     async def notify_goal_detected(self, match_name, team, odds, goal_num):
         await self.send(
-            f"⚡ <b>GOAL</b>\n⚽ {match_name}\n🎯 #{goal_num} {team}\n⏳ Confirm..."
+            f"⚡ <b>GOAL</b>\n⚽ {match_name}\n🎯 #{goal_num} {team}\n⏳ Placing…"
         )
 
     async def notify_bet_placed(
@@ -78,7 +80,8 @@ class TelegramAlerter:
         self.total_bets += 1
         self.total_staked += stake
         await self.send(
-            f"✅ <b>BET PLACED</b>\n⚽ {match_name}\n🎯 {team}\n"
+            f"✅ <b>BET SUCCESS</b> {stack_num}/{total_stack}\n"
+            f"⚽ {match_name}\n🎯 {team}\n"
             f"💵 ₦{stake:,.2f} @ {odds}\n🆔 <code>{bet_id}</code>"
         )
 
@@ -167,6 +170,7 @@ class TelegramCommandHandler:
         if low in ("/start", "start", "/help", "help"):
             await self.alerter.send(
                 "🟢 <b>Courtside</b>\n"
+                f"Hard cap ₦{Config.MAX_PROFIT_PER_BET:,.0f}\n"
                 "<code>/startbot</code> start all\n"
                 "<code>/stopbot</code> stop all\n"
                 "<code>/clear</code>\n"
@@ -202,8 +206,6 @@ class TelegramCommandHandler:
             return
 
         if low.startswith("/slow") or low.startswith("slow"):
-            # Arming can take up to ~90s (page load + market scan). Run it
-            # in the background so /stopbot and /clear stay responsive.
             asyncio.create_task(self._handle_slow(text))
             return
 
