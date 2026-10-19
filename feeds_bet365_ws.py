@@ -1,14 +1,4 @@
-"""Bet365 live score feed.
-
-Starts its own headful Chrome, attaches by CDP, watches score frames.
-watch(FI) → one event per change:
-
-  {"event": "goal",       "scorer": "home"|"away", "goal_no": N, ...}
-  {"event": "disallowed", ...}
-
-Also queues FI + name to Telegram as matches appear (and full list via send_full_match_list).
-Stall → restart browser (fresh profile).
-"""
+"""Bet365 live feed: goals for watched FI + Telegram FI/name list (once per FI per day)."""
 import asyncio
 import os
 import re
@@ -16,10 +6,10 @@ import shutil
 import subprocess
 import time
 import urllib.request
+from datetime import date
 from typing import Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
-
 from config import Config
 
 CHROME = os.getenv("BET365_CHROME", "/usr/bin/google-chrome")
@@ -42,8 +32,6 @@ HAS_VS = re.compile(r"\bv\b|\bvs\b|@", re.I)
 
 
 class ScoreTracker:
-    """Keeps last score per fixture; feed() returns scores that CHANGED."""
-
     def __init__(self):
         self.state: Dict[str, dict] = {}
 
@@ -72,8 +60,7 @@ class ScoreTracker:
                 prev = self.state.get(cur_fi) or {}
                 name = cur_na or prev.get("name", "")
                 ss = cur_ss or prev.get("ss", "")
-                h = prev.get("h")
-                a = prev.get("a")
+                h, a = prev.get("h"), prev.get("a")
                 if cur_ss:
                     try:
                         h, a = map(int, cur_ss.split("-"))
@@ -83,11 +70,7 @@ class ScoreTracker:
                 if cur_ss and prev.get("ss") and prev["ss"] != cur_ss:
                     changes.append((cur_fi, prev["h"], prev["a"], h, a, name))
                 self.state[cur_fi] = {
-                    "name": name,
-                    "ss": ss,
-                    "h": h,
-                    "a": a,
-                    "updated": time.time(),
+                    "name": name, "ss": ss, "h": h, "a": a, "updated": time.time()
                 }
                 cur_na = cur_ss = None
         return changes
@@ -100,8 +83,7 @@ class Bet365Feed:
         self.tracker = ScoreTracker()
         self.running = False
         self._want_run = False
-        self._task: Optional[asyncio.Task] = None
-        self._list_task: Optional[asyncio.Task] = None
+        self._task = self._list_task = None
         self._watch: Optional[str] = None
         self._goals_seen: set = set()
         self._last_data_at: Optional[float] = None
@@ -109,8 +91,10 @@ class Bet365Feed:
         self._pw = self._browser = self._page = self._proc = None
         self._profile: Optional[str] = None
         self._cooldown = 0.0
+        self._announced_day: Optional[str] = None
         self._announced: set = set()
         self._pending_tg: List[str] = []
+        self._initial_dump_done = False
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -141,29 +125,46 @@ class Bet365Feed:
 
     def is_healthy(self) -> bool:
         return bool(
-            self.running
-            and self._last_data_at
-            and time.time() - self._last_data_at < 120
+            self.running and self._last_data_at and time.time() - self._last_data_at < 120
         )
 
+    def _roll_day(self):
+        today = date.today().isoformat()
+        if self._announced_day != today:
+            self._announced_day = today
+            self._announced.clear()
+            self._initial_dump_done = False
+
     def _queue_match_line(self, fi: str, name: str, ss: str):
-        if not name or not fi or fi in self._announced:
+        self._roll_day()
+        if not fi or not name or fi in self._announced:
             return
         if not HAS_VS.search(name) and " v " not in name.lower():
             return
         self._announced.add(fi)
         self._pending_tg.append(f"<code>{fi}</code>  {ss or '?'}  {name}")
 
+    def _queue_all_current(self):
+        self._roll_day()
+        for fi, s in sorted(
+            self.tracker.state.items(), key=lambda x: (x[1].get("name") or "")
+        ):
+            self._queue_match_line(fi, s.get("name") or "", s.get("ss") or "")
+
     async def _list_flusher(self):
         while self._want_run:
             await asyncio.sleep(LIST_FLUSH_SECS)
+            if not self._initial_dump_done and self.running and self.tracker.state:
+                self._queue_all_current()
+                self._initial_dump_done = True
             if not self._pending_tg or not self.alerter:
                 continue
             chunk = self._pending_tg[:40]
             del self._pending_tg[:40]
-            text = "📋 <b>Bet365 live (FI + name)</b>\n" + "\n".join(chunk)
             try:
-                await self.alerter.send(text)
+                await self.alerter.send(
+                    "📋 <b>Bet365 live (FI + name)</b>\n" + "\n".join(chunk)
+                )
             except Exception:
                 pass
 
@@ -181,9 +182,7 @@ class Bet365Feed:
                 continue
             rows.append(f"<code>{fi}</code>  {s.get('ss') or '?'}  {name}")
         if not rows:
-            await self.alerter.send(
-                "No named matches yet — wait until Bet365 feed is UP"
-            )
+            await self.alerter.send("No named matches yet — wait for Bet365 feed UP")
             return
         for i in range(0, len(rows), 40):
             await self.alerter.send(
@@ -261,7 +260,7 @@ class Bet365Feed:
                 )
                 if not scorer:
                     logger.warning(
-                        f"[BET365] goal but scorer unclear {ph}-{pa} -> {h}-{a}"
+                        f"[BET365] goal scorer unclear {ph}-{pa} -> {h}-{a}"
                     )
                     continue
                 self._goals_seen.add(t)
@@ -297,6 +296,27 @@ class Bet365Feed:
             f"[BET365] {evt['event']} {evt.get('scorer', '')} "
             f"{evt['prev_ss']} -> {evt['ss']}"
         )
+        # Locked FI → Telegram immediately
+        if self.alerter and evt.get("event") in ("goal", "disallowed"):
+            try:
+                loop = asyncio.get_running_loop()
+                if evt["event"] == "goal":
+                    msg = (
+                        f"⚡ <b>GOAL</b> FI=<code>{evt.get('match_id')}</code>\n"
+                        f"⚽ {evt.get('name') or '?'}\n"
+                        f"🎯 {evt.get('scorer')}  {evt.get('prev_ss')} → {evt.get('ss')}\n"
+                        f"#{evt.get('goal_no')}"
+                    )
+                else:
+                    msg = (
+                        f"🚫 <b>DISALLOWED</b> FI=<code>{evt.get('match_id')}</code>\n"
+                        f"⚽ {evt.get('name') or '?'}\n"
+                        f"{evt.get('prev_ss')} → {evt.get('ss')}"
+                    )
+                loop.create_task(self.alerter.send(msg))
+            except Exception as e:
+                logger.error(f"[BET365] tg goal: {e}")
+
         if not self.callback:
             return
         try:
