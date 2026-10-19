@@ -62,7 +62,8 @@ class TelegramAlerter:
             f"Hard cap: <b>₦{Config.MAX_PROFIT_PER_BET:,.0f}</b>\n\n"
             f"<code>/startbot</code> — start\n"
             f"<code>/stopbot</code> — stop\n"
-            f"<code>/clear</code>\n\n"
+            f"<code>/clear</code>\n"
+            f"<code>/matches</code> — Bet365 FI + names\n\n"
             f"<code>/slow</code>\n"
             f"<code>SportyBet- URL</code>\n"
             f"<code>Bet365- FI</code>\n"
@@ -149,6 +150,7 @@ class TelegramCommandHandler:
                 "<code>/startbot</code>\n"
                 "<code>/stopbot</code>\n"
                 "<code>/clear</code>\n"
+                "<code>/matches</code> — Bet365 FI + names\n"
                 "<code>/slow</code> + SportyBet + Bet365 FI + Teams"
             )
             return
@@ -163,6 +165,15 @@ class TelegramCommandHandler:
 
         if low in ("/clear", "clear"):
             await self.bot.clear_slow()
+            return
+
+        if low in ("/matches", "matches", "/list", "list"):
+            if hasattr(self.bot, "bet365") and hasattr(
+                self.bot.bet365, "send_full_match_list"
+            ):
+                await self.bot.bet365.send_full_match_list()
+            else:
+                await self.alerter.send("Match list not available")
             return
 
         if low.startswith("/login ") or low.startswith("login "):
