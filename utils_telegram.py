@@ -85,33 +85,8 @@ class TelegramAlerter:
             f"💵 ₦{stake:,.2f} @ {odds}\n🆔 <code>{bet_id}</code>"
         )
 
-    async def notify_submission_slow(self, match_name, reason, elapsed_seconds):
-        self.slow_submissions += 1
-        await self.send(
-            f"🐌 <b>SLOW SUBMISSION</b>\n⚽ {match_name}\n"
-            f"⏱ {elapsed_seconds:.1f}s\n📝 {reason}"
-        )
-
-    async def notify_account_flagged(self, username: str):
-        await self.send(f"⚠️ <b>ACCOUNT FLAGGED</b>\n{username}")
-
-    async def notify_account_switched(self, old_username, new_username):
-        await self.send(f"🔄 {old_username} → <b>{new_username}</b>")
-
     async def notify_error(self, error_message: str):
         await self.send(f"❌ <b>ERROR</b>\n{error_message}")
-
-    async def notify_ht_detected(self, teams: str):
-        await self.send(
-            f"⏸ <b>HALF TIME</b>\n⚽ {teams}\n\n"
-            f"Send new /slow or wait for return."
-        )
-
-    async def notify_match_returned(self, teams: str):
-        await self.send(
-            f"🔄 <b>MATCH BACK FROM HT</b>\n⚽ {teams}\n"
-            f"Reply <code>yes</code> or <code>no</code>"
-        )
 
 
 class TelegramCommandHandler:
@@ -171,8 +146,8 @@ class TelegramCommandHandler:
             await self.alerter.send(
                 "🟢 <b>Courtside</b>\n"
                 f"Hard cap ₦{Config.MAX_PROFIT_PER_BET:,.0f}\n"
-                "<code>/startbot</code> start all\n"
-                "<code>/stopbot</code> stop all\n"
+                "<code>/startbot</code>\n"
+                "<code>/stopbot</code>\n"
                 "<code>/clear</code>\n"
                 "<code>/slow</code> + SportyBet + Bet365 FI + Teams"
             )
@@ -207,12 +182,6 @@ class TelegramCommandHandler:
 
         if low.startswith("/slow") or low.startswith("slow"):
             asyncio.create_task(self._handle_slow(text))
-            return
-
-        if low in ("yes", "no") and getattr(
-            self.bot, "_awaiting_switch_decision", False
-        ):
-            await self.bot.handle_switch_decision(low)
             return
 
     async def _handle_slow(self, text: str):
