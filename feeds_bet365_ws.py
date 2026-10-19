@@ -1,13 +1,13 @@
 """Bet365 live score feed.
 
-Starts its own headful Chrome (the flags that load the live page on this server),
-attaches to it by port and watches the score frames. For the match you lock with
-watch(FI) it sends ONE event per change to the callback:
+Starts its own headful Chrome, attaches by CDP, watches score frames.
+watch(FI) → one event per change:
 
-  {"event": "goal",       "scorer": "home" | "away", "goal_no": N, "prev_ss": "0-0", "ss": "1-0", ...}
-  {"event": "disallowed", "prev_ss": "1-0", "ss": "0-0", ...}
+  {"event": "goal",       "scorer": "home"|"away", "goal_no": N, ...}
+  {"event": "disallowed", ...}
 
-If the page stops sending data the browser is restarted (fresh profile).
+Also queues FI + name to Telegram as matches appear (and full list via send_full_match_list).
+Stall → restart browser (fresh profile).
 """
 import asyncio
 import os
@@ -30,6 +30,7 @@ CDP_PORT = int(os.getenv("BET365_CDP_PORT", "9333"))
 STALL_SECS = float(os.getenv("BET365_STALL_SECS", "90"))
 FIRST_DATA_SECS = float(os.getenv("BET365_FIRST_DATA_SECS", "120"))
 DISALLOW_CONFIRM = float(os.getenv("DISALLOW_CONFIRM_SECS", "0.6"))
+LIST_FLUSH_SECS = float(os.getenv("BET365_LIST_FLUSH_SECS", "12"))
 
 RE_FI = re.compile(r"(?:^|[|;,\s])FI=(\d{6,})", re.I)
 RE_ID = re.compile(r"(?:^|[|;,\s])ID=(\d{6,})", re.I)
@@ -37,10 +38,11 @@ RE_NA = re.compile(r"(?:^|[|;,\s])NA=([^|;]+)", re.I)
 RE_SS = re.compile(r"(?:^|[|;,\s])SS=(\d{1,2}\s*[-:]\s*\d{1,2})", re.I)
 RE_OV = re.compile(r"OV(\d{6,})C\d+", re.I)
 SPLIT = re.compile(r"[|\x01\x08]")
+HAS_VS = re.compile(r"\bv\b|\bvs\b|@", re.I)
 
 
 class ScoreTracker:
-    """Keeps the last score per fixture; feed() returns every score that CHANGED."""
+    """Keeps last score per fixture; feed() returns scores that CHANGED."""
 
     def __init__(self):
         self.state: Dict[str, dict] = {}
@@ -54,7 +56,7 @@ class ScoreTracker:
                 continue
             for m in RE_NA.finditer(part):
                 na = m.group(1).strip()
-                if re.search(r"\bv\b|\bvs\b|@", na, re.I) or " v " in na.lower():
+                if HAS_VS.search(na) or " v " in na.lower():
                     cur_na = na
             for m in RE_FI.finditer(part):
                 cur_fi = m.group(1)
@@ -80,7 +82,13 @@ class ScoreTracker:
                         ss = prev.get("ss", "")
                 if cur_ss and prev.get("ss") and prev["ss"] != cur_ss:
                     changes.append((cur_fi, prev["h"], prev["a"], h, a, name))
-                self.state[cur_fi] = {"name": name, "ss": ss, "h": h, "a": a, "updated": time.time()}
+                self.state[cur_fi] = {
+                    "name": name,
+                    "ss": ss,
+                    "h": h,
+                    "a": a,
+                    "updated": time.time(),
+                }
                 cur_na = cur_ss = None
         return changes
 
@@ -93,6 +101,7 @@ class Bet365Feed:
         self.running = False
         self._want_run = False
         self._task: Optional[asyncio.Task] = None
+        self._list_task: Optional[asyncio.Task] = None
         self._watch: Optional[str] = None
         self._goals_seen: set = set()
         self._last_data_at: Optional[float] = None
@@ -100,6 +109,8 @@ class Bet365Feed:
         self._pw = self._browser = self._page = self._proc = None
         self._profile: Optional[str] = None
         self._cooldown = 0.0
+        self._announced: set = set()
+        self._pending_tg: List[str] = []
 
     def set_alerter(self, alerter):
         self.alerter = alerter
@@ -120,11 +131,64 @@ class Bet365Feed:
         s = self.tracker.state.get(str(fi))
         if not s:
             return None
-        return {"match_id": str(fi), "name": s["name"], "ss": s["ss"],
-                "home_score": s["h"] or 0, "away_score": s["a"] or 0}
+        return {
+            "match_id": str(fi),
+            "name": s["name"],
+            "ss": s["ss"],
+            "home_score": s["h"] or 0,
+            "away_score": s["a"] or 0,
+        }
 
     def is_healthy(self) -> bool:
-        return bool(self.running and self._last_data_at and time.time() - self._last_data_at < 120)
+        return bool(
+            self.running
+            and self._last_data_at
+            and time.time() - self._last_data_at < 120
+        )
+
+    def _queue_match_line(self, fi: str, name: str, ss: str):
+        if not name or not fi or fi in self._announced:
+            return
+        if not HAS_VS.search(name) and " v " not in name.lower():
+            return
+        self._announced.add(fi)
+        self._pending_tg.append(f"<code>{fi}</code>  {ss or '?'}  {name}")
+
+    async def _list_flusher(self):
+        while self._want_run:
+            await asyncio.sleep(LIST_FLUSH_SECS)
+            if not self._pending_tg or not self.alerter:
+                continue
+            chunk = self._pending_tg[:40]
+            del self._pending_tg[:40]
+            text = "📋 <b>Bet365 live (FI + name)</b>\n" + "\n".join(chunk)
+            try:
+                await self.alerter.send(text)
+            except Exception:
+                pass
+
+    async def send_full_match_list(self):
+        if not self.alerter:
+            return
+        rows = []
+        for fi, s in sorted(
+            self.tracker.state.items(), key=lambda x: (x[1].get("name") or "")
+        ):
+            name = s.get("name") or ""
+            if not name:
+                continue
+            if not HAS_VS.search(name) and " v " not in name.lower():
+                continue
+            rows.append(f"<code>{fi}</code>  {s.get('ss') or '?'}  {name}")
+        if not rows:
+            await self.alerter.send(
+                "No named matches yet — wait until Bet365 feed is UP"
+            )
+            return
+        for i in range(0, len(rows), 40):
+            await self.alerter.send(
+                "📋 <b>Bet365 live (FI + name)</b>\n" + "\n".join(rows[i : i + 40])
+            )
 
     async def start(self):
         if self._want_run and self._task and not self._task.done():
@@ -135,59 +199,104 @@ class Bet365Feed:
     async def stop(self):
         self._want_run = False
         self.running = False
-        t, self._task = self._task, None
-        if t and not t.done():
-            t.cancel()
-            try:
-                await asyncio.wait_for(asyncio.shield(t), timeout=3.0)
-            except Exception:
-                pass
+        for t in (self._list_task, self._task):
+            if t and not t.done():
+                t.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(t), timeout=3.0)
+                except Exception:
+                    pass
+        self._list_task = self._task = None
         await self._teardown()
 
     def _on_frame(self, ev):
         try:
             payload = getattr(ev, "payload", ev)
-            text = payload.decode("utf-8", "ignore") if isinstance(payload, (bytes, bytearray)) else str(payload)
+            text = (
+                payload.decode("utf-8", "ignore")
+                if isinstance(payload, (bytes, bytearray))
+                else str(payload)
+            )
         except Exception:
             return
         has_ss = "SS=" in text
         if has_ss or "\x15OV" in text or "\x14OV" in text:
             self._last_data_at = time.time()
         if has_ss:
-            self._on_changes(self.tracker.feed(text))
+            changes = self.tracker.feed(text)
+            for fi, s in list(self.tracker.state.items()):
+                name = s.get("name") or ""
+                if name:
+                    self._queue_match_line(fi, name, s.get("ss") or "")
+            self._on_changes(changes)
 
     def _on_changes(self, changes):
         for fi, ph, pa, h, a, name in changes:
             if fi != self._watch:
                 continue
             pt, t = ph + pa, h + a
-            base = {"match_id": fi, "name": name, "prev_ss": f"{ph}-{pa}", "ss": f"{h}-{a}",
-                    "home_score": h, "away_score": a, "ts": time.time()}
+            base = {
+                "match_id": fi,
+                "name": name,
+                "prev_ss": f"{ph}-{pa}",
+                "ss": f"{h}-{a}",
+                "home_score": h,
+                "away_score": a,
+                "ts": time.time(),
+            }
             if t > pt:
                 if t in self._goals_seen:
                     continue
                 dh, da = h - ph, a - pa
-                scorer = "home" if dh > 0 and da <= 0 else "away" if da > 0 and dh <= 0 else (
-                    "home" if dh > da else "away" if da > dh else "")
+                scorer = (
+                    "home"
+                    if dh > 0 and da <= 0
+                    else "away"
+                    if da > 0 and dh <= 0
+                    else "home"
+                    if dh > da
+                    else "away"
+                    if da > dh
+                    else ""
+                )
                 if not scorer:
-                    logger.warning(f"[BET365] goal but scorer unclear {ph}-{pa} -> {h}-{a}")
+                    logger.warning(
+                        f"[BET365] goal but scorer unclear {ph}-{pa} -> {h}-{a}"
+                    )
                     continue
                 self._goals_seen.add(t)
-                self._emit({**base, "event": "goal", "scorer": scorer, "goal_no": pt + 1, "goals_added": t - pt})
+                self._emit(
+                    {
+                        **base,
+                        "event": "goal",
+                        "scorer": scorer,
+                        "goal_no": pt + 1,
+                        "goals_added": t - pt,
+                    }
+                )
             elif t < pt:
                 asyncio.get_running_loop().call_later(
-                    DISALLOW_CONFIRM, self._confirm_disallowed, fi, pt, dict(base))
+                    DISALLOW_CONFIRM, self._confirm_disallowed, fi, pt, dict(base)
+                )
 
     def _confirm_disallowed(self, fi: str, prev_total: int, base: dict):
         s = self.tracker.state.get(fi) or {}
         if (s.get("h") or 0) + (s.get("a") or 0) >= prev_total or fi != self._watch:
             return
         self._goals_seen = {x for x in self._goals_seen if x < prev_total}
-        base = {**base, "ss": s.get("ss", base["ss"]), "home_score": s.get("h"), "away_score": s.get("a")}
+        base = {
+            **base,
+            "ss": s.get("ss", base["ss"]),
+            "home_score": s.get("h"),
+            "away_score": s.get("a"),
+        }
         self._emit({**base, "event": "disallowed"})
 
     def _emit(self, evt: dict):
-        logger.info(f"[BET365] {evt['event']} {evt.get('scorer', '')} {evt['prev_ss']} -> {evt['ss']}")
+        logger.info(
+            f"[BET365] {evt['event']} {evt.get('scorer', '')} "
+            f"{evt['prev_ss']} -> {evt['ss']}"
+        )
         if not self.callback:
             return
         try:
@@ -202,6 +311,7 @@ class Bet365Feed:
             url = (getattr(ws, "url", "") or "").lower()
             if "zap" in url or "sportspublisher" in url:
                 ws.on("framereceived", self._on_frame)
+
         page.on("websocket", on_ws)
 
     async def _tg(self, text: str, min_gap: float = 300.0):
@@ -215,10 +325,22 @@ class Bet365Feed:
             pass
 
     def _chrome_cmd(self, use_xvfb: bool = False) -> List[str]:
-        flags = [CHROME, f"--remote-debugging-port={CDP_PORT}", f"--user-data-dir={self._profile}",
-                 "--no-first-run", "--no-default-browser-check", "--no-sandbox", "--disable-dev-shm-usage",
-                 "--disable-blink-features=AutomationControlled", "--use-gl=angle", "--use-angle=swiftshader",
-                 "--enable-unsafe-swiftshader", "--lang=en-US", "--window-size=1600,900", "about:blank"]
+        flags = [
+            CHROME,
+            f"--remote-debugging-port={CDP_PORT}",
+            f"--user-data-dir={self._profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--use-gl=angle",
+            "--use-angle=swiftshader",
+            "--enable-unsafe-swiftshader",
+            "--lang=en-US",
+            "--window-size=1600,900",
+            "about:blank",
+        ]
         env = ["env", f"TZ={TZ}", "LANG=en_US.UTF-8"]
         if use_xvfb:
             cmd = env + ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24"] + flags
@@ -231,7 +353,10 @@ class Bet365Feed:
     def _kill_chrome(self):
         if self._profile:
             try:
-                subprocess.run(["pkill", "-f", "--", f"--user-data-dir={self._profile}"], timeout=5)
+                subprocess.run(
+                    ["pkill", "-f", "--", f"--user-data-dir={self._profile}"],
+                    timeout=5,
+                )
             except Exception:
                 pass
         if self._proc and self._proc.poll() is None:
@@ -246,14 +371,20 @@ class Bet365Feed:
         if self._profile:
             shutil.rmtree(self._profile, ignore_errors=True)
         self._profile = f"/tmp/b365-chrome-{int(time.time())}"
-        self._proc = subprocess.Popen(self._chrome_cmd(use_xvfb), stdout=subprocess.DEVNULL,
-                                      stderr=subprocess.DEVNULL, start_new_session=True)
+        self._proc = subprocess.Popen(
+            self._chrome_cmd(use_xvfb),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
         for _ in range(40):
             await asyncio.sleep(0.5)
             if self._proc.poll() is not None:
                 return False
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}/json/version", timeout=1).read()
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{CDP_PORT}/json/version", timeout=1
+                ).read()
                 return True
             except Exception:
                 pass
@@ -261,16 +392,23 @@ class Bet365Feed:
 
     async def _start_browser(self) -> bool:
         from playwright.async_api import async_playwright
+
         if not await self._spawn_chrome(False) and not await self._spawn_chrome(True):
             return False
         try:
             self._pw = await async_playwright().start()
-            self._browser = await self._pw.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
+            self._browser = await self._pw.chromium.connect_over_cdp(
+                f"http://127.0.0.1:{CDP_PORT}"
+            )
             ctx = self._browser.contexts[0]
             self._page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             self._bind(self._page)
-            await self._page.goto(getattr(Config, "BET365_LIVE_URL", None) or "https://www.bet365.com/#/IP/B1",
-                                  wait_until="commit", timeout=45000)
+            await self._page.goto(
+                getattr(Config, "BET365_LIVE_URL", None)
+                or "https://www.bet365.com/#/IP/B1",
+                wait_until="commit",
+                timeout=45000,
+            )
             asyncio.create_task(self._accept_cookies(self._page))
             return True
         except Exception as e:
@@ -294,7 +432,10 @@ class Bet365Feed:
 
     async def _teardown(self):
         self.running = False
-        for closer in (getattr(self._browser, "close", None), getattr(self._pw, "stop", None)):
+        for closer in (
+            getattr(self._browser, "close", None),
+            getattr(self._pw, "stop", None),
+        ):
             if closer:
                 try:
                     await asyncio.wait_for(closer(), timeout=5)
@@ -309,7 +450,7 @@ class Bet365Feed:
         t_start, last_block_check = time.time(), 0.0
         self._last_data_at = None
         while self._want_run:
-            await asyncio.sleep(0.25)  # LIGHT CHANGE ONLY (was 1.0)
+            await asyncio.sleep(0.25)
             now = time.time()
             if self._proc and self._proc.poll() is not None:
                 return "browser exited"
@@ -318,7 +459,9 @@ class Bet365Feed:
                     last_block_check = now
                     try:
                         if "attention required" in (await self._page.title()).lower():
-                            await self._tg("Bet365 blocked this IP - change VPN server")
+                            await self._tg(
+                                "Bet365 blocked this IP - change VPN server"
+                            )
                             self._cooldown = 120.0
                             return "IP blocked"
                     except Exception:
@@ -346,6 +489,9 @@ class Bet365Feed:
                     backoff = min(backoff * 2, 120.0)
                     continue
                 backoff = 5.0
+                if self._list_task and not self._list_task.done():
+                    self._list_task.cancel()
+                self._list_task = asyncio.create_task(self._list_flusher())
                 reason = await self._watch_loop()
                 if not self._want_run:
                     break
