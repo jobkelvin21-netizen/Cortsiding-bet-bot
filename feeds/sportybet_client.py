@@ -1,4 +1,4 @@
-"""SportyBet bet client — login in RAM only; place / rebet / cashout confirmed payloads."""
+"""SportyBet API — login in RAM; place / rebet / cashout; next-goal 1H then FT."""
 
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ N_HEX = (
 NEXTGOAL_RE = re.compile(
     r"(next\s*goal|\b\d{1,2}(?:st|nd|rd|th)\s*goals?\b)", re.I
 )
+GOAL_NUM_RE = re.compile(r"(\d{1,2})(?:st|nd|rd|th)", re.I)
 
 
 def _b64e(b: bytes) -> str:
@@ -70,6 +71,20 @@ def _rsa_pub():
     return RSAPublicNumbers(65537, int(N_HEX, 16)).public_key()
 
 
+def _period_rank(name: str) -> int:
+    n = (name or "").lower()
+    if "1st half" in n or "first half" in n:
+        return 0
+    if "2nd half" in n or "second half" in n:
+        return 2
+    return 1  # full time / plain next goal
+
+
+def _goal_num_in_name(name: str) -> Optional[int]:
+    m = GOAL_NUM_RE.search(name or "")
+    return int(m.group(1)) if m else None
+
+
 @dataclass
 class ArmedSelection:
     event_id: str
@@ -83,6 +98,8 @@ class ArmedSelection:
     side: str
     market_name: str = ""
     outcome_name: str = ""
+    goal_no: Optional[int] = None
+    period_rank: int = 1
 
 
 class SportyBetClient:
@@ -112,7 +129,7 @@ class SportyBetClient:
         for k, v in headers.items():
             req.add_header(k, v)
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=20) as r:
                 return r.status, r.read()
         except urllib.error.HTTPError as e:
             return e.code, e.read() if e.fp else b""
@@ -120,7 +137,7 @@ class SportyBetClient:
     def _getjson(self, path: str, params: Optional[dict] = None) -> dict:
         url = BASE + path + (("?" + urllib.parse.urlencode(params)) if params else "")
         req = urllib.request.Request(url, headers=self._headers())
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=20) as r:
             return json.loads(r.read())
 
     def _phone_variants(self, p: str) -> List[str]:
@@ -235,11 +252,7 @@ class SportyBetClient:
                 pass
         return {}
 
-    def arm_next_goal_both(self, event_id: str) -> Dict[str, ArmedSelection]:
-        data = self.fetch_event(event_id)
-        out: Dict[str, ArmedSelection] = {}
-        if not data:
-            return out
+    def _collect_next_goal_markets(self, data: dict) -> List[dict]:
         markets = []
 
         def walk(n):
@@ -254,12 +267,27 @@ class SportyBetClient:
                     walk(v)
 
         walk(data)
-        for m in markets:
+        return markets
+
+    def arm_for_side(
+        self,
+        event_id: str,
+        side: str,
+        goal_no: Optional[int] = None,
+    ) -> Optional[ArmedSelection]:
+        """Pick next-goal outcome for home|away. Prefer 1H, then FT. Match goal_no if set."""
+        data = self.fetch_event(event_id)
+        if not data:
+            return None
+        candidates: List[ArmedSelection] = []
+        for m in self._collect_next_goal_markets(data):
             mname = str(m.get("name") or m.get("marketName") or "Next Goal")
             mid = str(m.get("id") or m.get("marketId") or "")
             product = str(m.get("product") or m.get("productId") or "1")
             sport_id = str(m.get("sportId") or "sr:sport:1")
             spec = str(m.get("specifier") or m.get("specifiers") or "")
+            gnum = _goal_num_in_name(mname)
+            pr = _period_rank(mname)
             outcomes = m.get("outcomes") or m.get("odds") or m.get("items") or []
             if isinstance(outcomes, dict):
                 outcomes = list(outcomes.values())
@@ -275,29 +303,52 @@ class SportyBetClient:
                 if odds <= 1.01 or not oid:
                     continue
                 low = oname.lower()
-                side = None
+                s = None
                 if "home" in low or low in ("1", "h"):
-                    side = "home"
+                    s = "home"
                 elif "away" in low or low in ("2", "a"):
-                    side = "away"
-                if not side:
+                    s = "away"
+                if s != side:
                     continue
-                arm = ArmedSelection(
-                    event_id=event_id,
-                    sport_id=sport_id,
-                    market_id=mid,
-                    outcome_id=oid,
-                    specifier=spec if isinstance(spec, str) else "",
-                    odds=odds,
-                    probability=float(o.get("probability") or o.get("prob") or 0),
-                    product=product,
-                    side=side,
-                    market_name=mname,
-                    outcome_name=oname,
+                candidates.append(
+                    ArmedSelection(
+                        event_id=event_id,
+                        sport_id=sport_id,
+                        market_id=mid,
+                        outcome_id=oid,
+                        specifier=spec if isinstance(spec, str) else "",
+                        odds=odds,
+                        probability=float(o.get("probability") or o.get("prob") or 0),
+                        product=product,
+                        side=s,
+                        market_name=mname,
+                        outcome_name=oname,
+                        goal_no=gnum,
+                        period_rank=pr,
+                    )
                 )
-                prev = out.get(side)
-                if not prev or arm.odds > prev.odds:
-                    out[side] = arm
+        if not candidates:
+            return None
+
+        def sort_key(a: ArmedSelection):
+            # prefer matching goal number, then 1H (0) before FT (1) before 2H (2)
+            gn = a.goal_no
+            match = 0 if (goal_no is not None and gn == goal_no) else (
+                1 if gn is None else 2
+            )
+            return (match, a.period_rank, -a.odds)
+
+        candidates.sort(key=sort_key)
+        return candidates[0]
+
+    def arm_next_goal_both(
+        self, event_id: str, goal_no: Optional[int] = None
+    ) -> Dict[str, ArmedSelection]:
+        out: Dict[str, ArmedSelection] = {}
+        for side in ("home", "away"):
+            arm = self.arm_for_side(event_id, side, goal_no=goal_no)
+            if arm:
+                out[side] = arm
         return out
 
     def stake_for_odds(self, odds: float, balance: float = 0.0) -> float:
@@ -352,7 +403,7 @@ class SportyBetClient:
         if results[0].get("bizCode") != 10000:
             return results
         for _ in range(n):
-            time.sleep(0.35)
+            time.sleep(0.25)
             r = self.place_armed(arm, stake_ngn)
             results.append(r)
             if r.get("bizCode") != 10000:
@@ -404,7 +455,7 @@ class SportyBetClient:
                 new = (last.get("data") or {}).get("maxCashOutAmount")
                 if new and str(float(new)) != cur:
                     cur = str(float(new))
-                    time.sleep(0.35)
+                    time.sleep(0.3)
                     continue
             break
         return last
