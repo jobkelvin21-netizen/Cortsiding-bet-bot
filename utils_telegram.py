@@ -60,10 +60,10 @@ class TelegramAlerter:
             f"💰 <b>LOGGED IN</b>\n"
             f"Balance: <b>₦{balance:,.2f}</b>\n"
             f"Hard cap: <b>₦{Config.MAX_PROFIT_PER_BET:,.0f}</b>\n\n"
-            f"<code>/startbot</code> — start\n"
-            f"<code>/stopbot</code> — stop\n"
-            f"<code>/clear</code>\n"
-            f"<code>/matches</code> — Bet365 FI + names\n\n"
+            f"<code>/startbot</code> — start feeds\n"
+            f"<code>/stopbot</code> — stop feeds\n"
+            f"<code>/clear</code> — clear slow lock\n"
+            f"<code>/matches</code> — current FI + names\n\n"
             f"<code>/slow</code>\n"
             f"<code>SportyBet- URL</code>\n"
             f"<code>Bet365- FI</code>\n"
@@ -146,11 +146,11 @@ class TelegramCommandHandler:
         if low in ("/start", "start", "/help", "help"):
             await self.alerter.send(
                 "🟢 <b>Courtside</b>\n"
-                f"Hard cap ₦{Config.MAX_PROFIT_PER_BET:,.0f}\n"
-                "<code>/startbot</code>\n"
-                "<code>/stopbot</code>\n"
-                "<code>/clear</code>\n"
-                "<code>/matches</code> — Bet365 FI + names\n"
+                f"Hard cap ₦{Config.MAX_PROFIT_PER_BET:,.0f}\n\n"
+                "<code>/startbot</code> — start\n"
+                "<code>/stopbot</code> — stop\n"
+                "<code>/clear</code> — clear slow\n"
+                "<code>/matches</code> — FI + names\n"
                 "<code>/slow</code> + SportyBet + Bet365 FI + Teams"
             )
             return
@@ -218,6 +218,6 @@ class TelegramCommandHandler:
             return
         m = re.search(r"(\d{6,})", bet365_id)
         if not m:
-            await self.alerter.send("❌ Bet365- must be numbers only")
+            await self.alerter.send("❌ Bet365- must be numbers (FI)")
             return
         await self.bot.handle_slow_game(sporty_url, m.group(1), teams or "Match")
