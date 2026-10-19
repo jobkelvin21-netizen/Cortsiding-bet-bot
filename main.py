@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Telegram control; Bet365 goal (scorer) → SportyBet API place+rebet; cashout on disallowed."""
+"""Telegram control; Bet365 goal/disallowed → SportyBet API place+rebet / cashout."""
 
 import asyncio
 import getpass
 import re
 import sys
-from typing import Optional
 
 from loguru import logger
 
@@ -45,9 +44,10 @@ class ArbitrageBot:
         self._bot_active = False
         self._has_open_bet = False
         self._processing = False
+        self._arm_task = None
+        self._arms = {}
         self.balance = 0.0
-        # After a successful bet on goal N, next target is N+1
-        self._next_goal_no: int = 1
+        self._next_goal_no = 1
 
     async def terminal_login(self):
         print("SPORTYBET LOGIN (not saved to any file)")
@@ -124,6 +124,8 @@ class ArbitrageBot:
 
     async def stop_bot(self):
         self._bot_active = False
+        if self._arm_task and not self._arm_task.done():
+            self._arm_task.cancel()
         try:
             self.bet365.unwatch()
             await self.bet365.stop()
@@ -132,9 +134,12 @@ class ArbitrageBot:
         self._manual_slow_match = None
         self._has_open_bet = False
         self._processing = False
+        self._arms = {}
         await self.alerter.send("BOT STOPPED")
 
     async def clear_slow(self):
+        if self._arm_task and not self._arm_task.done():
+            self._arm_task.cancel()
         try:
             self.bet365.unwatch()
         except Exception:
@@ -142,8 +147,26 @@ class ArbitrageBot:
         self._manual_slow_match = None
         self._has_open_bet = False
         self._processing = False
+        self._arms = {}
         self._next_goal_no = 1
         await self.alerter.send("Slow cleared")
+
+    async def _arm_loop(self, event_id: str):
+        while self._bot_active and self._manual_slow_match:
+            try:
+                arms = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.sb.arm_next_goal_both(event_id),
+                )
+                if arms:
+                    self._arms = arms
+                    h, a = arms.get("home"), arms.get("away")
+                    logger.info(
+                        f"[ARM] H@{getattr(h, 'odds', '—')} A@{getattr(a, 'odds', '—')}"
+                    )
+            except Exception as e:
+                logger.debug(f"[ARM] {e}")
+            await asyncio.sleep(2.0)
 
     async def _on_goal(self, evt: dict):
         if self._processing or not self._manual_slow_match:
@@ -155,7 +178,7 @@ class ArbitrageBot:
 
         scorer = (evt.get("scorer") or "").lower()
         if scorer not in ("home", "away"):
-            await self.alerter.send(f"GOAL but scorer unclear: {evt}")
+            await self.alerter.send(f"GOAL scorer unclear: {evt}")
             return
 
         goal_no = int(evt.get("goal_no") or self._next_goal_no or 1)
@@ -169,17 +192,14 @@ class ArbitrageBot:
 
         self._processing = True
         try:
-            # Fresh market for THIS goal number — 1H preferred inside arm_for_side
-            arm = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.sb.arm_for_side(event_id, scorer, goal_no=goal_no),
+            arm = self._arms.get(scorer)
+            # Always refresh odds for this side at goal time
+            fresh = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.sb.arm_next_goal_both(event_id)
             )
-            if not arm:
-                # fallback: any next-goal for side
-                arm = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.sb.arm_for_side(event_id, scorer, goal_no=None),
-                )
+            if fresh:
+                self._arms.update(fresh)
+                arm = self._arms.get(scorer) or arm
             if not arm:
                 await self.alerter.send(
                     f"GOAL {evt.get('ss')} {scoring} — no next-goal market for {scorer}"
@@ -187,9 +207,7 @@ class ArbitrageBot:
                 return
 
             stake = self.sb.stake_for_odds(arm.odds, self.balance)
-            await self.alerter.notify_goal_detected(
-                teams, scoring, arm.odds, goal_no
-            )
+            await self.alerter.notify_goal_detected(teams, scoring, arm.odds, goal_no)
             await self.alerter.send(
                 f"{arm.market_name} / {arm.outcome_name} @ {arm.odds}\n"
                 f"Stake ₦{stake} (cap ₦{Config.MAX_PROFIT_PER_BET})"
@@ -202,14 +220,11 @@ class ArbitrageBot:
             if ok_n:
                 self._has_open_bet = True
                 self.balance = max(0.0, self.balance - stake * ok_n)
-                # Goal allowed path: move target to NEXT goal market
                 self._next_goal_no = goal_no + 1
                 await self.alerter.notify_bet_placed(
                     teams, scoring, stake, arm.odds, locked, ok_n, len(results)
                 )
-                await self.alerter.send(
-                    f"Next target: goal #{self._next_goal_no} (1H then FT)"
-                )
+                await self.alerter.send(f"Next target: goal #{self._next_goal_no}")
             else:
                 await self.alerter.send(
                     f"BET FAILED 0/{len(results)}\n{results[-1] if results else ''}"
@@ -248,6 +263,9 @@ class ArbitrageBot:
             await self.alerter.send("Send /startbot first")
             return
 
+        if self._arm_task and not self._arm_task.done():
+            self._arm_task.cancel()
+
         b365 = _fi(bet365_id)
         if not b365:
             await self.alerter.send("Need numeric FI")
@@ -277,6 +295,7 @@ class ArbitrageBot:
         self._next_goal_no = total + 1
         self._has_open_bet = False
         self._processing = False
+        self._arms = {}
 
         self._manual_slow_match = {
             "url": sporty_url.strip(),
@@ -287,24 +306,16 @@ class ArbitrageBot:
             "event_id": event_id,
         }
 
-        # Preload both sides for next goal number (IDs ready; odds refreshed on goal)
-        arms = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: self.sb.arm_next_goal_both(event_id, goal_no=self._next_goal_no),
-        )
-        h = arms.get("home")
-        a = arms.get("away")
+        self._arm_task = asyncio.create_task(self._arm_loop(event_id))
+        await asyncio.sleep(2.0)
+        h, a = self._arms.get("home"), self._arms.get("away")
         await self.alerter.notify_manual_slow_set(teams, b365)
         await self.alerter.send(
             f"LOCKED FI={b365}\n{event_id}\n"
             f"Next goal #{self._next_goal_no}\n"
-            f"Home@{getattr(h, 'odds', '—')} ({getattr(h, 'market_name', '')})\n"
-            f"Away@{getattr(a, 'odds', '—')} ({getattr(a, 'market_name', '')})\n"
+            f"Home@{getattr(h, 'odds', '—')} Away@{getattr(a, 'odds', '—')}\n"
             f"Cap ₦{Config.MAX_PROFIT_PER_BET}"
         )
-
-    async def handle_switch_decision(self, decision: str):
-        await self.alerter.send("Switch N/A in this mode")
 
     def stop(self):
         self._bot_active = False
